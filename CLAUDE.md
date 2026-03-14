@@ -33,6 +33,10 @@ wsl bash -c "source '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-pa
 
 ## What This Is
 
+> **For a full human-readable explanation of the implementation, see [`README.md`](README.md).**
+> It covers: simulation loop phases, data structures, force kernel, hash chemistry,
+> fusion/decay/fission, rendering pipeline, config knobs, bug fixes, and performance history.
+
 A GPU-accelerated 2D particle simulator where **everything decays**. Every particle and
 composite structure has a half-life — an exponential decay probability. Particles interact
 via species-dependent force kernels, fuse into composites whose properties are determined by
@@ -65,7 +69,8 @@ and evolutionary dynamics that arise purely from the interplay of forces, fusion
 
 ```
 halflife-particle/
-├── CLAUDE.md           ← You are here
+├── CLAUDE.md           ← You are here (AI context)
+├── README.md           ← Full implementation documentation for humans
 ├── PLAN.md             ← Progress tracking, todo list, known issues
 ├── requirements.txt
 ├── halflife/
