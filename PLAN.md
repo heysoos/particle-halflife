@@ -64,11 +64,33 @@
 
 ---
 
+## Performance Investigation (done after first ~2 FPS run)
+
+Four bottlenecks identified and fixed:
+
+| # | Bottleneck | Root cause | Fix | Speedup |
+|---|-----------|-----------|-----|---------|
+| 1 | `attempt_fusion` scan | `lax.scan` over all N=20K particles; each step carries full `CompositeState` | Pre-filter to `max_fusions_per_step=100` candidates before scan | ~200x on scan |
+| 2 | `find_free_slots` | O(N²): vmapped N `jnp.min()` reductions of size N | Replace with O(N log N) `jnp.sort` on candidate array | ~N/log(N) |
+| 3 | `compute_bond_forces` | Iterates ALL 5K composites × 28 pairs every step, even when dead | Gate on `config.use_bond_forces` (default False) | ~140K ops/step saved |
+| 4 | Default config size | `max_particles=20K` (10x benchmark size), causing all O(N) ops to be 10x worse | Reduced to `max_particles=4K, num_particles_init=2K, max_composites=500` | ~10x |
+
+Result: 3.9ms/step → ~258 FPS potential (at default 2K particles, no bond forces)
+
+Remaining known perf issues (not yet addressed):
+- `find_neighbors_for_particle`: `pack_slot` vmap is O(max_neighbors × max_candidates)
+  per particle — an O(N × K²) total, could be simplified to O(N × K)
+- Bond forces still O(max_composites) when re-enabled — needs alive-composite filtering
+
+---
+
 ## Phase 5: Polish and Optimization
 
+- [ ] Verify FPS is good in full GUI run
 - [ ] Async rendering overlap (simulate N+1 while rendering N)
-- [ ] Profile with jax.profiler, identify bottlenecks
-- [ ] Interactive parameter controls
+- [ ] Scale up to larger particle counts once perf baseline is solid
+- [ ] Profile with jax.profiler if FPS drops when chemistry becomes active
+- [ ] Interactive parameter controls (live sliders)
 - [ ] Statistics overlay (species distribution, composite count, energy histogram)
 - [ ] Frame recording (save to disk for videos)
 
@@ -87,9 +109,11 @@
 
 ## Known Issues / Notes
 
-- Fixed: `chemistry.py:312` — `apply_composite_decay` computed center-of-mass by multiplying
-  `particles.position (N,2)` by `members mask (M,1)` — shape mismatch. Fixed to gather
-  member positions via indexed lookup before summing.
+- Fixed: `chemistry.py` — shape mismatch in `apply_composite_decay` CoM calc
+- Fixed: `renderer.py` — unused `u_window_size` uniform removed (GLSL optimizes it away)
+- Fixed: `attempt_fusion` scan O(N) → O(max_fusions_per_step)
+- Fixed: `find_free_slots` O(N²) → O(N log N)
+- Fixed: bond forces gated off by default (`use_bond_forces=False`)
 
 ---
 

@@ -24,13 +24,13 @@ class SimConfig:
     boundary_mode: str = "periodic"
 
     # ── Particles ────────────────────────────────────────────────────────────
-    max_particles: int = 20_000     # fixed pool capacity (alive + dead slots)
-    num_particles_init: int = 10_000  # how many to spawn at initialization
+    max_particles: int = 4_000      # fixed pool capacity (alive + dead slots)
+    num_particles_init: int = 2_000 # how many to spawn at initialization
     num_species: int = 12           # number of distinct particle types
     state_dim: int = 8              # internal state vector size (NCA-style, future use)
 
     # ── Composites ───────────────────────────────────────────────────────────
-    max_composites: int = 5_000     # fixed composite pool capacity
+    max_composites: int = 500       # fixed composite pool capacity
     max_composite_size: int = 8     # max particles per composite
 
     # ── Spatial Indexing ─────────────────────────────────────────────────────
@@ -83,6 +83,14 @@ class SimConfig:
 
     # Max products from a single decay event (padded to this length)
     max_decay_products: int = 3
+
+    # ── Performance Caps ─────────────────────────────────────────────────────
+    # Cap fusion scan to first K candidates per step (avoids O(N) sequential scan)
+    max_fusions_per_step: int = 100
+    # Cap decay spawns per step (keeps find_free_slots fast)
+    max_decay_per_step: int = 200
+    # Enable spring bond forces between composite members (expensive; off by default)
+    use_bond_forces: bool = False
 
     # ── Rendering ────────────────────────────────────────────────────────────
     window_width: int = 1280

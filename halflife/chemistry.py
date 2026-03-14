@@ -167,18 +167,18 @@ def apply_particle_decay(state: WorldState, config: SimConfig) -> WorldState:
     # (Multi-product spawning is a Phase 5 enhancement.)
     n_decaying = jnp.sum(decays.astype(jnp.int32))
 
-    # Find slots for new particles
-    free_slots = find_free_slots(new_alive, N)  # (N,) indices, -1 = no free slot
+    # Find free slots — capped at max_decay_per_step to keep this O(N log N)
+    max_spawns = config.max_decay_per_step
+    free_slots = find_free_slots(new_alive, max_spawns)  # (max_spawns,)
 
     # Assign decaying particles to spawn slots sequentially
-    # decay_indices: which particles are decaying (as sequential list)
     decay_cumsum = jnp.cumsum(decays.astype(jnp.int32))  # 1-indexed
 
     # For each decaying particle i with ordinal k, spawn into free_slots[k-1]
     def spawn_into_slot(i):
         """Given decaying particle i, return (target_slot, new_species, new_pos, new_vel)"""
         k = decay_cumsum[i] - 1  # 0-indexed ordinal among decaying particles
-        slot = jnp.where((k >= 0) & (k < N), free_slots[k], -1)
+        slot = jnp.where((k >= 0) & (k < max_spawns), free_slots[k], -1)
         slot = jnp.where(slot >= N, -1, slot)  # -1 if no free slot
 
         # Product species: first product from decay hash
@@ -455,16 +455,31 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
     )
     # all_partners: (N,) int32 — proposed partner for each particle (-1 = none)
 
-    # --- Conflict resolution via sequential scan ---
-    # Scan in ascending particle index order.
-    # Maintain a "claimed" array: once particle j is claimed, it can't be fused again.
+    # --- Conflict resolution via sequential scan over CANDIDATES ONLY ---
+    # Instead of scanning all N particles, pre-filter to the first
+    # max_fusions_per_step particles that have a valid partner. This shrinks
+    # the scan from O(N) sequential steps to O(max_fusions_per_step).
+    max_fusions = config.max_fusions_per_step
+    has_partner = all_partners >= 0  # (N,)
+    cumsum_p = jnp.cumsum(has_partner.astype(jnp.int32))
+    # Assign real index to first max_fusions candidates, sentinel N to the rest
+    candidate_i = jnp.where(
+        has_partner & (cumsum_p <= max_fusions),
+        jnp.arange(N, dtype=jnp.int32),
+        N,  # sentinel — sorts to end
+    )
+    # Sort so the valid candidates come first; take first max_fusions
+    scan_indices = jnp.sort(candidate_i)[:max_fusions]  # (max_fusions,)
 
     def fusion_scan_body(carry, i):
         claimed, new_composite_id, composites_state, comp_count = carry
 
-        partner = all_partners[i]
-        be      = all_be[i]
-        h       = all_hashes[i]
+        valid_i = i < N
+        safe_i  = jnp.minimum(i, N - 1)  # avoid OOB on sentinel
+
+        partner = jnp.where(valid_i, all_partners[safe_i], jnp.int32(-1))
+        be      = jnp.where(valid_i, all_be[safe_i],       jnp.float32(0.0))
+        h       = jnp.where(valid_i, all_hashes[safe_i],   jnp.uint32(0))
 
         can_fuse = (
             (partner >= 0) &
@@ -546,7 +561,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
     (final_claimed, final_composite_id, final_composites, _), _ = jax.lax.scan(
         fusion_scan_body,
         (claimed_init, composite_id_init, composites, comp_count_init),
-        jnp.arange(N, dtype=jnp.int32)
+        scan_indices,  # (max_fusions_per_step,) — only real candidates + sentinels
     )
 
     new_particles = particles._replace(composite_id=final_composite_id)

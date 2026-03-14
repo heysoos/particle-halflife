@@ -61,32 +61,22 @@ def find_free_slots(alive: jnp.ndarray, n_needed: int) -> jnp.ndarray:
     """
     Find the first n_needed False slots in a boolean alive array.
 
+    O(N log N) via argsort — avoids the O(N²) vmap-of-min approach.
+
     Returns:
         (n_needed,) int32 array of free slot indices.
-        If fewer than n_needed slots are free, the remaining entries
-        are filled with -1 (invalid).
+        If fewer than n_needed slots are free, remaining entries are -1.
 
     Args:
         alive:    (N,) bool — True = occupied, False = free
-        n_needed: int — number of free slots to find
+        n_needed: int — number of free slots to find (compile-time constant)
     """
-    free_mask = ~alive
-    # Assign ordinal positions to free slots, -1 to occupied slots
-    # cumsum of free_mask gives how many free slots we've seen so far
-    cumsum = jnp.cumsum(free_mask)  # (N,) int32: 1-indexed count of free slots seen
-    # Slot index i gets ordinal k if cumsum[i]==k and free_mask[i]==True
-    # We want the indices where ordinal is in [1, n_needed]
-    slot_indices = jnp.arange(alive.shape[0], dtype=jnp.int32)
-    # For each ordinal 1..n_needed, find the corresponding slot
-    def get_slot(ordinal):
-        # slot where cumsum == ordinal and free_mask == True
-        match = jnp.where(free_mask & (cumsum == ordinal), slot_indices, alive.shape[0])
-        return jnp.min(match)
-
-    slots = jax.vmap(get_slot)(jnp.arange(1, n_needed + 1, dtype=jnp.int32))
-    # Mark slots past the end of the array as -1 (invalid)
-    slots = jnp.where(slots >= alive.shape[0], -1, slots)
-    return slots
+    N = alive.shape[0]
+    # Free slots get their real index; occupied slots get sentinel N (sorts to end)
+    candidates = jnp.where(~alive, jnp.arange(N, dtype=jnp.int32), N)
+    sorted_candidates = jnp.sort(candidates)   # free slots first, sentinels last
+    slots = sorted_candidates[:n_needed]
+    return jnp.where(slots >= N, -1, slots)
 
 
 # ── Boundary Conditions ──────────────────────────────────────────────────────

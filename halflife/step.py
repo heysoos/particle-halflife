@@ -139,9 +139,10 @@ def simulation_step(state: WorldState, params: InteractionParams,
         particles.position, particles.species, particles.alive, neighbors, params, config
     )
 
-    # Bond forces (zero in Phase 2 since no composites; active in Phase 4+)
-    bond_forces = compute_bond_forces(state, config)
-    forces = forces + bond_forces
+    # Bond forces (optional — expensive; enable via config.use_bond_forces)
+    if config.use_bond_forces:
+        bond_forces = compute_bond_forces(state, config)
+        forces = forces + bond_forces
 
     # ── Phase 4: Integration (Euler) ──────────────────────────────────────────
     new_vel = particles.velocity + (forces / particles.mass[:, None]) * config.dt
