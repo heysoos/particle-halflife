@@ -1,0 +1,11 @@
+# Core simulation
+jax[cuda12]          # GPU-accelerated array computation (use jax[cpu] if no CUDA)
+jaxlib               # XLA backend
+
+# Visualization
+moderngl             # Modern OpenGL wrapper for Python
+moderngl-window      # Window management for moderngl (optional, we use pygame directly)
+pygame               # Window + event handling
+
+# Utilities
+numpy                # CPU array operations, data transfer
