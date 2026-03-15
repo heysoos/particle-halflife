@@ -23,6 +23,7 @@ import collections
 import numpy as np
 import pygame
 import moderngl
+import jax
 
 from halflife.config import SimConfig
 from halflife.state import WorldState, get_species_colors
@@ -251,9 +252,12 @@ class Renderer:
         self.particle_prog['u_world_size'].value = (config.world_width, config.world_height)
 
         self._particle_vertex_size = 7  # floats: x,y,r,g,b,a,size
-        self._particle_buf_size = config.max_particles * self._particle_vertex_size * 4
+        _max_draw = config.max_particles + config.max_composites
+        self._particle_buf_size = _max_draw * self._particle_vertex_size * 4
 
         self.particle_vbo = self.ctx.buffer(reserve=self._particle_buf_size)
+        # Pre-allocated CPU staging buffer — avoids per-frame heap allocations
+        self._part_vbuf = np.zeros((_max_draw, self._particle_vertex_size), dtype=np.float32)
         self.particle_vao = self.ctx.vertex_array(
             self.particle_prog,
             [(self.particle_vbo, '2f 4f 1f', 'in_position', 'in_color', 'in_size')],
@@ -468,18 +472,17 @@ class Renderer:
         particles  = state.particles
         composites = state.composites
 
-        # Transfer to CPU
-        pos        = np.asarray(particles.position)
-        vel        = np.asarray(particles.velocity)
-        species    = np.asarray(particles.species)
-        alive      = np.asarray(particles.alive)
-        mass       = np.asarray(particles.mass)
-        energy     = np.asarray(particles.energy)
-        comp_id    = np.asarray(particles.composite_id)
-
-        comp_members = np.asarray(composites.members)
-        comp_count   = np.asarray(composites.member_count)
-        comp_alive   = np.asarray(composites.alive)
+        # Single batched GPU→CPU transfer — one CUDA sync + one DMA instead of 13
+        (pos, vel, species, alive, mass, _energy, comp_id,
+         comp_members, comp_count, comp_alive,
+         total_energy, step_count, sim_time) = jax.device_get((
+            particles.position, particles.velocity,
+            particles.species,  particles.alive,
+            particles.mass,     particles.energy,
+            particles.composite_id,
+            composites.members, composites.member_count, composites.alive,
+            state.total_energy, state.step_count, state.time,
+        ))
 
         # ── Particle vertex data ──────────────────────────────────────────────
         alive_idx = np.where(alive)[0]
@@ -506,14 +509,13 @@ class Renderer:
                 config.point_size_min, config.point_size_max
             ).astype(np.float32)
 
-            vertex_data = np.concatenate([
-                p_pos.astype(np.float32),
-                colors.astype(np.float32),
-                alpha[:, None],
-                size[:, None],
-            ], axis=1).astype(np.float32)
-
-            self.particle_vbo.write(vertex_data.flatten().tobytes())
+            # In-place write to pre-allocated buffer — no heap allocations
+            buf = self._part_vbuf[:n_alive]
+            buf[:, 0:2] = p_pos
+            buf[:, 2:5] = colors
+            buf[:, 5]   = alpha
+            buf[:, 6]   = size
+            self.particle_vbo.write(buf.tobytes())
             self._n_particles_to_draw = n_alive
         else:
             self._n_particles_to_draw = 0
@@ -523,82 +525,76 @@ class Renderer:
         alive_comp_idx = np.where(comp_alive)[0]
 
         if self.composite_mode == self.MODE_BONDS and len(alive_comp_idx) > 0:
-            bond_chunks = []
-            for c in alive_comp_idx:
-                n = comp_count[c]
-                members = comp_members[c, :n]
-                if n < 2:
-                    continue
-                # Vectorized pair generation via triu_indices
-                ii, jj = np.triu_indices(n, k=1)
-                mem_a, mem_b = members[ii], members[jj]
-                valid = (mem_a >= 0) & (mem_b >= 0)
-                if not np.any(valid):
-                    continue
+            C_idx = alive_comp_idx
+            max_n = int(comp_count[C_idx].max())
+            if max_n >= 2:
+                mb  = comp_members[C_idx, :max_n]   # (n_comps, max_n)
+                cnt = comp_count[C_idx]              # (n_comps,)
+                ii, jj = np.triu_indices(max_n, k=1)
+                # valid: both pair indices in-range and member slots non-negative
+                valid = (ii[None, :] < cnt[:, None]) & (jj[None, :] < cnt[:, None])
+                mem_a = mb[:, ii].ravel()
+                mem_b = mb[:, jj].ravel()
+                valid = valid.ravel() & (mem_a >= 0) & (mem_b >= 0)
+                mem_a = mem_a[valid]
+                mem_b = mem_b[valid]
 
-                mem_a_v = mem_a[valid]
-                mem_b_v = mem_b[valid]
+                if len(mem_a) > 0:
+                    pos_a = pos[mem_a]
+                    dx    = pos[mem_b] - pos_a
+                    if config.boundary_mode == "periodic":
+                        dx[:, 0] -= config.world_width  * np.round(dx[:, 0] / config.world_width)
+                        dx[:, 1] -= config.world_height * np.round(dx[:, 1] / config.world_height)
+                    pos_b = pos_a + dx
 
-                comp_color = np.mean(self.species_colors[species[members]], axis=0)
-                bond_rgba  = np.array([*comp_color, 0.5], dtype=np.float32)
-
-                pos_a = pos[mem_a_v].copy()
-                dx    = pos[mem_b_v] - pos_a
-                if config.boundary_mode == "periodic":
-                    dx[:, 0] -= config.world_width  * np.round(dx[:, 0] / config.world_width)
-                    dx[:, 1] -= config.world_height * np.round(dx[:, 1] / config.world_height)
-                pos_b = pos_a + dx
-
-                n_pairs = len(mem_a_v)
-                # Interleave: [a0, b0, a1, b1, ...]
-                pairs_pos = np.empty((n_pairs * 2, 2), dtype=np.float32)
-                pairs_pos[0::2] = pos_a
-                pairs_pos[1::2] = pos_b
-                rgba_tiled = np.tile(bond_rgba, (n_pairs * 2, 1))
-                bond_chunks.append(np.concatenate([pairs_pos, rgba_tiled], axis=1))
-
-            if bond_chunks:
-                bond_data = np.concatenate(bond_chunks, axis=0).astype(np.float32)
-                n_bytes   = min(bond_data.nbytes, self._bond_buf_size)
-                self.bond_vbo.write(bond_data.flatten().tobytes()[:n_bytes])
-                self._n_bond_vertices = len(bond_data)
+                    n_pairs = len(mem_a)
+                    bond_verts = np.empty((n_pairs * 2, 6), dtype=np.float32)
+                    bond_verts[0::2, :2] = pos_a
+                    bond_verts[1::2, :2] = pos_b
+                    bond_verts[0::2, 2:5] = self.species_colors[species[mem_a]]
+                    bond_verts[1::2, 2:5] = self.species_colors[species[mem_b]]
+                    bond_verts[:, 5] = 0.5
+                    n_bytes = min(bond_verts.nbytes, self._bond_buf_size)
+                    self.bond_vbo.write(bond_verts.tobytes()[:n_bytes])
+                    self._n_bond_vertices = n_pairs * 2
 
         elif self.composite_mode == self.MODE_MERGED and len(alive_comp_idx) > 0:
-            merged_verts = []
-            for c in alive_comp_idx:
-                n = comp_count[c]
-                members = comp_members[c, :n]
-                if n < 1:
-                    continue
-                valid_m = members[members >= 0]
-                if len(valid_m) == 0:
-                    continue
-                com        = np.mean(pos[valid_m], axis=0)
-                total_mass = np.sum(mass[valid_m])
-                avg_color  = np.mean(self.species_colors[species[valid_m]], axis=0)
-                sz = np.clip(
-                    config.point_size_min + np.log1p(total_mass) * 4.0,
-                    config.point_size_min, config.point_size_max * 1.5
-                )
-                merged_verts.append(
-                    np.array([*com, *avg_color, 1.0, sz], dtype=np.float32)
-                )
+            C_idx = alive_comp_idx
+            max_n = int(comp_count[C_idx].max())
+            mb    = comp_members[C_idx, :max_n]     # (n_comps, max_n)
+            cnt   = comp_count[C_idx]               # (n_comps,)
+            # valid mask: slot index in-range and member index non-negative
+            vm    = (mb >= 0) & (np.arange(max_n)[None, :] < cnt[:, None])
+            safe_m = np.where(vm, mb, 0)             # safe gather indices (no -1)
+            vm_f  = vm.astype(np.float32)
 
-            if merged_verts:
-                merged_data = np.stack(merged_verts, axis=0).astype(np.float32)
-                offset      = self._n_particles_to_draw * self._particle_vertex_size * 4
-                extra_bytes = merged_data.flatten().tobytes()
-                avail       = self._particle_buf_size - offset
-                self.particle_vbo.write(extra_bytes[:min(len(extra_bytes), avail)], offset=offset)
-                self._n_particles_to_draw += len(merged_verts)
+            g_pos  = pos[safe_m]                                     # (n_comps, max_n, 2)
+            g_mass = mass[safe_m] * vm_f                             # (n_comps, max_n)
+            g_col  = self.species_colors[species[safe_m]]            # (n_comps, max_n, 3)
+            sum_vm = vm_f.sum(1, keepdims=True) + 1e-8
+            com    = (g_pos * vm_f[:, :, None]).sum(1) / sum_vm      # (n_comps, 2)
+            tmass  = g_mass.sum(1)
+            acolor = (g_col * vm_f[:, :, None]).sum(1) / sum_vm      # (n_comps, 3)
+            sz = np.clip(
+                config.point_size_min + np.log1p(tmass) * 4.0,
+                config.point_size_min, config.point_size_max * 1.5
+            )
+            n_m  = len(C_idx)
+            slot = self._part_vbuf[n_alive : n_alive + n_m]
+            slot[:, 0:2] = com
+            slot[:, 2:5] = acolor
+            slot[:, 5]   = 1.0
+            slot[:, 6]   = sz
+            self.particle_vbo.write(self._part_vbuf[:n_alive + n_m].tobytes())
+            self._n_particles_to_draw = n_alive + n_m
 
         # ── Stats ─────────────────────────────────────────────────────────────
         self._stats_alive    = int(np.sum(alive))
         self._stats_free     = int(np.sum(alive & (comp_id < 0)))
         self._stats_n_comp   = int(np.sum(comp_alive))
-        self._stats_energy   = float(np.asarray(state.total_energy))
-        self._stats_step     = int(np.asarray(state.step_count))
-        self._stats_sim_time = float(np.asarray(state.time))
+        self._stats_energy   = float(total_energy)
+        self._stats_step     = int(step_count)
+        self._stats_sim_time = float(sim_time)
 
         if self._stats_n_comp > 0:
             alive_counts = comp_count[comp_alive]
