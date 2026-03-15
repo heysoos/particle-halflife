@@ -288,6 +288,7 @@ class Renderer:
         self._prev_comp_alive = None
 
         self._stats_alive    = 0
+        self._stats_free     = 0
         self._stats_n_comp   = 0
         self._stats_energy   = 0.0
         self._stats_step     = 0
@@ -296,16 +297,14 @@ class Renderer:
 
         # Event counters
         self._fusion_total   = 0
-        self._fission_total  = 0
-        self._spawn_total    = 0
-        self._decay_total    = 0
+        self._decay_total    = 0   # composite decays (fissions)
         self._fusion_rate    = 0.0
-        self._fission_rate   = 0.0
+        self._decay_rate     = 0.0
         self._event_history  = collections.deque(maxlen=300)
 
         # Sparkline buffers
         SPARK_LEN = 150
-        self._spark_alive  = collections.deque(maxlen=SPARK_LEN)
+        self._spark_free   = collections.deque(maxlen=SPARK_LEN)
         self._spark_comp   = collections.deque(maxlen=SPARK_LEN)
         self._spark_energy = collections.deque(maxlen=SPARK_LEN)
 
@@ -374,15 +373,15 @@ class Renderer:
             brightness = np.clip(0.5 + speed / config.init_speed, 0.5, 1.5)
             colors = np.clip(colors * brightness[:, None], 0.0, 1.0)
 
-            alpha = np.where(p_comp >= 0, 0.7, 1.0).astype(np.float32)
+            if self.composite_mode == self.MODE_MERGED:
+                alpha = np.where(p_comp >= 0, 0.15, 1.0).astype(np.float32)
+            else:
+                alpha = np.ones(n_alive, dtype=np.float32)
 
             size = np.clip(
                 config.point_size_min + np.log1p(p_mass) * 3.0,
                 config.point_size_min, config.point_size_max
             ).astype(np.float32)
-
-            if self.composite_mode == self.MODE_MERGED:
-                alpha = np.where(p_comp >= 0, 0.0, alpha)
 
             vertex_data = np.concatenate([
                 p_pos.astype(np.float32),
@@ -463,6 +462,7 @@ class Renderer:
 
         # ── Stats ─────────────────────────────────────────────────────────────
         self._stats_alive    = int(np.sum(alive))
+        self._stats_free     = int(np.sum(alive & (comp_id < 0)))
         self._stats_n_comp   = int(np.sum(comp_alive))
         self._stats_energy   = float(np.asarray(state.total_energy))
         self._stats_step     = int(np.asarray(state.step_count))
@@ -489,8 +489,6 @@ class Renderer:
         ]
 
         if self._show_events and self._prev_alive is not None:
-            new_parts  = ~self._prev_alive      & alive
-            dead_parts = self._prev_alive       & ~alive
             new_comps  = ~self._prev_comp_alive & comp_alive
             dead_comps = self._prev_comp_alive  & ~comp_alive
 
@@ -520,45 +518,27 @@ class Renderer:
                         (ex, ey, 0.0, 1.0, 1.0, current_sim_time, comp_lifetime_secs)
                     )
 
-            # Spawn events (green) — subsample
-            for i in np.where(new_parts)[0][:min(15, budget // 8)]:
-                self._events.append(
-                    (float(pos[i, 0]), float(pos[i, 1]),
-                     0.2, 1.0, 0.2, current_sim_time, part_lifetime_secs)
-                )
-
-            # Decay events (red) — subsample
-            for i in np.where(dead_parts)[0][:min(15, budget // 8)]:
-                self._events.append(
-                    (float(pos[i, 0]), float(pos[i, 1]),
-                     1.0, 0.2, 0.2, current_sim_time, part_lifetime_secs)
-                )
-
             # Hard cap
             self._events = self._events[-self._event_max:]
 
-        # Accumulate event counts (uses prev masks computed above)
+        # Accumulate event counts (composite-level only; free particles don't decay)
         if self._prev_alive is not None:
-            n_fusion  = int(np.sum(~self._prev_comp_alive & comp_alive))
-            n_fission = int(np.sum(self._prev_comp_alive  & ~comp_alive))
-            n_spawn   = int(np.sum(~self._prev_alive      & alive))
-            n_decay   = int(np.sum(self._prev_alive       & ~alive))
-            self._fusion_total  += n_fusion
-            self._fission_total += n_fission
-            self._spawn_total   += n_spawn
-            self._decay_total   += n_decay
+            n_fusion = int(np.sum(~self._prev_comp_alive & comp_alive))
+            n_decay  = int(np.sum(self._prev_comp_alive  & ~comp_alive))
+            self._fusion_total += n_fusion
+            self._decay_total  += n_decay
             self._event_history.append(
-                (self._stats_sim_time, n_fusion, n_fission, n_spawn, n_decay)
+                (self._stats_sim_time, n_fusion, n_decay)
             )
             recent = [e for e in self._event_history
                       if e[0] >= self._stats_sim_time - 5.0]
             if len(recent) >= 2:
                 dt = max(0.01, recent[-1][0] - recent[0][0])
-                self._fusion_rate  = sum(e[1] for e in recent) / dt
-                self._fission_rate = sum(e[2] for e in recent) / dt
+                self._fusion_rate = sum(e[1] for e in recent) / dt
+                self._decay_rate  = sum(e[2] for e in recent) / dt
 
         # Sparklines
-        self._spark_alive.append(self._stats_alive)
+        self._spark_free.append(self._stats_free)
         self._spark_comp.append(self._stats_n_comp)
         self._spark_energy.append(self._stats_energy)
 
@@ -663,9 +643,10 @@ class Renderer:
         # ── Stats panel ───────────────────────────────────────────────────────
         if self._show_stats:
             config = self.config
-            max_hist_bins = config.max_composite_size - 1  # sizes 2..max
-            spark_rows = 3  # alive, composites, energy
-            panel_h = 120 + spark_rows * 18 + 4 * 16 + max_hist_bins * 13
+            # panel_h: 4 static rows (16px) + 3 spark-stat rows (15+18px) +
+            #          gap + 2 counter rows (16px) + gap + header (18px) +
+            #          chart (64px) + ticks (20px) + bottom (10px)
+            panel_h = (4 * 16 + 3 * 33 + 4 + 2 * 16 + 4 + 18 + 64 + 20 + 10)
             panel_w = 215
             panel_x = config.window_width - panel_w - 8
             panel_y = 8
@@ -676,63 +657,76 @@ class Renderer:
 
             y_off = panel_y + 6
 
-            # Static lines without sparklines
+            # Static lines (no sparkline)
             for line in [
                 f"FPS:        {fps:.1f}",
                 f"Step:       {self._stats_step:,}",
                 f"Sim time:   {self._stats_sim_time:.1f}",
+                f"Particles:  {self._stats_alive:,}",
             ]:
                 txt = font.render(line, True, (190, 215, 255))
                 surface.blit(txt, (panel_x + 6, y_off))
                 y_off += 16
 
-            # Lines with sparklines
-            spark_w, spark_h = 100, 14
-            spark_x = panel_x + panel_w - spark_w - 6
-            for label, val, spark_data, color in [
-                (f"Alive:      {self._stats_alive:,}", None, self._spark_alive,  (80, 180, 255)),
-                (f"Composites: {self._stats_n_comp:,}", None, self._spark_comp,   (120, 220, 120)),
-                (f"Energy:     {self._stats_energy:.0f}", None, self._spark_energy, (220, 180, 80)),
+            # Spark-stat rows: label on one line, sparkline below it
+            spark_w = panel_w - 16
+            spark_h = 14
+            spark_x = panel_x + 8
+            for label, spark_data, color in [
+                (f"Free:       {self._stats_free:,}",   self._spark_free,   (80, 180, 255)),
+                (f"Composites: {self._stats_n_comp:,}", self._spark_comp,   (120, 220, 120)),
+                (f"Energy:     {self._stats_energy:.0f}", self._spark_energy, (220, 180, 80)),
             ]:
                 txt = font.render(label, True, (190, 215, 255))
                 surface.blit(txt, (panel_x + 6, y_off))
+                y_off += 15
                 self._draw_sparkline(surface, spark_data, spark_x, y_off, spark_w, spark_h, color)
                 y_off += 18
 
             # Event counter lines
-            y_off += 2
+            y_off += 4
             for line in [
-                f"Fusions:   {self._fusion_total:,}  ({self._fusion_rate:.1f}/s)",
-                f"Fissions:  {self._fission_total:,}  ({self._fission_rate:.1f}/s)",
-                f"Spawns:    {self._spawn_total:,}",
-                f"Decays:    {self._decay_total:,}",
+                f"Decays:   {self._decay_total:,}  ({self._decay_rate:.1f}/s)",
+                f"Fusions:  {self._fusion_total:,}  ({self._fusion_rate:.1f}/s)",
             ]:
                 txt = font.render(line, True, (190, 215, 255))
                 surface.blit(txt, (panel_x + 6, y_off))
                 y_off += 16
 
-            # Histogram header
-            y_off += 2
+            # Histogram — vertical bar chart
+            y_off += 4
             txt = font.render("Composite sizes:", True, (160, 185, 230))
             surface.blit(txt, (panel_x + 6, y_off))
-            y_off += 15
+            y_off += 18
 
-            max_count = max(1, int(np.max(self._stats_hist[1:])) if len(self._stats_hist) > 1 else 1)
-            bar_max_w = panel_w - 44
-            for sz_idx in range(1, min(len(self._stats_hist), config.max_composite_size)):
-                count = int(self._stats_hist[sz_idx])
-                bar_w = int(bar_max_w * count / max_count)
-                lbl   = font.render(f"{sz_idx+1}:", True, (140, 170, 210))
-                surface.blit(lbl, (panel_x + 5, y_off))
-                if bar_w > 0:
-                    pygame.draw.rect(surface,
-                                     (60, 140, 220, 200),
-                                     pygame.Rect(panel_x + 36, y_off + 1, bar_w, 10))
-                if count > 0:
-                    cnt_lbl = font.render(str(count), True, (180, 210, 255))
-                    cnt_x = min(panel_x + 40 + bar_w + 2, panel_x + panel_w - 26)
-                    surface.blit(cnt_lbl, (cnt_x, y_off))
-                y_off += 13
+            chart_w = panel_w - 16
+            chart_h = 64
+            chart_x = panel_x + 8
+            chart_y = y_off
+            n_bins   = min(len(self._stats_hist) - 1, 40)
+            bar_w    = max(1, (chart_w - n_bins) // max(1, n_bins))
+            max_count = max(1, int(np.max(self._stats_hist[1:n_bins + 2]))
+                            if len(self._stats_hist) > 1 else 1)
+
+            for sz_idx in range(1, n_bins + 1):
+                count = int(self._stats_hist[sz_idx]) if sz_idx < len(self._stats_hist) else 0
+                if count == 0:
+                    continue
+                bh = max(1, int(chart_h * count / max_count))
+                bx = chart_x + (sz_idx - 1) * (bar_w + 1)
+                pygame.draw.rect(surface, (60, 140, 220, 200),
+                                 pygame.Rect(bx, chart_y + chart_h - bh, bar_w, bh))
+
+            pygame.draw.line(surface, (80, 110, 160),
+                             (chart_x, chart_y + chart_h),
+                             (chart_x + chart_w, chart_y + chart_h), 1)
+            for tick in [2, 5, 10, 15]:
+                tick_idx = tick - 1
+                if tick_idx < n_bins:
+                    tx = chart_x + (tick_idx) * (bar_w + 1)
+                    lbl = font.render(str(tick), True, (120, 150, 190))
+                    surface.blit(lbl, (tx - lbl.get_width() // 2, chart_y + chart_h + 2))
+            y_off = chart_y + chart_h + 20
 
         # ── Bottom key hint ───────────────────────────────────────────────────
         hint = "[Space] pause  [+/-] speed  [B] viz  [R] reset  [Q] quit"

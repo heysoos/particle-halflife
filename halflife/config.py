@@ -31,7 +31,7 @@ class SimConfig:
 
     # ── Composites ───────────────────────────────────────────────────────────
     max_composites: int = 500       # fixed composite pool capacity
-    max_composite_size: int = 64    # JAX buffer size — not a physics cap; chemistry determines stability
+    max_composite_size: int = 16    # JAX buffer size — not a physics cap; chemistry determines stability
 
     # ── Spatial Indexing ─────────────────────────────────────────────────────
     # cell_size should equal interaction_radius for optimal neighbor queries
@@ -87,8 +87,9 @@ class SimConfig:
     # ── Polarity Chemistry ────────────────────────────────────────────────────
     # Each species has a signed polarity charge p[s] ∈ [-1, 1].
     # Opposite polarities fuse more readily; neutral composites live longer.
-    polarity_fusion_scale:    float = 0.3   # bonus/penalty to binding energy
-    polarity_stability_scale: float = 0.5   # neutrality boost to composite half-life
+    polarity_fusion_scale:      float = 0.3   # bonus/penalty to binding energy
+    polarity_stability_scale:   float = 0.5   # neutrality boost to composite half-life
+    composite_size_decay_scale: float = 0.3   # size penalty on composite half-life (larger → shorter hl)
 
     # ── Performance Caps ─────────────────────────────────────────────────────
     # Cap fusion scan to first K candidates per step (avoids O(N) sequential scan)

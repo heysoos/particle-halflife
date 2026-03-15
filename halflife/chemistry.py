@@ -444,6 +444,12 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
     all_reps = jax.vmap(get_rep)(jnp.arange(N, dtype=jnp.int32))  # (N,)
     is_rep = (all_reps == jnp.arange(N)) & particles.alive  # (N,)
 
+    # ── Pre-cache entity species (computed once, reused in check_neighbor) ────
+    # This reduces _build_entity_species calls from N*max_neighbors to N.
+    all_entity_sp, all_entity_cnt, _ = jax.vmap(
+        lambda i: _build_entity_species(i, particles, composites, config)
+    )(jnp.arange(N, dtype=jnp.int32))  # (N, M), (N,)
+
     # ── Step 2: For each representative, find its best fusion partner ──────────
     def find_entity_partner(i):
         """
@@ -452,7 +458,8 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         """
         i_is_rep = is_rep[i]
 
-        sp_i, cnt_i, _ = _build_entity_species(i, particles, composites, config)
+        sp_i  = all_entity_sp[i]
+        cnt_i = all_entity_cnt[i]
         c_i = jnp.clip(particles.composite_id[i], 0, config.max_composites - 1)
 
         def check_neighbor(j):
@@ -473,7 +480,8 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             in_range = dist2 < fusion_r2
 
             # Build merged species multiset (up to 2*M, clamped to M)
-            sp_j, cnt_j, _ = _build_entity_species(j, particles, composites, config)
+            sp_j  = all_entity_sp[j]
+            cnt_j = all_entity_cnt[j]
             merged_count = jnp.minimum(cnt_i + cnt_j, M)
 
             # Concatenate and sort into one buffer of size M
@@ -612,8 +620,16 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             ]
         )
 
-        # Derive composite properties from merged hash
-        hl = _hash_to_half_life(h, config)
+        # Energy-based half-life: high binding energy → stable, low → unstable
+        t = jnp.clip(
+            (be - config.fusion_threshold) / (1.0 - config.fusion_threshold + 1e-8),
+            0.0, 1.0
+        )
+        hl_base = config.half_life_min + (config.half_life_max - config.half_life_min) * t
+        size_penalty = 1.0 + config.composite_size_decay_scale * jnp.maximum(
+            0.0, mc.astype(jnp.float32) - 2.0
+        )
+        hl = hl_base / size_penalty
 
         # Mean polarity of merged entity
         pi = jnp.where(i_is_free,
