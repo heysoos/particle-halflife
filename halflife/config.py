@@ -26,12 +26,12 @@ class SimConfig:
     # ── Particles ────────────────────────────────────────────────────────────
     max_particles: int = 4_000      # fixed pool capacity (alive + dead slots)
     num_particles_init: int = 2_000 # how many to spawn at initialization
-    num_species: int = 2           # number of distinct particle types
+    num_species: int = 4           # number of distinct particle types
     state_dim: int = 8              # internal state vector size (NCA-style, future use)
 
     # ── Composites ───────────────────────────────────────────────────────────
-    max_composites: int = 2000       # fixed composite pool capacity
-    max_composite_size: int = 128     # JAX buffer size — not a physics cap; chemistry determines stability
+    max_composites: int = 2_000       # fixed composite pool capacity
+    max_composite_size: int = 64     # JAX buffer size — not a physics cap; chemistry determines stability
 
     # ── Spatial Indexing ─────────────────────────────────────────────────────
     # cell_size should equal interaction_radius for optimal neighbor queries
