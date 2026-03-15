@@ -31,6 +31,33 @@ wsl bash -c "source '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-pa
 
 ---
 
+## Git Operations
+
+**IMPORTANT: Git has no global identity configured in WSL.** Always supply `-c user.email` and
+`-c user.name` inline — never `git config --global` (that would mutate shared WSL state).
+
+**The only working commit pattern:**
+```bash
+wsl bash -c "cd '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-particle' && git -c user.email='heysoos@local' -c user.name='Heysoos' add <files...> && git -c user.email='heysoos@local' -c user.name='Heysoos' commit -m 'message'"
+```
+
+**Stage specific source files then commit (copy-paste template):**
+```bash
+wsl bash -c "cd '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-particle' \
+  && git -c user.email='heysoos@local' -c user.name='Heysoos' \
+     add halflife/foo.py halflife/bar.py \
+  && git -c user.email='heysoos@local' -c user.name='Heysoos' \
+     commit -m 'your message here'"
+```
+
+**Never** use `git add -A` or `git add .` — the repo contains `.idea/`, `__pycache__/`,
+`bash.exe.stackdump`, and `init_prompt.txt` that should not be committed.
+
+**`cd` with spaces requires single quotes inside the `wsl bash -c "..."` string.**
+Using double quotes around the path inside the outer double-quoted string will break the shell.
+
+---
+
 ## What This Is
 
 > **For a full human-readable explanation of the implementation, see [`README.md`](README.md).**
@@ -116,7 +143,14 @@ WorldState
     ├── binding_energy (C,) float32
     ├── half_life    (C,) float32
     ├── age          (C,) float32
-    └── species_hash (C,) uint32   — hash of sorted member species multiset
+    ├── species_hash (C,) uint32   — hash of sorted member species multiset
+    └── net_polarity (C,) float32  — mean polarity of members at formation
+
+InteractionParams  (passed separately, not part of WorldState)
+    ├── attraction  (S, S) float32 — signed attraction matrix
+    ├── r_attract   (S, S) float32 — peak attraction radius
+    ├── r_cutoff    (S, S) float32 — zero-force cutoff
+    └── polarity    (S,)   float32 — per-species charge ∈ [-1, 1]
 ```
 
 ## JAX Conventions
@@ -143,28 +177,58 @@ composite_binding_energy = g(h) # derived from hash bits
 decay_products         = parse_products(h)  # number and species of products
 ```
 
-Same species set → same hash → same properties every time. This creates a consistent
-"chemistry" without storing any rules. Different hash constants give different universes.
+Same species set → same hash → same properties every time. Different hash constants give
+different universes.
+
+## Polarity Chemistry
+
+Each species has a fixed scalar **polarity charge** `p[s] ∈ [-1, 1]` stored in
+`params.polarity`. Three effects:
+
+1. **Fusion preference** (`chemistry.py`, `check_neighbor`): opposite-polarity pairs get a
+   binding energy bonus `be_eff = be + polarity_fusion_scale * (-pi*pj)`. Like ionic bonding.
+2. **Force scaling** (`step.py` → `interactions.py`): each particle's `attr_mod` = its
+   composite's `net_polarity` (1.0 for free particles). The attraction term is scaled by
+   `attr_mod_i * attr_mod_j`, making balanced composites inert and polarized ones active.
+3. **Half-life stability** (`chemistry.py`, `fusion_scan_body`): neutral composites
+   (`|net_polarity| ≈ 0`) get `hl_eff = hl * (1 + polarity_stability_scale * neutrality)`.
 
 ## Visualization
 
-- **ModernGL point sprites**: each alive particle is a circle, colored by species (HSV),
-  sized by mass, brightness by energy
-- **Composite modes** (toggle with `B` key):
-  - **Bonds mode**: GL_LINES between composite members (shows internal structure)
+- **Particles**: point sprites colored by species (HSV), sized by log(mass), brightness by speed
+- **Composite modes** (toggle with `B` key or button):
+  - **Bonds mode**: GL_LINES between composite members with periodic-boundary wrapping
   - **Merged mode**: single large point at center of mass
+- **HUD overlay**: pygame RGBA surface uploaded each frame as an OpenGL texture on a
+  fullscreen quad. Buttons on the left edge; key hints at the bottom.
+- **Event sprites**: expanding ring point sprites at fusion (gold), fission (cyan),
+  spawn (green), decay (red) sites. Age tracked in sim-time; capped at 200.
+- **Stats panel** (toggle): FPS, step, sim time, alive, composites, energy,
+  composite-size histogram.
 - **Async overlap**: `simulation_step(N+1)` dispatched before rendering frame N
 
-## Keyboard Controls (main.py)
+## Controls
+
+### Keyboard (main.py)
 
 | Key | Action |
 |-----|--------|
 | Space | Pause / resume |
-| `+` / `-` | Speed up / slow down (steps per render frame) |
+| `+` / `-` | More / fewer simulation steps per frame |
 | `B` | Toggle composite visualization (bonds ↔ merged) |
 | `R` | Reset to initial state |
 | `S` | Save screenshot |
 | `Q` / Esc | Quit |
+
+### Mouse (on-screen buttons, left edge)
+
+| Button | Action |
+|--------|--------|
+| Pause / Resume | Toggle pause |
+| Bonds / Merged | Toggle composite visualization |
+| Stats | Toggle live stats panel |
+| Events | Toggle event sprites |
+| Reset | Re-initialize world |
 
 ## Configuration
 
@@ -173,12 +237,18 @@ Key experiment knobs:
 
 ```python
 config = SimConfig(
-    num_species=16,          # more species → richer chemistry
-    max_particles=50_000,    # total particle pool
-    base_half_life_range=(10.0, 1000.0),  # particle lifetimes
-    interaction_radius=2.0,  # force cutoff
-    fusion_radius=0.5,       # must be < interaction_radius
+    num_species=12,          # more species → richer chemistry
+    max_particles=4_000,     # total particle pool
+    interaction_radius=4.0,  # force cutoff
+    fusion_radius=1.0,       # must be < interaction_radius
+    fusion_threshold=0.2,    # min binding energy to fuse [0,1]
+    half_life_min=50.0,
+    half_life_max=500.0,
     hash_modulus=100_000_007, # changes the "universe" / chemistry
+
+    # Polarity knobs
+    polarity_fusion_scale=0.3,    # bonus/penalty to binding energy
+    polarity_stability_scale=0.5, # neutrality boost to composite half-life
 )
 ```
 

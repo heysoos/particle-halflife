@@ -24,7 +24,9 @@ python -m halflife.main --no-chemistry
 **Requirements:** Python 3.10 (WSL/Ubuntu), JAX + CUDA 12, ModernGL, pygame.
 See `requirements.txt` for exact versions.
 
-### Keyboard Controls
+### Controls
+
+**Keyboard:**
 
 | Key | Action |
 |-----|--------|
@@ -34,6 +36,16 @@ See `requirements.txt` for exact versions.
 | `R` | Reset to initial state |
 | `S` | Save screenshot |
 | `Q` / `Esc` | Quit |
+
+**Mouse (on-screen buttons, left edge of window):**
+
+| Button | Action |
+|--------|--------|
+| Pause / Resume | Toggle pause |
+| Bonds / Merged | Toggle composite visualization |
+| Stats | Toggle live stats panel |
+| Events | Toggle event sprites |
+| Reset | Re-initialize world |
 
 ---
 
@@ -160,6 +172,39 @@ A fused composite records:
 
 ---
 
+### Polarity
+
+Each species carries a fixed **polarity charge** `p[s] ∈ [-1, 1]`, initialized randomly
+via `InteractionParams.polarity`. Three coupled effects:
+
+**1. Fusion preference.** Before comparing to `fusion_threshold`, binding energy is adjusted:
+
+```
+be_eff = be_hash + polarity_fusion_scale × (−pᵢ × pⱼ)
+```
+
+Opposite polarities → positive bonus → easier fusion (ionic-like pairing).
+Same polarities → penalty → harder fusion.
+
+**2. Composite force scaling.** In `step.py`, each particle's `attr_mod` is set to its
+composite's `net_polarity` (1.0 for free particles). The attraction term in the force
+kernel is multiplied by `attr_mod_i × attr_mod_j`:
+
+- `net_polarity ≈ 0` (balanced composite) → near-zero attraction modifier → nearly inert
+- `net_polarity = ±0.8` (polarized composite) → strong interaction, possibly sign-flipping
+  if one composite is positive and the other negative
+
+**3. Composite half-life.** At formation time:
+
+```
+neutrality = 1 − |net_polarity|
+hl_eff = hl_hash × (1 + polarity_stability_scale × neutrality)
+```
+
+Balanced composites live longer; polarized ones are less stable.
+
+---
+
 ### Decay and Fission
 
 Every step, each alive entity draws a uniform random number. It decays if:
@@ -190,16 +235,23 @@ hard constraints that could destabilize dynamics.
 
 The renderer uses **ModernGL + pygame** sharing a single OpenGL context:
 
-- **Particles:** rendered as point sprites via a GLSL vertex+fragment shader.
-  Color = HSV hue by species; size ∝ log(mass); brightness ∝ speed.
-- **Bonds mode** (`B`): `GL_LINES` connecting every pair within each alive composite.
+- **Particles:** point sprites (GLSL). Color = HSV by species; size ∝ log(mass); brightness ∝ speed.
+- **Bonds mode** (`B`): `GL_LINES` between every pair within each composite. Endpoints are
+  wrapped through the minimum-image convention so lines never cross the screen at periodic
+  boundaries.
 - **Merged mode** (`B`): single oversized point at composite center of mass.
+- **Event sprites:** a separate point-sprite pass draws expanding rings at reaction sites.
+  Colors: fusion = gold, fission = cyan, spawn = green, decay = red. Each ring expands
+  over its sim-time lifetime then disappears.
+- **HUD overlay:** a `pygame.Surface(RGBA)` is drawn each frame (buttons, optional stats
+  panel, key-hint bar) and uploaded as a `moderngl.Texture` rendered on a fullscreen quad.
+  Blended on top of the 3D scene.
 
 Data flow per frame:
 1. `np.asarray()` — JAX GPU array → CPU numpy (GPU→CPU sync point)
-2. Pack vertex buffer: `(x, y, r, g, b, a, size)` per particle
-3. `vbo.write()` — upload to GPU via OpenGL
-4. `glDrawArrays(GL_POINTS)` + optional `GL_LINES`
+2. Pack particle VBO: `(x, y, r, g, b, a, size)` per alive particle
+3. Draw particles (`GL_POINTS`), bonds (`GL_LINES`), event rings (`GL_POINTS`)
+4. Render pygame HUD surface as fullscreen textured quad
 5. `pygame.display.flip()`
 
 ---
@@ -211,30 +263,34 @@ All parameters live in `SimConfig` (frozen dataclass). Key knobs:
 ```python
 SimConfig(
     # Scale
-    max_particles       = 4_000,   # pool size; increase for richer dynamics
-    num_particles_init  = 2_000,   # particles spawned at t=0
-    num_species         = 12,      # more species → richer chemistry
+    max_particles        = 4_000,   # pool size; increase for richer dynamics
+    num_particles_init   = 2_000,   # particles spawned at t=0
+    num_species          = 12,      # more species → richer chemistry
 
     # Force shape
-    interaction_radius  = 4.0,     # force cutoff distance
-    repulsion_radius    = 0.8,     # hard-core repulsion inner radius
-    repulsion_strength  = 2.0,
+    interaction_radius   = 4.0,     # force cutoff distance
+    repulsion_radius     = 0.8,     # hard-core repulsion inner radius
+    repulsion_strength   = 2.0,
 
     # Chemistry
-    fusion_radius       = 1.0,     # must be < interaction_radius
-    fusion_threshold    = 0.2,     # min binding energy to trigger fusion [0,1]
-    half_life_min       = 50.0,    # particle half-life range (sim time units)
-    half_life_max       = 500.0,
+    fusion_radius        = 1.0,     # must be < interaction_radius
+    fusion_threshold     = 0.2,     # min binding energy to trigger fusion [0,1]
+    half_life_min        = 50.0,    # particle half-life range (sim time units)
+    half_life_max        = 500.0,
 
     # Universe identity
-    hash_modulus        = 100_000_007,  # change this for a different chemistry
-    hash_prime_a        = 1_000_003,
-    hash_prime_b        = 7,
+    hash_modulus         = 100_000_007,  # change this for a different chemistry
+    hash_prime_a         = 1_000_003,
+    hash_prime_b         = 7,
+
+    # Polarity chemistry
+    polarity_fusion_scale    = 0.3,  # how much polarity boosts/penalizes fusion
+    polarity_stability_scale = 0.5,  # how much neutrality extends composite half-life
 
     # Performance caps
-    max_fusions_per_step = 100,    # fusion scan length cap
-    max_decay_per_step   = 200,    # spawn slots allocated per step
-    use_bond_forces      = False,  # spring forces within composites (expensive)
+    max_fusions_per_step = 100,     # fusion scan length cap
+    max_decay_per_step   = 200,     # spawn slots allocated per step
+    use_bond_forces      = True,    # spring forces within composites
 )
 ```
 
