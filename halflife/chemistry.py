@@ -31,7 +31,7 @@ JIT notes:
 import jax
 import jax.numpy as jnp
 
-from halflife.state import ParticleState, CompositeState, WorldState
+from halflife.state import ParticleState, CompositeState, WorldState, InteractionParams
 from halflife.config import SimConfig
 from halflife.utils import find_free_slots
 
@@ -365,7 +365,7 @@ def apply_composite_decay(state: WorldState, config: SimConfig) -> WorldState:
 # ── Fusion ───────────────────────────────────────────────────────────────────
 
 def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
-                   config: SimConfig) -> WorldState:
+                   params: InteractionParams, config: SimConfig) -> WorldState:
     """
     Try to fuse pairs of nearby free particles into composites.
 
@@ -428,7 +428,13 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             h = _hash_sorted_species(species_sorted, jnp.array(2), config)
             be = _hash_to_binding_energy(h, config)
 
-            can_fuse = valid & in_range & (be > config.fusion_threshold)
+            # Polarity bonus: opposite signs → positive bonus (ionic-like preference)
+            pi = params.polarity[si]
+            pj = params.polarity[sj]
+            polarity_bonus = config.polarity_fusion_scale * (-pi * pj)
+            be_eff = be + polarity_bonus
+
+            can_fuse = valid & in_range & (be_eff > config.fusion_threshold)
             return jnp.where(can_fuse, j, -1), jnp.where(can_fuse, be, 0.0), h
 
         results = jax.vmap(check_neighbor)(neighbors[i])
@@ -489,11 +495,10 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         )
 
         # If can_fuse, allocate a new composite slot
-        # Find first free composite slot
-        free_comp_slot = jnp.argmin(composites_state.alive.astype(jnp.int32) +
+        # Find first free (dead) composite slot
+        free_comp_slot = jnp.argmin(composites_state.alive.astype(jnp.int32) * config.max_composites +
                                      jnp.arange(config.max_composites))
-        # More robust: use the cumulative count
-        comp_slot = jnp.where(can_fuse, comp_count, -1)
+        comp_slot = jnp.where(can_fuse, free_comp_slot, -1)
 
         # Build species array for the new composite
         si = particles.species[i]
@@ -504,6 +509,14 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         species_sorted = species_sorted.at[0].set(s_lo)
         species_sorted = species_sorted.at[1].set(s_hi)
         hl = _hash_to_half_life(h, config)
+
+        # Polarity: net_polarity = mean of member polarities
+        pi = params.polarity[si]
+        pj = params.polarity[sj]
+        net_pol = (pi + pj) / 2.0
+        # Neutral composites (|net_pol| ≈ 0) are more stable
+        neutrality = 1.0 - jnp.abs(net_pol)
+        hl_eff = hl * (1.0 + config.polarity_stability_scale * neutrality)
 
         # Update composite arrays
         new_members = composites_state.members.at[comp_slot].set(
@@ -518,13 +531,16 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             jnp.where(can_fuse, be, composites_state.binding_energy[comp_slot])
         )
         new_comp_hl = composites_state.half_life.at[comp_slot].set(
-            jnp.where(can_fuse, hl, composites_state.half_life[comp_slot])
+            jnp.where(can_fuse, hl_eff, composites_state.half_life[comp_slot])
         )
         new_comp_count_arr = composites_state.member_count.at[comp_slot].set(
             jnp.where(can_fuse, 2, composites_state.member_count[comp_slot])
         )
         new_comp_hash = composites_state.species_hash.at[comp_slot].set(
             jnp.where(can_fuse, h, composites_state.species_hash[comp_slot])
+        )
+        new_comp_net_pol = composites_state.net_polarity.at[comp_slot].set(
+            jnp.where(can_fuse, net_pol, composites_state.net_polarity[comp_slot])
         )
 
         new_composites = composites_state._replace(
@@ -534,6 +550,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             half_life=new_comp_hl,
             member_count=new_comp_count_arr,
             species_hash=new_comp_hash,
+            net_polarity=new_comp_net_pol,
         )
 
         # Update particle composite_id

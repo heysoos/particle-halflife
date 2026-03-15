@@ -56,6 +56,7 @@ class CompositeState(NamedTuple):
     half_life:      jnp.ndarray  # (C,)   float32 — composite decay half-life
     age:            jnp.ndarray  # (C,)   float32 — time since formation
     species_hash:   jnp.ndarray  # (C,)   uint32  — hash of sorted member species
+    net_polarity:   jnp.ndarray  # (C,)   float32 — normalized sum of member polarities
 
 
 class WorldState(NamedTuple):
@@ -151,6 +152,7 @@ def initialize_world(config: SimConfig, seed: int = 0) -> WorldState:
         half_life=jnp.zeros(C, dtype=jnp.float32),
         age=jnp.zeros(C, dtype=jnp.float32),
         species_hash=jnp.zeros(C, dtype=jnp.uint32),
+        net_polarity=jnp.zeros(C, dtype=jnp.float32),
     )
 
     # ── Global scalars ────────────────────────────────────────────────────────
@@ -178,6 +180,7 @@ class InteractionParams(NamedTuple):
     attraction:        jnp.ndarray  # signed strength in [-1, 1]
     r_attract:         jnp.ndarray  # radius of peak attraction/repulsion
     r_cutoff:          jnp.ndarray  # beyond this distance: zero force
+    polarity:          jnp.ndarray  # (num_species,) float32 — species charge ∈ [-1, 1]
 
 
 def initialize_interaction_params(config: SimConfig,
@@ -198,7 +201,7 @@ def initialize_interaction_params(config: SimConfig,
     """
     key = jax.random.PRNGKey(seed)
     S = config.num_species
-    key, k1, k2, k3 = jax.random.split(key, 4)
+    key, k1, k2, k3, k4 = jax.random.split(key, 5)
 
     # Random signed attraction: uniform in [-1, 1]
     attraction = jax.random.uniform(k1, (S, S), minval=-1.0, maxval=1.0)
@@ -213,10 +216,14 @@ def initialize_interaction_params(config: SimConfig,
     # Cutoff: all use global interaction_radius
     r_cutoff = jnp.full((S, S), config.interaction_radius, dtype=jnp.float32)
 
+    # Per-species polarity charge: uniform in [-1, 1]
+    polarity = jax.random.uniform(k4, (S,), minval=-1.0, maxval=1.0)
+
     return InteractionParams(
         attraction=attraction,
         r_attract=r_attract,
         r_cutoff=r_cutoff,
+        polarity=polarity,
     )
 
 

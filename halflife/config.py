@@ -84,13 +84,19 @@ class SimConfig:
     # Max products from a single decay event (padded to this length)
     max_decay_products: int = 3
 
+    # ── Polarity Chemistry ────────────────────────────────────────────────────
+    # Each species has a signed polarity charge p[s] ∈ [-1, 1].
+    # Opposite polarities fuse more readily; neutral composites live longer.
+    polarity_fusion_scale:    float = 0.3   # bonus/penalty to binding energy
+    polarity_stability_scale: float = 0.5   # neutrality boost to composite half-life
+
     # ── Performance Caps ─────────────────────────────────────────────────────
     # Cap fusion scan to first K candidates per step (avoids O(N) sequential scan)
     max_fusions_per_step: int = 100
     # Cap decay spawns per step (keeps find_free_slots fast)
     max_decay_per_step: int = 200
     # Enable spring bond forces between composite members (expensive; off by default)
-    use_bond_forces: bool = False
+    use_bond_forces: bool = True
 
     # ── Rendering ────────────────────────────────────────────────────────────
     window_width: int = 1280
