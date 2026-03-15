@@ -156,6 +156,64 @@ void main() {
 """
 
 
+# ── Slider ────────────────────────────────────────────────────────────────────
+
+class Slider:
+    """Horizontal slider widget — log-scale multiplier centered at 1× (the default)."""
+
+    EXPO_MIN, EXPO_MAX = -1.0, 2.0   # 0.1× to 100× the default value
+
+    def __init__(self, label: str, field: str, default_value: float,
+                 track_rect: pygame.Rect, fmt: str = "{:.3f}"):
+        self._label = label
+        self._field = field
+        self._default = float(default_value)
+        self._exponent = 0.0  # 1× = default
+        self._track_rect = track_rect
+        self._fmt = fmt
+
+    @property
+    def field(self) -> str:
+        return self._field
+
+    @property
+    def value(self) -> float:
+        return self._default * (10.0 ** self._exponent)
+
+    def reset(self) -> None:
+        self._exponent = 0.0
+
+    def _handle_x(self) -> int:
+        t = (self._exponent - self.EXPO_MIN) / (self.EXPO_MAX - self.EXPO_MIN)
+        return int(self._track_rect.left + t * self._track_rect.width)
+
+    def draw(self, surface: pygame.Surface, font) -> None:
+        r = self._track_rect
+        mult = 10.0 ** self._exponent
+        label_str = f"{self._label}: {self._fmt.format(self.value)} ({mult:.2f}\u00d7)"
+        txt = font.render(label_str, True, (190, 215, 255))
+        surface.blit(txt, (r.left, r.top - 14))
+        # Track
+        pygame.draw.rect(surface, (50, 60, 80, 220), r, border_radius=3)
+        # Fill
+        hx = self._handle_x()
+        fill_r = pygame.Rect(r.left, r.top, hx - r.left, r.height)
+        if fill_r.width > 0:
+            pygame.draw.rect(surface, (60, 130, 200, 220), fill_r, border_radius=3)
+        # Handle
+        pygame.draw.circle(surface, (180, 210, 255), (hx, r.centery), 6)
+
+    def hit_handle(self, pos) -> bool:
+        hx = self._handle_x()
+        return abs(pos[0] - hx) <= 8 and abs(pos[1] - self._track_rect.centery) <= 10
+
+    def handle_drag(self, pos) -> float:
+        r = self._track_rect
+        t = (pos[0] - r.left) / max(r.width, 1)
+        self._exponent = self.EXPO_MIN + float(max(0.0, min(1.0, t))) * (self.EXPO_MAX - self.EXPO_MIN)
+        return self.value
+
+
 # ── Renderer ──────────────────────────────────────────────────────────────────
 
 class Renderer:
@@ -270,9 +328,38 @@ class Renderer:
             ("Stats",   "toggle_stats"),
             ("Events",  "toggle_events"),
             ("Reset",   "reset"),
+            ("Params",  "toggle_params"),
         ]):
             rect = pygame.Rect(btn_x, 8 + k * (btn_h + gap), btn_w, btn_h)
             self._buttons.append((label, rect, action))
+
+        # ── Physics sliders ───────────────────────────────────────────────────
+        self._show_params = False
+        self._dragging_slider = None
+        self._physics_updates = {}
+        panel_x = btn_x
+        slider_track_w = 200
+        # First slider starts just below the "Params" button (index 5)
+        slider_start_y = 8 + 6 * (btn_h + gap) + 8  # 8px below bottom of Params btn
+        slider_row_h = 38
+        slider_specs = [
+            ("damping",                  "damping",     0.995, "{:.4f}"),
+            ("repulsion_strength",       "repulsion",   2.0,   "{:.2f}"),
+            ("fusion_threshold",         "fuse thresh", 0.2,   "{:.3f}"),
+            ("polarity_fusion_scale",    "pol fuse",    0.3,   "{:.3f}"),
+            ("polarity_stability_scale", "pol stab",    0.5,   "{:.3f}"),
+            ("binding_energy_scale",     "bind energy", 1.0,   "{:.3f}"),
+            ("repulsion_radius",         "repulse r",   0.8,   "{:.2f}"),
+            ("r_cutoff_scale",           "attract r\u00d7",  1.0,   "{:.2f}"),
+            ("spring_k",                 "spring k",    50.0,  "{:.1f}"),
+            ("attraction_scale",         "attract \u00d7",   1.0,   "{:.2f}"),
+        ]
+        self._sliders = []
+        for k, (field, label, default, fmt) in enumerate(slider_specs):
+            row_y = slider_start_y + k * slider_row_h
+            track = pygame.Rect(panel_x + 4, row_y + 18, slider_track_w, 8)
+            self._sliders.append(Slider(label, field, default, track, fmt))
+        self._params_reset_rect = pygame.Rect(panel_x + 4, slider_start_y - 26, 100, 20)
 
         # ── Runtime state ─────────────────────────────────────────────────────
         self._n_particles_to_draw = 0
@@ -307,6 +394,8 @@ class Renderer:
         self._spark_free   = collections.deque(maxlen=SPARK_LEN)
         self._spark_comp   = collections.deque(maxlen=SPARK_LEN)
         self._spark_energy = collections.deque(maxlen=SPARK_LEN)
+        self._spark_fusion = collections.deque(maxlen=SPARK_LEN)
+        self._spark_decay  = collections.deque(maxlen=SPARK_LEN)
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -333,6 +422,40 @@ class Renderer:
             if rect.collidepoint(pos):
                 return action
         return None
+
+    def toggle_params(self) -> None:
+        self._show_params = not self._show_params
+
+    def handle_mousedown_slider(self, pos) -> bool:
+        """Start dragging a slider if pos hits a handle, or reset all if reset button hit."""
+        if not self._show_params:
+            return False
+        if self._params_reset_rect.collidepoint(pos):
+            for s in self._sliders:
+                s.reset()
+            self._physics_updates.update({s.field: s.value for s in self._sliders})
+            return True
+        for slider in self._sliders:
+            if slider.hit_handle(pos):
+                self._dragging_slider = slider
+                slider.handle_drag(pos)
+                self._physics_updates[slider.field] = slider.value
+                return True
+        return False
+
+    def handle_mousemotion(self, pos) -> None:
+        if self._dragging_slider is not None:
+            self._dragging_slider.handle_drag(pos)
+            self._physics_updates[self._dragging_slider.field] = self._dragging_slider.value
+
+    def handle_mouseup(self) -> None:
+        self._dragging_slider = None
+
+    def get_physics_updates(self) -> dict:
+        """Return accumulated {field: float} updates and clear the buffer."""
+        updates = dict(self._physics_updates)
+        self._physics_updates.clear()
+        return updates
 
     # ── Per-frame update ──────────────────────────────────────────────────────
 
@@ -550,6 +673,8 @@ class Renderer:
         self._spark_free.append(self._stats_free)
         self._spark_comp.append(self._stats_n_comp)
         self._spark_energy.append(self._stats_energy)
+        self._spark_fusion.append(self._fusion_rate)
+        self._spark_decay.append(self._decay_rate)
 
         self._prev_alive      = alive.copy()
         self._prev_comp_alive = comp_alive.copy()
@@ -633,6 +758,8 @@ class Renderer:
                 display_label = "Stats ON" if self._show_stats else "Stats"
             elif action == 'toggle_events':
                 display_label = "Events ON" if self._show_events else "Events"
+            elif action == 'toggle_params':
+                display_label = "Params ON" if self._show_params else "Params"
 
             # Background
             if action in ('reset',):
@@ -652,10 +779,9 @@ class Renderer:
         # ── Stats panel ───────────────────────────────────────────────────────
         if self._show_stats:
             config = self.config
-            # panel_h: 4 static rows (16px) + 3 spark-stat rows (15+18px) +
-            #          gap + 2 counter rows (16px) + gap + header (18px) +
-            #          chart (64px) + ticks (20px) + bottom (10px)
-            panel_h = (4 * 16 + 3 * 33 + 4 + 2 * 16 + 4 + 18 + 64 + 20 + 10)
+            # panel_h: 4 static rows (16px) + 5 spark-stat rows (15+18px) +
+            #          gap + header (18px) + chart (64px) + ticks (20px) + bottom (10px)
+            panel_h = (4 * 16 + 5 * 33 + 4 + 18 + 64 + 20 + 10)
             panel_w = 215
             panel_x = config.window_width - panel_w - 8
             panel_y = 8
@@ -692,15 +818,17 @@ class Renderer:
                 self._draw_sparkline(surface, spark_data, spark_x, y_off, spark_w, spark_h, color)
                 y_off += 18
 
-            # Event counter lines
+            # Spark-stat rows for fusions and decays
             y_off += 4
-            for line in [
-                f"Decays:   {self._decay_total:,}  ({self._decay_rate:.1f}/s)",
-                f"Fusions:  {self._fusion_total:,}  ({self._fusion_rate:.1f}/s)",
+            for label, spark_data, color in [
+                (f"Fusions: {self._fusion_total:,} ({self._fusion_rate:.1f}/s)", self._spark_fusion, (220, 170, 60)),
+                (f"Decays:  {self._decay_total:,}  ({self._decay_rate:.1f}/s)",  self._spark_decay,  (80, 200, 220)),
             ]:
-                txt = font.render(line, True, (190, 215, 255))
+                txt = font.render(label, True, (190, 215, 255))
                 surface.blit(txt, (panel_x + 6, y_off))
-                y_off += 16
+                y_off += 15
+                self._draw_sparkline(surface, spark_data, spark_x, y_off, spark_w, spark_h, color)
+                y_off += 18
 
             # Histogram — vertical bar chart
             y_off += 4
@@ -729,13 +857,34 @@ class Renderer:
             pygame.draw.line(surface, (80, 110, 160),
                              (chart_x, chart_y + chart_h),
                              (chart_x + chart_w, chart_y + chart_h), 1)
-            for tick in [2, 5, 10, 15]:
+            raw_ticks = np.linspace(2, n_bins, 5).astype(int)
+            for tick in sorted(set(raw_ticks)):
                 tick_idx = tick - 1
-                if tick_idx < n_bins:
-                    tx = chart_x + (tick_idx) * (bar_w + 1)
+                if 0 <= tick_idx < n_bins:
+                    tx = chart_x + tick_idx * (bar_w + 1)
                     lbl = font.render(str(tick), True, (120, 150, 190))
                     surface.blit(lbl, (tx - lbl.get_width() // 2, chart_y + chart_h + 2))
             y_off = chart_y + chart_h + 20
+
+        # ── Params panel ──────────────────────────────────────────────────────
+        if self._show_params:
+            btn_w, btn_h, gap = 108, 26, 4
+            panel_x = 8
+            slider_start_y = 8 + 6 * (btn_h + gap) + 8
+            panel_w = 220
+            panel_h = len(self._sliders) * 38 + 10 + 26
+            panel_rect = pygame.Rect(panel_x - 4, slider_start_y - 30, panel_w, panel_h)
+            pygame.draw.rect(surface, (15, 18, 35, 185), panel_rect, border_radius=6)
+            pygame.draw.rect(surface, (70, 100, 150, 180), panel_rect, 1, border_radius=6)
+            # Reset Params button
+            reset_rect = self._params_reset_rect
+            pygame.draw.rect(surface, (80, 30, 30, 200), reset_rect, border_radius=4)
+            pygame.draw.rect(surface, (150, 80, 80, 180), reset_rect, 1, border_radius=4)
+            reset_txt = font.render("Reset Params", True, (255, 160, 160))
+            surface.blit(reset_txt, (reset_rect.centerx - reset_txt.get_width() // 2,
+                                     reset_rect.centery - reset_txt.get_height() // 2))
+            for slider in self._sliders:
+                slider.draw(surface, font)
 
         # ── Bottom key hint ───────────────────────────────────────────────────
         hint = "[Space] pause  [+/-] speed  [B] viz  [R] reset  [Q] quit"

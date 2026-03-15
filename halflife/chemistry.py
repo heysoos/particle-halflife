@@ -31,7 +31,7 @@ JIT notes:
 import jax
 import jax.numpy as jnp
 
-from halflife.state import ParticleState, CompositeState, WorldState, InteractionParams
+from halflife.state import ParticleState, CompositeState, WorldState, InteractionParams, PhysicsParams
 from halflife.config import SimConfig
 from halflife.utils import find_free_slots
 
@@ -83,10 +83,15 @@ def _hash_to_half_life(h: jnp.ndarray, config: SimConfig) -> jnp.ndarray:
     return (base + spread * (frac * 2.0 - 1.0)) * config.composite_half_life_scale
 
 
-def _hash_to_binding_energy(h: jnp.ndarray, config: SimConfig) -> jnp.ndarray:
+def _hash_to_binding_energy(h: jnp.ndarray, config: SimConfig,
+                             physics: PhysicsParams) -> jnp.ndarray:
     """Derive binding energy from species hash (normalized to [0, 1])."""
-    frac = (((h // 1000) % 1000).astype(jnp.float32)) / 999.0
-    return frac * config.binding_energy_scale
+    # Bug fix: (h // 1000) % 1000 always read 0 because entity hashes are
+    # multiples of hash_prime_a ≈ 10^6, so decimal digits 3-5 are always zero.
+    # Fix: apply a secondary Fibonacci-hash mix before extracting low digits.
+    h2 = (h * jnp.uint32(2_654_435_761)) ^ (h >> jnp.uint32(13))
+    frac = (h2 % jnp.uint32(1000)).astype(jnp.float32) / 999.0
+    return frac * physics.binding_energy_scale
 
 
 def _hash_to_decay_products(h: jnp.ndarray, parent_species: jnp.ndarray,
@@ -382,7 +387,8 @@ def apply_composite_decay(state: WorldState, config: SimConfig) -> WorldState:
 # ── Fusion ───────────────────────────────────────────────────────────────────
 
 def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
-                   params: InteractionParams, config: SimConfig) -> WorldState:
+                   params: InteractionParams, config: SimConfig,
+                   physics: PhysicsParams) -> WorldState:
     """
     Unified entity-entity fusion: any entity (free particle or composite) can
     fuse with any neighboring entity.
@@ -462,7 +468,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             merged_h = ((h_i.astype(jnp.int32) + all_entity_hash[j].astype(jnp.int32))
                         % config.hash_modulus).astype(jnp.uint32)
 
-            be = _hash_to_binding_energy(merged_h, config)
+            be = _hash_to_binding_energy(merged_h, config, physics)
 
             # Polarity bonus
             c_j = jnp.clip(particles.composite_id[j], 0, config.max_composites - 1)
@@ -476,12 +482,12 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
                 params.polarity[particles.species[j]],
                 composites.net_polarity[c_j]
             )
-            be_eff = be + config.polarity_fusion_scale * (-pi * pj)
+            be_eff = be + physics.polarity_fusion_scale * (-pi * pj)
 
             # Size cap: don't grow beyond buffer
             would_overflow = (cnt_i + cnt_j) > M
 
-            can_fuse = valid & in_range & (be_eff > config.fusion_threshold) & ~would_overflow
+            can_fuse = valid & in_range & (be_eff > physics.fusion_threshold) & ~would_overflow
             return (
                 jnp.where(can_fuse, j,            jnp.int32(-1)),
                 jnp.where(can_fuse, be_eff,        jnp.float32(0.0)),
@@ -583,7 +589,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
 
         # Energy-based half-life: high binding energy → stable, low → unstable
         t = jnp.clip(
-            (be - config.fusion_threshold) / (1.0 - config.fusion_threshold + 1e-8),
+            (be - physics.fusion_threshold) / (1.0 - physics.fusion_threshold + 1e-8),
             0.0, 1.0
         )
         hl_base = config.half_life_min + (config.half_life_max - config.half_life_min) * t
@@ -604,7 +610,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         net_pol = (pi * cnt_i_scalar.astype(jnp.float32) +
                    pj * cnt_j_scalar.astype(jnp.float32)) / (mc.astype(jnp.float32) + 1e-8)
         neutrality = 1.0 - jnp.abs(net_pol)
-        hl_eff = hl * (1.0 + config.polarity_stability_scale * neutrality)
+        hl_eff = hl * (1.0 + physics.polarity_stability_scale * neutrality)
 
         # Build the merged member list: gather all member particle indices
         # i-side members
@@ -620,8 +626,12 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         # Concat first half of each into a (M,) buffer
         half = M // 2
         merged_members = jnp.concatenate([i_members[:half], j_members[:half]])  # (M,)
-        # Replace -1 sentinels beyond mc with -1 (already set), ensure count is mc
-        # (The concat gives us up to M valid slots; any excess are -1 already)
+        # Compact: valid IDs (>=0) must occupy slots [0..mc-1]; -1 sentinels at the end.
+        # Without compaction, the concat produces e.g. [i, -1, -1, -1, j, -1, -1, -1]
+        # while member_count=2 implies members[0] and members[1] are both valid.
+        # Fix: argsort by validity descending (1=valid, 0=-1) moves valid IDs to front.
+        order = jnp.argsort(-(merged_members >= 0).astype(jnp.int32), stable=True)
+        merged_members = merged_members[order]
 
         # Write to target composite
         safe_target = jnp.where(can_fuse, target, 0)

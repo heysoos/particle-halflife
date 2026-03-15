@@ -30,6 +30,7 @@ Keyboard controls:
 """
 
 import argparse
+import collections
 import time
 import os
 import numpy as np
@@ -39,8 +40,8 @@ import jax.numpy as jnp
 import pygame
 
 from halflife.config import SimConfig
-from halflife.state import initialize_world, initialize_interaction_params
-from halflife.step import simulation_step
+from halflife.state import initialize_world, initialize_interaction_params, initialize_physics_params
+from halflife.step import make_run_n_steps
 from halflife.renderer import Renderer
 
 
@@ -82,18 +83,24 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
     print(f"Initializing world: {config.num_particles_init:,} particles, "
           f"{config.num_species} species, world {config.world_width}x{config.world_height}")
 
-    state  = initialize_world(config, seed=seed)
-    params = initialize_interaction_params(config, seed=seed + 1)
+    state   = initialize_world(config, seed=seed)
+    params  = initialize_interaction_params(config, seed=seed + 1)
+    physics = initialize_physics_params(config)
     renderer = Renderer(config)
 
-    # JIT-compile the simulation step (first call triggers compilation)
+    # JIT-compile via make_run_n_steps (first call triggers compilation)
     print("JIT-compiling simulation step... (this takes ~10-30 seconds first time)")
     t0 = time.time()
-    _step_fn = jax.jit(simulation_step, static_argnums=(2,))
-    # Warm up
-    _ = _step_fn(state, params, config)
+    run_n = make_run_n_steps(config)
+    # Warm up with a single step
+    _ = run_n(state, params, physics, 1)
     jax.block_until_ready(_)
     print(f"JIT compilation done in {time.time() - t0:.1f}s")
+
+    # Frame-time profiling deques (rolling 60-frame windows)
+    _t_sim    = collections.deque(maxlen=60)
+    _t_update = collections.deque(maxlen=60)
+    _t_render = collections.deque(maxlen=60)
 
     # ── Main Loop ─────────────────────────────────────────────────────────────
     running         = True
@@ -110,8 +117,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
     # Async pipeline: pre-dispatch first batch so GPU starts immediately
     pending_state = state
     if not paused:
-        for _ in range(steps_per_frame):
-            pending_state = _step_fn(pending_state, params, config)
+        pending_state = run_n(pending_state, params, physics, steps_per_frame)
 
     while running:
         t_frame_start = time.time()
@@ -135,8 +141,18 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                     renderer.toggle_stats()
                 elif action == 'toggle_events':
                     renderer.toggle_events()
+                elif action == 'toggle_params':
+                    renderer.toggle_params()
                 elif action == 'reset':
                     reset_requested = True
+                else:
+                    renderer.handle_mousedown_slider(event.pos)
+
+            elif event.type == pygame.MOUSEMOTION:
+                renderer.handle_mousemotion(event.pos)
+
+            elif event.type == pygame.MOUSEBUTTONUP:
+                renderer.handle_mouseup()
 
             elif event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_q, pygame.K_ESCAPE):
@@ -172,31 +188,40 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
             print("Resetting...")
             state  = initialize_world(config, seed=seed)
             params = initialize_interaction_params(config, seed=seed + 1)
+            # physics intentionally NOT reset — slider values persist across resets
             pending_state = state
             if not paused:
-                for _ in range(steps_per_frame):
-                    pending_state = _step_fn(pending_state, params, config)
+                pending_state = run_n(pending_state, params, physics, steps_per_frame)
+
+        # ── Consume slider updates (before next dispatch) ─────────────────────
+        updates = renderer.get_physics_updates()
+        if updates:
+            physics = physics._replace(**{k: jnp.float32(v) for k, v in updates.items()})
 
         # ── Async pipeline ────────────────────────────────────────────────────
         # Dispatch NEXT batch before blocking on current — GPU computes frame N+1
         # while CPU renders frame N. This hides simulation latency.
+        t0_sim = time.perf_counter()
         if not paused and not reset_requested:
-            next_pending = pending_state
-            for _ in range(steps_per_frame):
-                next_pending = _step_fn(next_pending, params, config)
+            next_pending = run_n(pending_state, params, physics, steps_per_frame)
         else:
             next_pending = pending_state
+        _t_sim.append(time.perf_counter() - t0_sim)
 
         # ── Render ────────────────────────────────────────────────────────────
         # renderer.update() triggers the GPU→CPU transfer for pending_state.
         # Meanwhile the GPU is already working on next_pending.
+        t0_update = time.perf_counter()
         renderer.update(pending_state)
+        _t_update.append(time.perf_counter() - t0_update)
 
         n_alive    = int(np.sum(np.asarray(pending_state.particles.alive)))
         step_count = int(np.asarray(pending_state.step_count))
         fps        = clock.get_fps()
 
+        t0_render = time.perf_counter()
         renderer.render(fps, step_count, n_alive)
+        _t_render.append(time.perf_counter() - t0_render)
 
         # Advance pipeline
         if not paused:
@@ -211,6 +236,9 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
             sim_time = float(np.asarray(pending_state.time))
             print(f"FPS: {fps_val:.1f} | Sim time: {sim_time:.1f} | "
                   f"Alive: {n_alive:,} | Steps: {step_count:,}")
+            if _t_update:
+                ms = lambda d: sum(d) / len(d) * 1000
+                print(f"  frame ms: sim={ms(_t_sim):.1f}  update={ms(_t_update):.1f}  render={ms(_t_render):.1f}")
 
     renderer.close()
     print("Simulation ended.")

@@ -25,11 +25,12 @@ Multi-step (no Python overhead):
     )[0], static_argnums=())
 """
 
+import functools
 import jax
 import jax.numpy as jnp
 
 from halflife.config import SimConfig
-from halflife.state import WorldState, InteractionParams
+from halflife.state import WorldState, InteractionParams, PhysicsParams
 from halflife.spatial import build_cell_list, find_all_neighbors
 from halflife.interactions import compute_all_forces
 from halflife.chemistry import attempt_fusion, apply_composite_decay
@@ -39,7 +40,8 @@ from halflife.utils import apply_boundary
 
 # ── Bond Forces (particles within composites) ─────────────────────────────────
 
-def compute_bond_forces(state: WorldState, config: SimConfig) -> jnp.ndarray:
+def compute_bond_forces(state: WorldState, config: SimConfig,
+                        physics: PhysicsParams) -> jnp.ndarray:
     """
     COM-spring forces keeping composite members together.
     Each member is attracted toward the composite center of mass.
@@ -51,20 +53,32 @@ def compute_bond_forces(state: WorldState, config: SimConfig) -> jnp.ndarray:
     composites = state.composites
     N = config.max_particles
     M = config.max_composite_size
-    spring_k = 50.0
+    spring_k = physics.spring_k
 
     def bonds_for_composite(c):
         is_alive = composites.alive[c]
         n_members = composites.member_count[c]
 
-        # Compute COM once per composite
+        # Compute COM using minimum-image convention to handle periodic boundaries.
+        # Use first member as reference; compute min-image displacements from it.
         safe_members = jnp.where(composites.members[c] >= 0, composites.members[c], 0)
         valid_mask = ((composites.members[c] >= 0) &
                       (jnp.arange(M) < n_members)).astype(jnp.float32)
-        member_positions = particles.position[safe_members]  # (M, 2)
-        com = jnp.sum(member_positions * valid_mask[:, None], axis=0) / (
+        ref_pos = particles.position[safe_members[0]]  # (2,) reference position
+
+        def _disp_from_ref(m_idx):
+            mpos = particles.position[safe_members[m_idx]]
+            d = mpos - ref_pos
+            if config.boundary_mode == "periodic":
+                d = d - config.world_width  * jnp.round(d[0] / config.world_width)  * jnp.array([1., 0.])
+                d = d - config.world_height * jnp.round(d[1] / config.world_height) * jnp.array([0., 1.])
+            return d
+
+        member_disps = jax.vmap(_disp_from_ref)(jnp.arange(M))  # (M, 2)
+        com_disp = jnp.sum(member_disps * valid_mask[:, None], axis=0) / (
             n_members.astype(jnp.float32) + 1e-8
         )
+        com = ref_pos + com_disp  # may be outside [0,W) — min-image in spring calc corrects it
 
         def member_spring(m_idx):
             pid = composites.members[c, m_idx]
@@ -98,14 +112,15 @@ def compute_bond_forces(state: WorldState, config: SimConfig) -> jnp.ndarray:
 # ── Main Simulation Step ──────────────────────────────────────────────────────
 
 def simulation_step(state: WorldState, params: InteractionParams,
-                    config: SimConfig) -> WorldState:
+                    config: SimConfig, physics: PhysicsParams) -> WorldState:
     """
     Advance WorldState by one timestep (dt).
 
     Args:
-        state:  WorldState — current simulation state
-        params: InteractionParams — species-dependent force parameters
-        config: SimConfig — static simulation parameters
+        state:   WorldState — current simulation state
+        params:  InteractionParams — species-dependent force parameters
+        config:  SimConfig — static simulation parameters (static_argnums=(2,))
+        physics: PhysicsParams — runtime-tunable physics scalars
 
     Returns:
         WorldState — updated state after one dt
@@ -128,17 +143,17 @@ def simulation_step(state: WorldState, params: InteractionParams,
 
     forces = compute_all_forces(
         particles.position, particles.species, particles.alive, neighbors, params, config,
-        attr_mod
+        physics, attr_mod
     )
 
     # Bond forces (optional — expensive; enable via config.use_bond_forces)
     if config.use_bond_forces:
-        bond_forces = compute_bond_forces(state, config)
+        bond_forces = compute_bond_forces(state, config, physics)
         forces = forces + bond_forces
 
     # ── Phase 4: Integration (Euler) ──────────────────────────────────────────
     new_vel = particles.velocity + (forces / particles.mass[:, None]) * config.dt
-    new_vel = new_vel * config.damping
+    new_vel = new_vel * physics.damping
     new_vel = jnp.clip(new_vel, -config.max_velocity, config.max_velocity)
     new_pos = particles.position + new_vel * config.dt
 
@@ -155,7 +170,7 @@ def simulation_step(state: WorldState, params: InteractionParams,
     )
 
     # ── Phase 6: Fusion ───────────────────────────────────────────────────────
-    state = attempt_fusion(state, neighbors, params, config)
+    state = attempt_fusion(state, neighbors, params, config, physics)
 
     # ── Phase 7: Decay ────────────────────────────────────────────────────────
     state = apply_composite_decay(state, config)
@@ -182,17 +197,21 @@ def simulation_step(state: WorldState, params: InteractionParams,
 def make_run_n_steps(config: SimConfig):
     """
     Return a JIT-compiled function that runs n steps without returning to Python.
-    Uses jax.lax.scan for maximum throughput.
+    Uses jax.lax.scan for maximum throughput — all N steps fuse into one XLA kernel.
+
+    config is captured by closure (static/frozen).
+    params and physics are regular JAX arguments (can change without recompile).
+    n_steps is a concrete Python int; JAX retraces per unique value (7 values max).
 
     Usage:
-        run = make_run_n_steps(config)
-        state = run(state, params, n_steps=100)
+        run_n = make_run_n_steps(config)
+        state = run_n(state, params, physics, n_steps=1)
     """
-    @jax.jit
+    @functools.partial(jax.jit, static_argnums=(3,))
     def run_n_steps(state: WorldState, params: InteractionParams,
-                    n_steps: int) -> WorldState:
+                    physics: PhysicsParams, n_steps: int) -> WorldState:
         def body(s, _):
-            return simulation_step(s, params, config), None
+            return simulation_step(s, params, config, physics), None
         final_state, _ = jax.lax.scan(body, state, None, length=n_steps)
         return final_state
     return run_n_steps
