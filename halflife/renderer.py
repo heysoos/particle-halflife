@@ -19,6 +19,7 @@ Data flow per frame:
   6. pygame.display.flip()
 """
 
+import collections
 import numpy as np
 import pygame
 import moderngl
@@ -293,6 +294,21 @@ class Renderer:
         self._stats_sim_time = 0.0
         self._stats_hist     = np.zeros(config.max_composite_size, dtype=np.int32)
 
+        # Event counters
+        self._fusion_total   = 0
+        self._fission_total  = 0
+        self._spawn_total    = 0
+        self._decay_total    = 0
+        self._fusion_rate    = 0.0
+        self._fission_rate   = 0.0
+        self._event_history  = collections.deque(maxlen=300)
+
+        # Sparkline buffers
+        SPARK_LEN = 150
+        self._spark_alive  = collections.deque(maxlen=SPARK_LEN)
+        self._spark_comp   = collections.deque(maxlen=SPARK_LEN)
+        self._spark_energy = collections.deque(maxlen=SPARK_LEN)
+
     # ── Public interface ──────────────────────────────────────────────────────
 
     def toggle_composite_mode(self):
@@ -521,6 +537,31 @@ class Renderer:
             # Hard cap
             self._events = self._events[-self._event_max:]
 
+        # Accumulate event counts (uses prev masks computed above)
+        if self._prev_alive is not None:
+            n_fusion  = int(np.sum(~self._prev_comp_alive & comp_alive))
+            n_fission = int(np.sum(self._prev_comp_alive  & ~comp_alive))
+            n_spawn   = int(np.sum(~self._prev_alive      & alive))
+            n_decay   = int(np.sum(self._prev_alive       & ~alive))
+            self._fusion_total  += n_fusion
+            self._fission_total += n_fission
+            self._spawn_total   += n_spawn
+            self._decay_total   += n_decay
+            self._event_history.append(
+                (self._stats_sim_time, n_fusion, n_fission, n_spawn, n_decay)
+            )
+            recent = [e for e in self._event_history
+                      if e[0] >= self._stats_sim_time - 5.0]
+            if len(recent) >= 2:
+                dt = max(0.01, recent[-1][0] - recent[0][0])
+                self._fusion_rate  = sum(e[1] for e in recent) / dt
+                self._fission_rate = sum(e[2] for e in recent) / dt
+
+        # Sparklines
+        self._spark_alive.append(self._stats_alive)
+        self._spark_comp.append(self._stats_n_comp)
+        self._spark_energy.append(self._stats_energy)
+
         self._prev_alive      = alive.copy()
         self._prev_comp_alive = comp_alive.copy()
 
@@ -571,6 +612,20 @@ class Renderer:
 
     # ── HUD surface drawing ───────────────────────────────────────────────────
 
+    def _draw_sparkline(self, surface, data, x, y, w, h, color):
+        if len(data) < 2:
+            return
+        arr = np.array(data, dtype=np.float32)
+        lo, hi = arr.min(), arr.max()
+        if hi == lo:
+            hi = lo + 1
+        pts = [
+            (x + int(k * w / (len(arr) - 1)),
+             y + h - int((v - lo) / (hi - lo) * h))
+            for k, v in enumerate(arr)
+        ]
+        pygame.draw.lines(surface, color, False, pts, 1)
+
     def _render_hud_surface(self, fps: float):
         """Draw buttons and optional stats panel onto the transparent HUD surface."""
         surface = self._hud_surface
@@ -609,7 +664,8 @@ class Renderer:
         if self._show_stats:
             config = self.config
             max_hist_bins = config.max_composite_size - 1  # sizes 2..max
-            panel_h = 120 + max_hist_bins * 13
+            spark_rows = 3  # alive, composites, energy
+            panel_h = 120 + spark_rows * 18 + 4 * 16 + max_hist_bins * 13
             panel_w = 215
             panel_x = config.window_width - panel_w - 8
             panel_y = 8
@@ -618,16 +674,39 @@ class Renderer:
             pygame.draw.rect(surface, (15, 18, 35, 185), panel_rect, border_radius=6)
             pygame.draw.rect(surface, (70, 100, 150, 180), panel_rect, 1, border_radius=6)
 
-            stat_lines = [
+            y_off = panel_y + 6
+
+            # Static lines without sparklines
+            for line in [
                 f"FPS:        {fps:.1f}",
                 f"Step:       {self._stats_step:,}",
                 f"Sim time:   {self._stats_sim_time:.1f}",
-                f"Alive:      {self._stats_alive:,}",
-                f"Composites: {self._stats_n_comp:,}",
-                f"Energy:     {self._stats_energy:.0f}",
-            ]
-            y_off = panel_y + 6
-            for line in stat_lines:
+            ]:
+                txt = font.render(line, True, (190, 215, 255))
+                surface.blit(txt, (panel_x + 6, y_off))
+                y_off += 16
+
+            # Lines with sparklines
+            spark_w, spark_h = 100, 14
+            spark_x = panel_x + panel_w - spark_w - 6
+            for label, val, spark_data, color in [
+                (f"Alive:      {self._stats_alive:,}", None, self._spark_alive,  (80, 180, 255)),
+                (f"Composites: {self._stats_n_comp:,}", None, self._spark_comp,   (120, 220, 120)),
+                (f"Energy:     {self._stats_energy:.0f}", None, self._spark_energy, (220, 180, 80)),
+            ]:
+                txt = font.render(label, True, (190, 215, 255))
+                surface.blit(txt, (panel_x + 6, y_off))
+                self._draw_sparkline(surface, spark_data, spark_x, y_off, spark_w, spark_h, color)
+                y_off += 18
+
+            # Event counter lines
+            y_off += 2
+            for line in [
+                f"Fusions:   {self._fusion_total:,}  ({self._fusion_rate:.1f}/s)",
+                f"Fissions:  {self._fission_total:,}  ({self._fission_rate:.1f}/s)",
+                f"Spawns:    {self._spawn_total:,}",
+                f"Decays:    {self._decay_total:,}",
+            ]:
                 txt = font.render(line, True, (190, 215, 255))
                 surface.blit(txt, (panel_x + 6, y_off))
                 y_off += 16
@@ -651,7 +730,8 @@ class Renderer:
                                      pygame.Rect(panel_x + 36, y_off + 1, bar_w, 10))
                 if count > 0:
                     cnt_lbl = font.render(str(count), True, (180, 210, 255))
-                    surface.blit(cnt_lbl, (panel_x + 40 + bar_w + 2, y_off))
+                    cnt_x = min(panel_x + 40 + bar_w + 2, panel_x + panel_w - 26)
+                    surface.blit(cnt_lbl, (cnt_x, y_off))
                 y_off += 13
 
         # ── Bottom key hint ───────────────────────────────────────────────────

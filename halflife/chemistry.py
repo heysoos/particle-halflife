@@ -364,20 +364,60 @@ def apply_composite_decay(state: WorldState, config: SimConfig) -> WorldState:
 
 # ── Fusion ───────────────────────────────────────────────────────────────────
 
+def _build_entity_species(pid: jnp.ndarray, particles, composites,
+                           config: SimConfig) -> tuple:
+    """
+    Return the sorted species array and member count for the entity containing
+    particle pid.  If free → single-element; if in composite → all members.
+
+    Returns:
+        species_buf: (max_composite_size,) int32, sorted, padded with -1
+        count:       scalar int32
+        rep:         representative particle index (members[c,0] or pid)
+    """
+    M = config.max_composite_size
+    c = jnp.clip(particles.composite_id[pid], 0, config.max_composites - 1)
+    is_free = particles.composite_id[pid] < 0
+
+    # Representative = self if free, else first member of composite
+    rep = jnp.where(is_free, pid, composites.members[c, 0])
+
+    # Count
+    count = jnp.where(is_free, jnp.int32(1), composites.member_count[c])
+
+    # Species buffer: free → [species[pid], -1, ...]; composite → species of members
+    free_buf = jnp.full(M, -1, dtype=jnp.int32).at[0].set(particles.species[pid])
+
+    # For composite: gather species of each member slot
+    safe_members = jnp.where(composites.members[c] >= 0, composites.members[c], 0)
+    member_species = particles.species[safe_members]  # (M,)
+    valid_mask = (composites.members[c] >= 0) & (jnp.arange(M) < composites.member_count[c])
+    comp_buf = jnp.where(valid_mask, member_species, jnp.int32(-1))
+
+    raw_buf = jnp.where(is_free, free_buf, comp_buf)
+    # Sort: move -1 sentinels to end by sorting (valid species < sentinel if using large value)
+    # Replace -1 with large value for sort, then restore
+    sort_key = jnp.where(raw_buf < 0, jnp.int32(999999), raw_buf)
+    sorted_buf = jnp.sort(sort_key)
+    # Restore -1 for values that were sentinel
+    final_buf = jnp.where(sorted_buf >= 999999, jnp.int32(-1), sorted_buf)
+
+    return final_buf, count, rep
+
+
 def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
                    params: InteractionParams, config: SimConfig) -> WorldState:
     """
-    Try to fuse pairs of nearby free particles into composites.
+    Unified entity-entity fusion: any entity (free particle or composite) can
+    fuse with any neighboring entity.
 
-    For each particle i:
-      - Check neighbors within fusion_radius
-      - Both must be free (composite_id == -1)
-      - Compute hash of sorted [species_i, species_j]
-      - If hash-derived binding_energy > fusion_threshold: fuse
+    An entity is represented by its lowest-index member (the "representative").
+    Only representatives participate in the fusion scan to avoid double-counting.
 
-    Conflict resolution: scan particles in ascending index order.
-    If particle i claims particle j, j is marked as "claimed" and cannot
-    be claimed again by a later particle.
+    Three cases handled uniformly:
+      - free + free   → create new composite
+      - composite + free / free + composite → grow existing composite
+      - composite + composite → merge smaller into larger (lower index wins)
 
     Args:
         state:     WorldState
@@ -385,31 +425,46 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         config:    SimConfig (static)
 
     Returns:
-        Updated WorldState with new composites formed
+        Updated WorldState with new/grown composites
     """
     particles = state.particles
     composites = state.composites
     key, subkey = jax.random.split(state.rng_key)
     N = config.max_particles
+    M = config.max_composite_size
 
     fusion_r2 = config.fusion_radius ** 2
 
-    # --- Find fusion candidates ---
-    # For each particle i, find its best fusion partner (lowest index valid neighbor)
-    def find_fusion_partner(i):
+    # ── Step 1: Identify representatives ──────────────────────────────────────
+    def get_rep(i):
+        c = jnp.clip(particles.composite_id[i], 0, config.max_composites - 1)
+        is_free = particles.composite_id[i] < 0
+        return jnp.where(is_free, i, composites.members[c, 0])
+
+    all_reps = jax.vmap(get_rep)(jnp.arange(N, dtype=jnp.int32))  # (N,)
+    is_rep = (all_reps == jnp.arange(N)) & particles.alive  # (N,)
+
+    # ── Step 2: For each representative, find its best fusion partner ──────────
+    def find_entity_partner(i):
         """
-        Returns (partner_j, binding_energy) for particle i's best fusion candidate.
-        Returns (-1, 0.0) if no valid partner found.
+        For representative particle i, scan its neighbors to find the best
+        entity partner. Returns (partner_rep, be_eff, merged_h, merged_count).
         """
-        is_free_i = particles.alive[i] & (particles.composite_id[i] < 0)
+        i_is_rep = is_rep[i]
+
+        sp_i, cnt_i, _ = _build_entity_species(i, particles, composites, config)
+        c_i = jnp.clip(particles.composite_id[i], 0, config.max_composites - 1)
 
         def check_neighbor(j):
+            j_is_rep = is_rep[j]
             valid = (
-                (j >= 0) & (j > i) &  # only consider j > i to avoid double-processing
-                particles.alive[j] &
-                (particles.composite_id[j] < 0)
+                (j >= 0) & (j != i) &
+                j_is_rep &
+                # Don't fuse same composite with itself
+                ~((particles.composite_id[i] >= 0) &
+                  (particles.composite_id[i] == particles.composite_id[j]))
             )
-            # Distance check
+            # Distance check (between representative particles i and j)
             d = particles.position[i] - particles.position[j]
             if config.boundary_mode == "periodic":
                 d = d - config.world_width  * jnp.round(d[0] / config.world_width) * jnp.array([1., 0.])
@@ -417,130 +472,209 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             dist2 = jnp.dot(d, d)
             in_range = dist2 < fusion_r2
 
-            # Hash of sorted species pair
-            si = particles.species[i]
-            sj = particles.species[j]
-            s_lo = jnp.minimum(si, sj)
-            s_hi = jnp.maximum(si, sj)
-            species_sorted = jnp.array([-1] * config.max_composite_size, dtype=jnp.int32)
-            species_sorted = species_sorted.at[0].set(s_lo)
-            species_sorted = species_sorted.at[1].set(s_hi)
-            h = _hash_sorted_species(species_sorted, jnp.array(2), config)
+            # Build merged species multiset (up to 2*M, clamped to M)
+            sp_j, cnt_j, _ = _build_entity_species(j, particles, composites, config)
+            merged_count = jnp.minimum(cnt_i + cnt_j, M)
+
+            # Concatenate and sort into one buffer of size M
+            # Use a fixed-size trick: place sp_i in [0..M/2) and sp_j in [M/2..M)
+            half = M // 2
+            merged_raw = jnp.concatenate([sp_i[:half], sp_j[:half]])  # (M,)
+            sort_key = jnp.where(merged_raw < 0, jnp.int32(999999), merged_raw)
+            merged_sorted = jnp.sort(sort_key)
+            merged_buf = jnp.where(merged_sorted >= 999999, jnp.int32(-1), merged_sorted)
+
+            h = _hash_sorted_species(merged_buf, merged_count, config)
             be = _hash_to_binding_energy(h, config)
 
-            # Polarity bonus: opposite signs → positive bonus (ionic-like preference)
-            pi = params.polarity[si]
-            pj = params.polarity[sj]
-            polarity_bonus = config.polarity_fusion_scale * (-pi * pj)
-            be_eff = be + polarity_bonus
+            # Polarity bonus
+            c_j = jnp.clip(particles.composite_id[j], 0, config.max_composites - 1)
+            pi = jnp.where(
+                particles.composite_id[i] < 0,
+                params.polarity[particles.species[i]],
+                composites.net_polarity[c_i]
+            )
+            pj = jnp.where(
+                particles.composite_id[j] < 0,
+                params.polarity[particles.species[j]],
+                composites.net_polarity[c_j]
+            )
+            be_eff = be + config.polarity_fusion_scale * (-pi * pj)
 
-            can_fuse = valid & in_range & (be_eff > config.fusion_threshold)
-            return jnp.where(can_fuse, j, -1), jnp.where(can_fuse, be, 0.0), h
+            # Size cap: don't grow beyond buffer
+            would_overflow = (cnt_i + cnt_j) > M
 
-        results = jax.vmap(check_neighbor)(neighbors[i])
-        partner_candidates = results[0]  # (max_neighbors,)
-        be_candidates      = results[1]  # (max_neighbors,)
-        h_candidates       = results[2]  # (max_neighbors,)
+            can_fuse = valid & in_range & (be_eff > config.fusion_threshold) & ~would_overflow
+            return (
+                jnp.where(can_fuse, j, jnp.int32(-1)),
+                jnp.where(can_fuse, be_eff, jnp.float32(0.0)),
+                jnp.where(can_fuse, h, jnp.uint32(0)),
+                jnp.where(can_fuse, merged_count, jnp.int32(0)),
+                jnp.where(can_fuse, merged_buf, jnp.full(M, -1, jnp.int32)),
+            )
 
-        # Pick the partner with highest binding energy
-        best_idx = jnp.argmax(be_candidates)
-        best_partner = partner_candidates[best_idx]
-        best_be      = be_candidates[best_idx]
-        best_h       = h_candidates[best_idx]
+        # vmap over neighbors
+        nbrs = neighbors[i]
+        results = jax.vmap(check_neighbor)(nbrs)
+        partners, bes, hs, mcounts, mbufs = results
+        # (max_neighbors,), (max_neighbors,), ...
 
-        # No partner if particle is not free
-        final_partner = jnp.where(is_free_i, best_partner, -1)
-        final_be      = jnp.where(is_free_i, best_be, 0.0)
-        final_h       = jnp.where(is_free_i, best_h, jnp.uint32(0))
+        best_idx    = jnp.argmax(bes)
+        best_j      = partners[best_idx]
+        best_be     = bes[best_idx]
+        best_h      = hs[best_idx]
+        best_mc     = mcounts[best_idx]
+        best_mbuf   = mbufs[best_idx]
 
-        return final_partner, final_be, final_h
+        # Gate on i being a representative
+        final_j    = jnp.where(i_is_rep, best_j,    jnp.int32(-1))
+        final_be   = jnp.where(i_is_rep, best_be,   jnp.float32(0.0))
+        final_h    = jnp.where(i_is_rep, best_h,    jnp.uint32(0))
+        final_mc   = jnp.where(i_is_rep, best_mc,   jnp.int32(0))
+        final_mbuf = jnp.where(i_is_rep, best_mbuf, jnp.full(M, -1, jnp.int32))
 
-    # vmap to get fusion candidates for all particles
-    all_partners, all_be, all_hashes = jax.vmap(find_fusion_partner)(
-        jnp.arange(N, dtype=jnp.int32)
-    )
-    # all_partners: (N,) int32 — proposed partner for each particle (-1 = none)
+        return final_j, final_be, final_h, final_mc, final_mbuf
 
-    # --- Conflict resolution via sequential scan over CANDIDATES ONLY ---
-    # Instead of scanning all N particles, pre-filter to the first
-    # max_fusions_per_step particles that have a valid partner. This shrinks
-    # the scan from O(N) sequential steps to O(max_fusions_per_step).
+    all_partners, all_be, all_hashes, all_merged_counts, all_merged_bufs = jax.vmap(
+        find_entity_partner
+    )(jnp.arange(N, dtype=jnp.int32))
+    # (N,), (N,), (N,), (N,), (N, M)
+
+    # ── Step 3: Conflict resolution via sequential scan ────────────────────────
     max_fusions = config.max_fusions_per_step
-    has_partner = all_partners >= 0  # (N,)
-    cumsum_p = jnp.cumsum(has_partner.astype(jnp.int32))
-    # Assign real index to first max_fusions candidates, sentinel N to the rest
+    has_partner = all_partners >= 0
+    cumsum_p    = jnp.cumsum(has_partner.astype(jnp.int32))
     candidate_i = jnp.where(
         has_partner & (cumsum_p <= max_fusions),
         jnp.arange(N, dtype=jnp.int32),
-        N,  # sentinel — sorts to end
+        N,
     )
-    # Sort so the valid candidates come first; take first max_fusions
-    scan_indices = jnp.sort(candidate_i)[:max_fusions]  # (max_fusions,)
+    scan_indices = jnp.sort(candidate_i)[:max_fusions]
 
     def fusion_scan_body(carry, i):
         claimed, new_composite_id, composites_state, comp_count = carry
 
         valid_i = i < N
-        safe_i  = jnp.minimum(i, N - 1)  # avoid OOB on sentinel
+        safe_i  = jnp.minimum(i, N - 1)
 
-        partner = jnp.where(valid_i, all_partners[safe_i], jnp.int32(-1))
-        be      = jnp.where(valid_i, all_be[safe_i],       jnp.float32(0.0))
-        h       = jnp.where(valid_i, all_hashes[safe_i],   jnp.uint32(0))
+        j        = jnp.where(valid_i, all_partners[safe_i],      jnp.int32(-1))
+        be       = jnp.where(valid_i, all_be[safe_i],            jnp.float32(0.0))
+        h        = jnp.where(valid_i, all_hashes[safe_i],        jnp.uint32(0))
+        mc       = jnp.where(valid_i, all_merged_counts[safe_i], jnp.int32(0))
+        mbuf     = jnp.where(valid_i, all_merged_bufs[safe_i],
+                             jnp.full(M, -1, dtype=jnp.int32))
+
+        safe_j = jnp.where(j >= 0, j, 0)
 
         can_fuse = (
-            (partner >= 0) &
-            ~claimed[i] &
-            ~claimed[partner] &
+            (j >= 0) &
+            ~claimed[safe_i] &
+            ~claimed[safe_j] &
             (comp_count < config.max_composites)
         )
 
-        # If can_fuse, allocate a new composite slot
-        # Find first free (dead) composite slot
-        free_comp_slot = jnp.argmin(composites_state.alive.astype(jnp.int32) * config.max_composites +
-                                     jnp.arange(config.max_composites))
-        comp_slot = jnp.where(can_fuse, free_comp_slot, -1)
+        # Determine i/j free vs composite
+        i_is_free = new_composite_id[safe_i] < 0
+        j_is_free = new_composite_id[safe_j] < 0
 
-        # Build species array for the new composite
-        si = particles.species[i]
-        sj = jnp.where(partner >= 0, particles.species[partner], si)
-        s_lo = jnp.minimum(si, sj)
-        s_hi = jnp.maximum(si, sj)
-        species_sorted = jnp.full(config.max_composite_size, -1, dtype=jnp.int32)
-        species_sorted = species_sorted.at[0].set(s_lo)
-        species_sorted = species_sorted.at[1].set(s_hi)
+        ci = jnp.clip(new_composite_id[safe_i], 0, config.max_composites - 1)
+        cj = jnp.clip(new_composite_id[safe_j], 0, config.max_composites - 1)
+
+        # Target composite slot:
+        #   free+free  → new free slot
+        #   comp+free  → ci (i's composite grows)
+        #   free+comp  → cj (j's composite grows)
+        #   comp+comp  → lower index absorbs higher
+        free_comp_slot = jnp.argmin(
+            composites_state.alive.astype(jnp.int32) * config.max_composites
+            + jnp.arange(config.max_composites)
+        )
+        target = jax.lax.switch(
+            (i_is_free.astype(jnp.int32) * 2 + j_is_free.astype(jnp.int32)),
+            [
+                # case 0: comp+comp → lower index absorbs
+                lambda: jnp.minimum(ci, cj),
+                # case 1: comp+free → ci
+                lambda: ci,
+                # case 2: free+comp → cj
+                lambda: cj,
+                # case 3: free+free → new slot
+                lambda: free_comp_slot,
+            ]
+        )
+        absorbed = jax.lax.switch(
+            (i_is_free.astype(jnp.int32) * 2 + j_is_free.astype(jnp.int32)),
+            [
+                lambda: jnp.maximum(ci, cj),  # comp+comp: higher index killed
+                lambda: jnp.int32(-1),          # comp+free: no composite killed
+                lambda: jnp.int32(-1),          # free+comp: no composite killed
+                lambda: jnp.int32(-1),          # free+free: no composite killed
+            ]
+        )
+
+        # Derive composite properties from merged hash
         hl = _hash_to_half_life(h, config)
 
-        # Polarity: net_polarity = mean of member polarities
-        pi = params.polarity[si]
-        pj = params.polarity[sj]
-        net_pol = (pi + pj) / 2.0
-        # Neutral composites (|net_pol| ≈ 0) are more stable
+        # Mean polarity of merged entity
+        pi = jnp.where(i_is_free,
+                        params.polarity[particles.species[safe_i]],
+                        composites_state.net_polarity[ci])
+        pj = jnp.where(j_is_free,
+                        params.polarity[particles.species[safe_j]],
+                        composites_state.net_polarity[cj])
+        cnt_i_scalar = jnp.where(i_is_free, jnp.int32(1), composites_state.member_count[ci])
+        cnt_j_scalar = jnp.where(j_is_free, jnp.int32(1), composites_state.member_count[cj])
+        net_pol = (pi * cnt_i_scalar.astype(jnp.float32) +
+                   pj * cnt_j_scalar.astype(jnp.float32)) / (mc.astype(jnp.float32) + 1e-8)
         neutrality = 1.0 - jnp.abs(net_pol)
         hl_eff = hl * (1.0 + config.polarity_stability_scale * neutrality)
 
-        # Update composite arrays
-        new_members = composites_state.members.at[comp_slot].set(
-            jnp.where(can_fuse,
-                       jnp.array([i, partner] + [-1] * (config.max_composite_size - 2), dtype=jnp.int32),
-                       composites_state.members[comp_slot])
+        # Build the merged member list: gather all member particle indices
+        # i-side members
+        i_members_comp = composites_state.members[ci]  # (M,)
+        i_members_free = jnp.full(M, -1, dtype=jnp.int32).at[0].set(safe_i)
+        i_members = jnp.where(i_is_free, i_members_free, i_members_comp)
+
+        # j-side members
+        j_members_comp = composites_state.members[cj]  # (M,)
+        j_members_free = jnp.full(M, -1, dtype=jnp.int32).at[0].set(safe_j)
+        j_members = jnp.where(j_is_free, j_members_free, j_members_comp)
+
+        # Concat first half of each into a (M,) buffer
+        half = M // 2
+        merged_members = jnp.concatenate([i_members[:half], j_members[:half]])  # (M,)
+        # Replace -1 sentinels beyond mc with -1 (already set), ensure count is mc
+        # (The concat gives us up to M valid slots; any excess are -1 already)
+
+        # Write to target composite
+        safe_target = jnp.where(can_fuse, target, 0)
+        safe_absorbed = jnp.where((absorbed >= 0) & can_fuse, absorbed, 0)
+
+        new_members = composites_state.members.at[safe_target].set(
+            jnp.where(can_fuse, merged_members, composites_state.members[safe_target])
         )
-        new_comp_alive = composites_state.alive.at[comp_slot].set(
-            jnp.where(can_fuse, True, composites_state.alive[comp_slot])
+        new_comp_alive = composites_state.alive.at[safe_target].set(
+            jnp.where(can_fuse, True, composites_state.alive[safe_target])
         )
-        new_comp_be = composites_state.binding_energy.at[comp_slot].set(
-            jnp.where(can_fuse, be, composites_state.binding_energy[comp_slot])
+        # Kill absorbed composite (comp+comp case)
+        kill_absorbed = can_fuse & (absorbed >= 0)
+        new_comp_alive = new_comp_alive.at[safe_absorbed].set(
+            jnp.where(kill_absorbed, False, new_comp_alive[safe_absorbed])
         )
-        new_comp_hl = composites_state.half_life.at[comp_slot].set(
-            jnp.where(can_fuse, hl_eff, composites_state.half_life[comp_slot])
+        new_comp_be = composites_state.binding_energy.at[safe_target].set(
+            jnp.where(can_fuse, be, composites_state.binding_energy[safe_target])
         )
-        new_comp_count_arr = composites_state.member_count.at[comp_slot].set(
-            jnp.where(can_fuse, 2, composites_state.member_count[comp_slot])
+        new_comp_hl = composites_state.half_life.at[safe_target].set(
+            jnp.where(can_fuse, hl_eff, composites_state.half_life[safe_target])
         )
-        new_comp_hash = composites_state.species_hash.at[comp_slot].set(
-            jnp.where(can_fuse, h, composites_state.species_hash[comp_slot])
+        new_comp_count_arr = composites_state.member_count.at[safe_target].set(
+            jnp.where(can_fuse, mc, composites_state.member_count[safe_target])
         )
-        new_comp_net_pol = composites_state.net_polarity.at[comp_slot].set(
-            jnp.where(can_fuse, net_pol, composites_state.net_polarity[comp_slot])
+        new_comp_hash = composites_state.species_hash.at[safe_target].set(
+            jnp.where(can_fuse, h, composites_state.species_hash[safe_target])
+        )
+        new_comp_net_pol = composites_state.net_polarity.at[safe_target].set(
+            jnp.where(can_fuse, net_pol, composites_state.net_polarity[safe_target])
         )
 
         new_composites = composites_state._replace(
@@ -553,32 +687,54 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             net_polarity=new_comp_net_pol,
         )
 
-        # Update particle composite_id
-        new_composite_id = new_composite_id.at[i].set(
-            jnp.where(can_fuse, comp_slot, new_composite_id[i])
-        )
-        new_composite_id = new_composite_id.at[
-            jnp.where(can_fuse, partner, 0)
-        ].set(jnp.where(can_fuse, comp_slot, new_composite_id[jnp.where(can_fuse, partner, 0)]))
+        # Update composite_id for all merged members
+        # i-side: assign to target
+        def assign_i_member(m_idx):
+            pid = jnp.where(i_is_free, safe_i, i_members[m_idx])
+            valid = can_fuse & (pid >= 0) & (
+                jnp.where(i_is_free, m_idx == 0, m_idx < composites_state.member_count[ci])
+            )
+            return pid, valid
 
-        # Mark both as claimed
-        new_claimed = claimed.at[i].set(claimed[i] | can_fuse)
-        new_claimed = new_claimed.at[jnp.where(can_fuse, partner, 0)].set(
-            new_claimed[jnp.where(can_fuse, partner, 0)] | can_fuse
+        i_pids, i_valid = jax.vmap(assign_i_member)(jnp.arange(half, dtype=jnp.int32))
+        safe_i_pids = jnp.where(i_valid, i_pids, 0)
+        new_composite_id = new_composite_id.at[safe_i_pids].set(
+            jnp.where(i_valid, target, new_composite_id[safe_i_pids])
         )
 
-        new_comp_count = comp_count + jnp.where(can_fuse, 1, 0)
+        # j-side: assign to target
+        def assign_j_member(m_idx):
+            pid = jnp.where(j_is_free, safe_j, j_members[m_idx])
+            valid = can_fuse & (pid >= 0) & (
+                jnp.where(j_is_free, m_idx == 0, m_idx < composites_state.member_count[cj])
+            )
+            return pid, valid
+
+        j_pids, j_valid = jax.vmap(assign_j_member)(jnp.arange(half, dtype=jnp.int32))
+        safe_j_pids = jnp.where(j_valid, j_pids, 0)
+        new_composite_id = new_composite_id.at[safe_j_pids].set(
+            jnp.where(j_valid, target, new_composite_id[safe_j_pids])
+        )
+
+        # Mark both representatives as claimed
+        new_claimed = claimed.at[safe_i].set(claimed[safe_i] | can_fuse)
+        new_claimed = new_claimed.at[safe_j].set(new_claimed[safe_j] | can_fuse)
+
+        # Only increment comp_count for free+free (new composite created)
+        new_comp_count = comp_count + jnp.where(
+            can_fuse & i_is_free & j_is_free, jnp.int32(1), jnp.int32(0)
+        )
 
         return (new_claimed, new_composite_id, new_composites, new_comp_count), None
 
-    claimed_init = jnp.zeros(N, dtype=bool)
+    claimed_init      = jnp.zeros(N, dtype=bool)
     composite_id_init = particles.composite_id
-    comp_count_init = jnp.sum(composites.alive.astype(jnp.int32))
+    comp_count_init   = jnp.sum(composites.alive.astype(jnp.int32))
 
-    (final_claimed, final_composite_id, final_composites, _), _ = jax.lax.scan(
+    (_, final_composite_id, final_composites, _), _ = jax.lax.scan(
         fusion_scan_body,
         (claimed_init, composite_id_init, composites, comp_count_init),
-        scan_indices,  # (max_fusions_per_step,) — only real candidates + sentinels
+        scan_indices,
     )
 
     new_particles = particles._replace(composite_id=final_composite_id)
