@@ -32,7 +32,7 @@ from halflife.config import SimConfig
 from halflife.state import WorldState, InteractionParams
 from halflife.spatial import build_cell_list, find_all_neighbors
 from halflife.interactions import compute_all_forces
-from halflife.chemistry import attempt_fusion, apply_particle_decay, apply_composite_decay
+from halflife.chemistry import attempt_fusion, apply_composite_decay
 from halflife.energy import compute_total_energy, apply_soft_energy_conservation
 from halflife.utils import apply_boundary
 
@@ -175,7 +175,6 @@ def simulation_step(state: WorldState, params: InteractionParams,
 
     # ── Phase 7: Decay ────────────────────────────────────────────────────────
     state = apply_composite_decay(state, config)
-    state = apply_particle_decay(state, config)
 
     # ── Phase 8: Energy Accounting ────────────────────────────────────────────
     current_energy = compute_total_energy(state)
