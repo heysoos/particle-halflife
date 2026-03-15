@@ -400,36 +400,45 @@ class Renderer:
         alive_comp_idx = np.where(comp_alive)[0]
 
         if self.composite_mode == self.MODE_BONDS and len(alive_comp_idx) > 0:
-            bond_verts = []
+            bond_chunks = []
             for c in alive_comp_idx:
                 n = comp_count[c]
                 members = comp_members[c, :n]
                 if n < 2:
                     continue
+                # Vectorized pair generation via triu_indices
+                ii, jj = np.triu_indices(n, k=1)
+                mem_a, mem_b = members[ii], members[jj]
+                valid = (mem_a >= 0) & (mem_b >= 0)
+                if not np.any(valid):
+                    continue
+
+                mem_a_v = mem_a[valid]
+                mem_b_v = mem_b[valid]
+
                 comp_color = np.mean(self.species_colors[species[members]], axis=0)
                 bond_rgba  = np.array([*comp_color, 0.5], dtype=np.float32)
 
-                for m_a in range(n):
-                    for m_b in range(m_a + 1, n):
-                        i_a = members[m_a]
-                        i_b = members[m_b]
-                        if i_a < 0 or i_b < 0:
-                            continue
-                        # ── Periodic boundary fix: wrap the endpoint ──────────
-                        pos_a = pos[i_a].copy()
-                        dx    = pos[i_b] - pos_a
-                        if config.boundary_mode == "periodic":
-                            dx[0] -= config.world_width  * round(dx[0] / config.world_width)
-                            dx[1] -= config.world_height * round(dx[1] / config.world_height)
-                        pos_b = pos_a + dx
-                        bond_verts.append(np.concatenate([pos_a, bond_rgba]))
-                        bond_verts.append(np.concatenate([pos_b, bond_rgba]))
+                pos_a = pos[mem_a_v].copy()
+                dx    = pos[mem_b_v] - pos_a
+                if config.boundary_mode == "periodic":
+                    dx[:, 0] -= config.world_width  * np.round(dx[:, 0] / config.world_width)
+                    dx[:, 1] -= config.world_height * np.round(dx[:, 1] / config.world_height)
+                pos_b = pos_a + dx
 
-            if bond_verts:
-                bond_data  = np.stack(bond_verts, axis=0).astype(np.float32)
-                n_bytes    = min(bond_data.nbytes, self._bond_buf_size)
+                n_pairs = len(mem_a_v)
+                # Interleave: [a0, b0, a1, b1, ...]
+                pairs_pos = np.empty((n_pairs * 2, 2), dtype=np.float32)
+                pairs_pos[0::2] = pos_a
+                pairs_pos[1::2] = pos_b
+                rgba_tiled = np.tile(bond_rgba, (n_pairs * 2, 1))
+                bond_chunks.append(np.concatenate([pairs_pos, rgba_tiled], axis=1))
+
+            if bond_chunks:
+                bond_data = np.concatenate(bond_chunks, axis=0).astype(np.float32)
+                n_bytes   = min(bond_data.nbytes, self._bond_buf_size)
                 self.bond_vbo.write(bond_data.flatten().tobytes()[:n_bytes])
-                self._n_bond_vertices = len(bond_verts)
+                self._n_bond_vertices = len(bond_data)
 
         elif self.composite_mode == self.MODE_MERGED and len(alive_comp_idx) > 0:
             merged_verts = []

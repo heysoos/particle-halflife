@@ -30,18 +30,18 @@ class SimConfig:
     state_dim: int = 8              # internal state vector size (NCA-style, future use)
 
     # ── Composites ───────────────────────────────────────────────────────────
-    max_composites: int = 500       # fixed composite pool capacity
-    max_composite_size: int = 16    # JAX buffer size — not a physics cap; chemistry determines stability
+    max_composites: int = 200       # fixed composite pool capacity
+    max_composite_size: int = 8     # JAX buffer size — not a physics cap; chemistry determines stability
 
     # ── Spatial Indexing ─────────────────────────────────────────────────────
     # cell_size should equal interaction_radius for optimal neighbor queries
     cell_size: float = 4.0
     # max particles per cell in the cell list (4x expected density is safe)
-    cell_capacity: int = 16
+    cell_capacity: int = 8
 
     # ── Interactions ─────────────────────────────────────────────────────────
     interaction_radius: float = 4.0   # pairwise force cutoff distance
-    max_neighbors: int = 32           # max neighbors per particle (cap for fixed arrays)
+    max_neighbors: int = 16           # max neighbors per particle (cap for fixed arrays)
 
     # Particle Life-style force shape:
     #   [0, repulsion_radius]       → strong repulsion (hard core)
