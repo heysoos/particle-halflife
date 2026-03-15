@@ -38,7 +38,6 @@ class ParticleState(NamedTuple):
     half_life:    jnp.ndarray  # (N,)    float32 — decay half-life (sim time units)
     age:          jnp.ndarray  # (N,)    float32 — time since creation/last spawn
     composite_id: jnp.ndarray  # (N,)    int32   — composite index, -1 = free particle
-    internal:     jnp.ndarray  # (N, D)  float32 — hidden state (NCA-style, future use)
 
 
 class CompositeState(NamedTuple):
@@ -93,7 +92,6 @@ def initialize_world(config: SimConfig, seed: int = 0) -> WorldState:
     n_init = config.num_particles_init
     C = config.max_composites
     M = config.max_composite_size
-    D = config.state_dim
 
     # ── Particles ────────────────────────────────────────────────────────────
     key, k1, k2, k3, k4, k5 = jax.random.split(key, 6)
@@ -128,7 +126,6 @@ def initialize_world(config: SimConfig, seed: int = 0) -> WorldState:
 
     age = jnp.zeros(N, dtype=jnp.float32)
     composite_id = jnp.full(N, -1, dtype=jnp.int32)
-    internal = jnp.zeros((N, D), dtype=jnp.float32)
 
     particles = ParticleState(
         position=pos,
@@ -140,7 +137,6 @@ def initialize_world(config: SimConfig, seed: int = 0) -> WorldState:
         half_life=half_life,
         age=age,
         composite_id=composite_id,
-        internal=internal,
     )
 
     # ── Composites ───────────────────────────────────────────────────────────

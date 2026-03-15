@@ -96,22 +96,28 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
     print(f"JIT compilation done in {time.time() - t0:.1f}s")
 
     # ── Main Loop ─────────────────────────────────────────────────────────────
-    running       = True
-    paused        = False
+    running         = True
+    paused          = False
     steps_per_frame = 1      # simulation steps per rendered frame
-    clock         = pygame.time.Clock()
-    frame_count   = 0
-    fps_history   = []
+    clock           = pygame.time.Clock()
+    frame_count     = 0
 
     # Screenshot counter
     screenshot_dir = "screenshots"
 
     print("Running. Controls: Space=pause, +/-=speed, B=composite mode, R=reset, Q=quit")
 
+    # Async pipeline: pre-dispatch first batch so GPU starts immediately
+    pending_state = state
+    if not paused:
+        for _ in range(steps_per_frame):
+            pending_state = _step_fn(pending_state, params, config)
+
     while running:
         t_frame_start = time.time()
 
         # ── Events ────────────────────────────────────────────────────────────
+        reset_requested = False
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -130,9 +136,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                 elif action == 'toggle_events':
                     renderer.toggle_events()
                 elif action == 'reset':
-                    print("Resetting...")
-                    state  = initialize_world(config, seed=seed)
-                    params = initialize_interaction_params(config, seed=seed + 1)
+                    reset_requested = True
 
             elif event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_q, pygame.K_ESCAPE):
@@ -156,9 +160,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                     print(f"Composite mode: {renderer.composite_mode}")
 
                 elif event.key == pygame.K_r:
-                    print("Resetting...")
-                    state  = initialize_world(config, seed=seed)
-                    params = initialize_interaction_params(config, seed=seed + 1)
+                    reset_requested = True
 
                 elif event.key == pygame.K_s:
                     os.makedirs(screenshot_dir, exist_ok=True)
@@ -166,31 +168,47 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                     pygame.image.save(pygame.display.get_surface(), fname)
                     print(f"Screenshot saved: {fname}")
 
-        # ── Simulate ──────────────────────────────────────────────────────────
-        if not paused:
-            # Dispatch next frame's simulation before rendering current
-            # (JAX async dispatch — computation runs in background on GPU)
+        if reset_requested:
+            print("Resetting...")
+            state  = initialize_world(config, seed=seed)
+            params = initialize_interaction_params(config, seed=seed + 1)
+            pending_state = state
+            if not paused:
+                for _ in range(steps_per_frame):
+                    pending_state = _step_fn(pending_state, params, config)
+
+        # ── Async pipeline ────────────────────────────────────────────────────
+        # Dispatch NEXT batch before blocking on current — GPU computes frame N+1
+        # while CPU renders frame N. This hides simulation latency.
+        if not paused and not reset_requested:
+            next_pending = pending_state
             for _ in range(steps_per_frame):
-                state = _step_fn(state, params, config)
+                next_pending = _step_fn(next_pending, params, config)
+        else:
+            next_pending = pending_state
 
         # ── Render ────────────────────────────────────────────────────────────
-        # renderer.update() triggers the GPU→CPU transfer (np.asarray)
-        # This also syncs with JAX's async dispatch from the previous step
-        renderer.update(state)
+        # renderer.update() triggers the GPU→CPU transfer for pending_state.
+        # Meanwhile the GPU is already working on next_pending.
+        renderer.update(pending_state)
 
-        n_alive = int(np.sum(np.asarray(state.particles.alive)))
-        step_count = int(np.asarray(state.step_count))
-        fps = clock.get_fps()
+        n_alive    = int(np.sum(np.asarray(pending_state.particles.alive)))
+        step_count = int(np.asarray(pending_state.step_count))
+        fps        = clock.get_fps()
 
         renderer.render(fps, step_count, n_alive)
+
+        # Advance pipeline
+        if not paused:
+            pending_state = next_pending
 
         # ── Timing ────────────────────────────────────────────────────────────
         clock.tick(config.fps_target)
         frame_count += 1
 
         if frame_count % 60 == 0:
-            fps_val = clock.get_fps()
-            sim_time = float(np.asarray(state.time))
+            fps_val  = clock.get_fps()
+            sim_time = float(np.asarray(pending_state.time))
             print(f"FPS: {fps_val:.1f} | Sim time: {sim_time:.1f} | "
                   f"Alive: {n_alive:,} | Steps: {step_count:,}")
 

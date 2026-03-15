@@ -41,72 +41,56 @@ from halflife.utils import apply_boundary
 
 def compute_bond_forces(state: WorldState, config: SimConfig) -> jnp.ndarray:
     """
-    Spring-like forces keeping composite members together.
-    Each pair (i, j) within a composite attracts toward rest distance fusion_radius.
+    COM-spring forces keeping composite members together.
+    Each member is attracted toward the composite center of mass.
+    O(C*M) instead of O(C*M^2) — no all-pairs computation needed.
 
     Returns: (N, 2) float32 — additional forces from bonds
     """
     particles = state.particles
     composites = state.composites
     N = config.max_particles
-    bond_forces = jnp.zeros((N, 2), dtype=jnp.float32)
-
-    spring_k = 50.0         # spring constant
-    rest_len = config.fusion_radius * 0.8
+    M = config.max_composite_size
+    spring_k = 50.0
 
     def bonds_for_composite(c):
-        """Compute bond forces for composite c, return (N, 2) contributions."""
         is_alive = composites.alive[c]
         n_members = composites.member_count[c]
 
-        def pair_force(m_pair):
-            m_a, m_b = m_pair[0], m_pair[1]
-            i = composites.members[c, m_a]
-            j = composites.members[c, m_b]
-            valid = (
-                is_alive &
-                (m_a < n_members) & (m_b < n_members) &
-                (m_a != m_b) & (i >= 0) & (j >= 0)
-            )
-            d = particles.position[i] - particles.position[j]
+        # Compute COM once per composite
+        safe_members = jnp.where(composites.members[c] >= 0, composites.members[c], 0)
+        valid_mask = ((composites.members[c] >= 0) &
+                      (jnp.arange(M) < n_members)).astype(jnp.float32)
+        member_positions = particles.position[safe_members]  # (M, 2)
+        com = jnp.sum(member_positions * valid_mask[:, None], axis=0) / (
+            n_members.astype(jnp.float32) + 1e-8
+        )
+
+        def member_spring(m_idx):
+            pid = composites.members[c, m_idx]
+            valid = is_alive & (m_idx < n_members) & (pid >= 0)
+            d = com - particles.position[pid]  # direction toward COM
             if config.boundary_mode == "periodic":
                 d = d - config.world_width  * jnp.round(d[0] / config.world_width) * jnp.array([1., 0.])
                 d = d - config.world_height * jnp.round(d[1] / config.world_height) * jnp.array([0., 1.])
-            r = jnp.linalg.norm(d) + 1e-10
-            d_hat = d / r
-            f_mag = spring_k * (r - rest_len)
-            f = -f_mag * d_hat  # toward equilibrium
-            return jnp.where(valid, i, 0), jnp.where(valid, j, 0), jnp.where(valid, f, jnp.zeros(2)), valid
+            f = spring_k * d
+            return jnp.where(valid, pid, 0), valid, jnp.where(valid, f, jnp.zeros(2))
 
-        M = config.max_composite_size
-        pairs = jnp.array([[a, b] for a in range(M) for b in range(a + 1, M)], dtype=jnp.int32)
-        idx_i, idx_j, f_pairs, valid_pairs = jax.vmap(pair_force)(pairs)
+        pids, valids, forces = jax.vmap(member_spring)(jnp.arange(M, dtype=jnp.int32))
+        return pids, valids, forces  # (M,), (M,), (M, 2)
 
-        # Accumulate forces into per-particle arrays (relative to this composite)
-        # Return sparse updates: (n_pairs, 2) — applied to idx_i as +f, idx_j as -f
-        return idx_i, idx_j, f_pairs, valid_pairs
-
-    # For performance, skip bond forces in Phase 2 (no composites yet).
-    # In Phase 4+, these are active. The vmap below is over composites.
-    # This is expensive for large MAX_COMPOSITES — consider limiting to alive composites.
-    all_i, all_j, all_f, all_valid = jax.vmap(bonds_for_composite)(
+    all_pids, all_valid, all_forces = jax.vmap(bonds_for_composite)(
         jnp.arange(config.max_composites, dtype=jnp.int32)
-    )
-    # all_i: (C, n_pairs) int32 etc.
+    )  # (C, M), (C, M), (C, M, 2)
 
-    flat_i = all_i.reshape(-1)
-    flat_j = all_j.reshape(-1)
-    flat_f = all_f.reshape(-1, 2)
-    flat_valid = all_valid.reshape(-1)
+    flat_pids   = all_pids.reshape(-1)
+    flat_valid  = all_valid.reshape(-1)
+    flat_forces = all_forces.reshape(-1, 2)
+    safe_pids   = jnp.where(flat_valid, flat_pids, 0)
 
-    safe_i = jnp.where(flat_valid, flat_i, 0)
-    safe_j = jnp.where(flat_valid, flat_j, 0)
-
-    bond_forces = bond_forces.at[safe_i].add(
-        jnp.where(flat_valid[:, None], flat_f, 0.0)
-    )
-    bond_forces = bond_forces.at[safe_j].add(
-        jnp.where(flat_valid[:, None], -flat_f, 0.0)
+    bond_forces = jnp.zeros((N, 2), dtype=jnp.float32)
+    bond_forces = bond_forces.at[safe_pids].add(
+        jnp.where(flat_valid[:, None], flat_forces, 0.0)
     )
     return bond_forces
 
