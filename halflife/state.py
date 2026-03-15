@@ -223,6 +223,42 @@ def initialize_interaction_params(config: SimConfig,
     )
 
 
+# ── Physics Parameters (runtime-tunable, dynamic JAX arg) ────────────────────
+
+class PhysicsParams(NamedTuple):
+    """
+    Physics scalars that can be adjusted at runtime without recompiling.
+    Passed as a regular JAX argument (not static), so slider changes take
+    effect on the next simulation step without triggering recompilation.
+    """
+    damping:                  jnp.ndarray  # () float32 — velocity damping per step
+    repulsion_strength:       jnp.ndarray  # () float32 — hard-core repulsion magnitude
+    fusion_threshold:         jnp.ndarray  # () float32 — min binding energy to fuse [0,1]
+    polarity_fusion_scale:    jnp.ndarray  # () float32 — ionic bonding preference
+    polarity_stability_scale: jnp.ndarray  # () float32 — neutral composite stability bonus
+    binding_energy_scale:     jnp.ndarray  # () float32 — energy released on fusion
+    repulsion_radius:         jnp.ndarray  # () float32 — inner hard-core repulsion radius
+    r_cutoff_scale:           jnp.ndarray  # () float32 — multiplier on per-species r_cutoff
+    spring_k:                 jnp.ndarray  # () float32 — composite COM-spring stiffness
+    attraction_scale:         jnp.ndarray  # () float32 — global attraction magnitude multiplier
+
+
+def initialize_physics_params(config: SimConfig) -> PhysicsParams:
+    """Create PhysicsParams from SimConfig defaults."""
+    return PhysicsParams(
+        damping=jnp.float32(config.damping),
+        repulsion_strength=jnp.float32(config.repulsion_strength),
+        fusion_threshold=jnp.float32(config.fusion_threshold),
+        polarity_fusion_scale=jnp.float32(config.polarity_fusion_scale),
+        polarity_stability_scale=jnp.float32(config.polarity_stability_scale),
+        binding_energy_scale=jnp.float32(config.binding_energy_scale),
+        repulsion_radius=jnp.float32(config.repulsion_radius),
+        r_cutoff_scale=jnp.float32(1.0),
+        spring_k=jnp.float32(50.0),
+        attraction_scale=jnp.float32(1.0),
+    )
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def get_species_colors(config: SimConfig) -> np.ndarray:
