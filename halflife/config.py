@@ -31,7 +31,7 @@ class SimConfig:
 
     # ── Composites ───────────────────────────────────────────────────────────
     max_composites: int = 500       # fixed composite pool capacity
-    max_composite_size: int = 8     # max particles per composite
+    max_composite_size: int = 64    # JAX buffer size — not a physics cap; chemistry determines stability
 
     # ── Spatial Indexing ─────────────────────────────────────────────────────
     # cell_size should equal interaction_radius for optimal neighbor queries
