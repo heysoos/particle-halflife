@@ -51,7 +51,7 @@ def compute_bond_forces(state: WorldState, config: SimConfig) -> jnp.ndarray:
     N = config.max_particles
     bond_forces = jnp.zeros((N, 2), dtype=jnp.float32)
 
-    spring_k = 5.0          # spring constant
+    spring_k = 50.0         # spring constant
     rest_len = config.fusion_radius * 0.8
 
     def bonds_for_composite(c):
@@ -135,8 +135,16 @@ def simulation_step(state: WorldState, params: InteractionParams,
     neighbors = find_all_neighbors(particles.position, particles.alive, cell_list, config)
 
     # ── Phase 3: Force Computation ────────────────────────────────────────────
+    # Polarity modifier: composite members use their composite's net_polarity;
+    # free particles use 1.0 (no scaling).
+    is_composite = particles.composite_id >= 0
+    safe_cid = jnp.clip(particles.composite_id, 0, config.max_composites - 1)
+    net_pol = state.composites.net_polarity[safe_cid]   # (N,) float32
+    attr_mod = jnp.where(is_composite, net_pol, 1.0)    # (N,) float32
+
     forces = compute_all_forces(
-        particles.position, particles.species, particles.alive, neighbors, params, config
+        particles.position, particles.species, particles.alive, neighbors, params, config,
+        attr_mod
     )
 
     # Bond forces (optional — expensive; enable via config.use_bond_forces)
@@ -163,7 +171,7 @@ def simulation_step(state: WorldState, params: InteractionParams,
     )
 
     # ── Phase 6: Fusion ───────────────────────────────────────────────────────
-    state = attempt_fusion(state, neighbors, config)
+    state = attempt_fusion(state, neighbors, params, config)
 
     # ── Phase 7: Decay ────────────────────────────────────────────────────────
     state = apply_composite_decay(state, config)

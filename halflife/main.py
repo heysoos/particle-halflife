@@ -116,12 +116,31 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
             if event.type == pygame.QUIT:
                 running = False
 
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                action = renderer.handle_click(event.pos)
+                if action == 'pause':
+                    paused = not paused
+                    renderer.set_paused(paused)
+                    print("Paused" if paused else "Resumed")
+                elif action == 'toggle_bonds':
+                    renderer.toggle_composite_mode()
+                    print(f"Composite mode: {renderer.composite_mode}")
+                elif action == 'toggle_stats':
+                    renderer.toggle_stats()
+                elif action == 'toggle_events':
+                    renderer.toggle_events()
+                elif action == 'reset':
+                    print("Resetting...")
+                    state  = initialize_world(config, seed=seed)
+                    params = initialize_interaction_params(config, seed=seed + 1)
+
             elif event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_q, pygame.K_ESCAPE):
                     running = False
 
                 elif event.key == pygame.K_SPACE:
                     paused = not paused
+                    renderer.set_paused(paused)
                     print("Paused" if paused else "Resumed")
 
                 elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
@@ -138,7 +157,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
 
                 elif event.key == pygame.K_r:
                     print("Resetting...")
-                    state = initialize_world(config, seed=seed)
+                    state  = initialize_world(config, seed=seed)
                     params = initialize_interaction_params(config, seed=seed + 1)
 
                 elif event.key == pygame.K_s:
