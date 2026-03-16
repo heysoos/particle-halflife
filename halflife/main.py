@@ -61,7 +61,7 @@ def build_config(args) -> SimConfig:
     # Start with defaults
     kwargs = {}
     if args.species   is not None: kwargs['num_species']        = args.species
-    if args.particles is not None: kwargs['num_particles_init'] = args.particles
+    if args.particles is not None: kwargs['num_particles'] = args.particles
     if args.width     is not None: kwargs['world_width']        = args.width
     if args.height    is not None: kwargs['world_height']       = args.height
     return SimConfig(**kwargs)
@@ -80,7 +80,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
         config = SimConfig()
 
     # ── Initialize ────────────────────────────────────────────────────────────
-    print(f"Initializing world: {config.num_particles_init:,} particles, "
+    print(f"Initializing world: {config.num_particles:,} particles, "
           f"{config.num_species} species, world {config.world_width}x{config.world_height}")
 
     state   = initialize_world(config, seed=seed)
@@ -215,7 +215,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
         renderer.update(pending_state)
         _t_update.append(time.perf_counter() - t0_update)
 
-        n_alive    = int(np.sum(np.asarray(pending_state.particles.alive)))
+        n_alive    = config.num_particles
         step_count = int(np.asarray(pending_state.step_count))
         fps        = clock.get_fps()
 

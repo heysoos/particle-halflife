@@ -44,10 +44,10 @@ def _run_steps(n: int, config=_config, seed=0):
     step_fn = jax.jit(simulation_step, static_argnums=(2,))
     # Warm-up JIT on first call
     state = step_fn(state, params, config)
-    state.particles.alive.block_until_ready()
+    state.particles.position.block_until_ready()
     for _ in range(n - 1):
         state = step_fn(state, params, config)
-    state.particles.alive.block_until_ready()
+    state.particles.position.block_until_ready()
     return state
 
 
@@ -97,7 +97,7 @@ def test_fusion_count_grows():
 
     # Warm up
     state = step_fn(state, params, config)
-    state.particles.alive.block_until_ready()
+    state.particles.position.block_until_ready()
 
     cumulative_fusions = 0
     prev_n_comp = int(jnp.sum(state.composites.alive.astype(jnp.int32)))
@@ -158,8 +158,7 @@ def test_decay_occurs():
         half_life_min=10.0,
         half_life_max=30.0,
         composite_half_life_scale=1.0,
-        num_particles_init=500,
-        max_particles=1000,
+        num_particles=500,
     )
     state = initialize_world(config, seed=2)
     params = initialize_interaction_params(config, seed=42)
@@ -167,7 +166,7 @@ def test_decay_occurs():
 
     # Warm up
     state = step_fn(state, params, config)
-    state.particles.alive.block_until_ready()
+    state.particles.position.block_until_ready()
 
     max_composites_seen = 0
     fission_observed = False
@@ -195,34 +194,24 @@ def test_decay_occurs():
 
 def test_no_particle_loss():
     """
-    Over 300 steps, alive particle count should never drop below a floor.
-    Decay can reduce count, but it should be bounded by max_decay_per_step * steps.
+    Particle count is fixed (no creation/destruction) and must always equal
+    config.num_particles regardless of fusion/fission activity.
     """
     config = _config
-    state = _run_steps(1, config=config)  # warm-up step
-
     state = initialize_world(config, seed=3)
     params = initialize_interaction_params(config, seed=42)
     step_fn = jax.jit(simulation_step, static_argnums=(2,))
     state = step_fn(state, params, config)
-    state.particles.alive.block_until_ready()
+    state.particles.position.block_until_ready()
 
-    initial_alive = int(jnp.sum(state.particles.alive.astype(jnp.int32)))
-    # Decay can remove at most max_decay_per_step per step, but spawns replace them
-    # In practice the count should stay roughly stable (spawn-for-each-decay)
-    # Use a generous floor: 50% of initial
-    floor = initial_alive // 2
-
-    min_alive_seen = initial_alive
+    expected = config.num_particles
     for _ in range(299):
         state = step_fn(state, params, config)
-        n = int(jnp.sum(state.particles.alive.astype(jnp.int32)))
-        min_alive_seen = min(min_alive_seen, n)
+    actual = state.particles.position.shape[0]
 
-    print(f"\nParticle count: initial={initial_alive}, min_seen={min_alive_seen}, floor={floor}")
-    assert min_alive_seen >= floor, (
-        f"Particle count dropped to {min_alive_seen} (below floor {floor}). "
-        f"Possible runaway decay."
+    print(f"\nParticle count: expected={expected}, actual={actual} (fixed)")
+    assert actual == expected, (
+        f"Particle count changed: {actual} != {expected}"
     )
 
 
@@ -249,11 +238,9 @@ def test_composite_member_consistency():
 
         for m in range(mc):
             pid = int(composites.members[c, m])
-            if pid < 0 or pid >= _config.max_particles:
+            if pid < 0 or pid >= _config.num_particles:
                 errors.append(f"Composite {c} member[{m}]={pid} is invalid index")
                 continue
-            if not bool(particles.alive[pid]):
-                errors.append(f"Composite {c} member[{m}]={pid} is dead")
             cid = int(particles.composite_id[pid])
             if cid != c:
                 errors.append(

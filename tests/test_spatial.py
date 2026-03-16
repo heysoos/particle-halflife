@@ -24,17 +24,17 @@ from halflife.spatial import build_cell_list, find_all_neighbors
 _config = SimConfig()
 
 # JIT-compiled spatial functions
-_build_cell_list_jit = jax.jit(build_cell_list, static_argnums=(2,))
-_find_all_neighbors_jit = jax.jit(find_all_neighbors, static_argnums=(3,))
+_build_cell_list_jit = jax.jit(build_cell_list, static_argnums=(1,))
+_find_all_neighbors_jit = jax.jit(find_all_neighbors, static_argnums=(2,))
 
 
 @functools.lru_cache(maxsize=None)
 def _get_spatial_state():
     """Build cell list and neighbors from a fixed initial state (cached)."""
     state = initialize_world(_config, seed=0)
-    cell_list = _build_cell_list_jit(state.particles.position, state.particles.alive, _config)
+    cell_list = _build_cell_list_jit(state.particles.position, _config)
     neighbors = _find_all_neighbors_jit(
-        state.particles.position, state.particles.alive, cell_list, _config
+        state.particles.position, cell_list, _config
     )
     cell_list.particle_ids.block_until_ready()
     neighbors.block_until_ready()
@@ -46,7 +46,7 @@ def _get_spatial_state():
 def test_no_self_neighbor():
     """Particle i must never appear in its own neighbor list."""
     state, cell_list, neighbors = _get_spatial_state()
-    N = _config.max_particles
+    N = _config.num_particles
 
     # neighbors[i, k] == i would be self-neighbor
     particle_indices = jnp.arange(N, dtype=jnp.int32)[:, None]  # (N, 1)
@@ -65,8 +65,7 @@ def test_neighbor_distance_bound():
     """
     state, cell_list, neighbors = _get_spatial_state()
     positions = np.array(state.particles.position)
-    alive = np.array(state.particles.alive)
-    N = _config.max_particles
+    N = _config.num_particles
     r_max = _config.interaction_radius
     W = _config.world_width
     H = _config.world_height
@@ -76,8 +75,6 @@ def test_neighbor_distance_bound():
     max_dist_seen = 0.0
 
     for i in range(N):
-        if not alive[i]:
-            continue
         for k in range(_config.max_neighbors):
             j = int(neighbors[i, k])
             if j < 0:
@@ -100,10 +97,9 @@ def test_neighbor_distance_bound():
 
 
 def test_no_dead_neighbors():
-    """All reported neighbor indices must be -1 (padding) or pointing to alive particles."""
+    """All reported neighbor indices must be -1 (padding) or valid particle indices."""
     state, cell_list, neighbors = _get_spatial_state()
-    alive = np.array(state.particles.alive)
-    N = _config.max_particles
+    N = _config.num_particles
 
     violations = 0
     for i in range(N):
@@ -111,33 +107,27 @@ def test_no_dead_neighbors():
             j = int(neighbors[i, k])
             if j < 0:
                 continue
-            if not alive[j]:
+            if j >= N:
                 violations += 1
 
-    print(f"\nDead-particle neighbor violations: {violations}")
-    assert violations == 0, f"{violations} neighbor entries point to dead particles"
+    print(f"\nOut-of-range neighbor violations: {violations}")
+    assert violations == 0, f"{violations} neighbor entries have out-of-range index"
 
 
 def test_neighbor_count_reasonable():
     """
-    Mean neighbor count per alive particle should be in [0.5, max_neighbors].
+    Mean neighbor count per particle should be in [0.5, max_neighbors].
     With 2000 particles in 200x200 (density ~0.05/unit²) and radius 4,
     expected ~2.5 neighbors on average.
     """
     state, cell_list, neighbors = _get_spatial_state()
-    alive = np.array(state.particles.alive)
     neighbors_np = np.array(neighbors)
+    N = _config.num_particles
 
-    alive_indices = np.where(alive)[0]
-    n_alive = len(alive_indices)
-
-    neighbor_counts = []
-    for i in alive_indices:
-        count = int(np.sum(neighbors_np[i] >= 0))
-        neighbor_counts.append(count)
+    neighbor_counts = [int(np.sum(neighbors_np[i] >= 0)) for i in range(N)]
 
     mean_count = np.mean(neighbor_counts)
-    print(f"\nNeighbor count stats ({n_alive} alive particles):")
+    print(f"\nNeighbor count stats ({N} particles):")
     print(f"  mean={mean_count:.2f}, min={min(neighbor_counts)}, "
           f"max={max(neighbor_counts)}, max_neighbors={_config.max_neighbors}")
 
@@ -153,17 +143,17 @@ def test_neighbor_count_reasonable():
 
 def test_symmetric_neighbors():
     """
-    If j ∈ neighbors[i] and both are alive, then i should be in neighbors[j].
+    If j ∈ neighbors[i], then i should be in neighbors[j].
     Due to the one-sided max_neighbors cap this is not guaranteed, but violations
     should be rare (< 20%). Report violation rate rather than hard-failing.
     """
     state, cell_list, neighbors = _get_spatial_state()
-    alive = np.array(state.particles.alive)
     neighbors_np = np.array(neighbors)
+    N = _config.num_particles
 
     # Build a set of neighbors for each particle for fast lookup
-    neighbor_sets = [set() for _ in range(_config.max_particles)]
-    for i in range(_config.max_particles):
+    neighbor_sets = [set() for _ in range(N)]
+    for i in range(N):
         for k in range(_config.max_neighbors):
             j = int(neighbors_np[i, k])
             if j >= 0:
@@ -171,12 +161,8 @@ def test_symmetric_neighbors():
 
     total_pairs = 0
     asymmetric = 0
-    for i in range(_config.max_particles):
-        if not alive[i]:
-            continue
+    for i in range(N):
         for j in neighbor_sets[i]:
-            if not alive[j]:
-                continue
             total_pairs += 1
             if i not in neighbor_sets[j]:
                 asymmetric += 1

@@ -24,8 +24,7 @@ class SimConfig:
     boundary_mode: str = "periodic"
 
     # ── Particles ────────────────────────────────────────────────────────────
-    max_particles: int = 4_000      # fixed pool capacity (alive + dead slots)
-    num_particles_init: int = 2_000 # how many to spawn at initialization
+    num_particles: int = 2_000      # total particle count (fixed, all always alive)
     num_species: int = 4           # number of distinct particle types
     state_dim: int = 8              # internal state vector size (NCA-style, future use)
 
@@ -57,9 +56,9 @@ class SimConfig:
     fusion_threshold: float = 0.2     # minimum binding energy to trigger fusion [0,1]
 
     # ── Decay / Half-life ────────────────────────────────────────────────────
-    # Particle half-lives are sampled uniformly from this range at init
-    half_life_min: float = 50.0       # shortest particle half-life (sim time units)
-    half_life_max: float = 500.0      # longest particle half-life
+    # Composite half-lives are derived from their species hash using this range
+    half_life_min: float = 50.0       # shortest composite half-life (sim time units)
+    half_life_max: float = 500.0      # longest composite half-life
 
     # Composites get a half-life derived from their species hash; this scales it
     composite_half_life_scale: float = 3.0  # composites live ~3x longer than particles
@@ -94,8 +93,6 @@ class SimConfig:
     # ── Performance Caps ─────────────────────────────────────────────────────
     # Cap fusion scan to first K candidates per step (avoids O(N) sequential scan)
     max_fusions_per_step: int = 100
-    # Cap decay spawns per step (keeps find_free_slots fast)
-    max_decay_per_step: int = 200
     # Enable spring bond forces between composite members (expensive; off by default)
     use_bond_forces: bool = True
 

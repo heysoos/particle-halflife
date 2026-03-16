@@ -287,7 +287,7 @@ class Renderer:
         self.particle_prog['u_world_size'].value = (config.world_width, config.world_height)
 
         self._particle_vertex_size = 7  # floats: x,y,r,g,b,a,size
-        _max_draw = config.max_particles + config.max_composites
+        _max_draw = config.num_particles + config.max_composites
         self._particle_buf_size = _max_draw * self._particle_vertex_size * 4
 
         self.particle_vbo = self.ctx.buffer(reserve=self._particle_buf_size)
@@ -412,7 +412,6 @@ class Renderer:
         self._show_events = True
         self._paused      = False   # mirror of main loop paused state
 
-        self._prev_alive      = None
         self._prev_comp_alive = None
 
         self._stats_alive    = 0
@@ -517,11 +516,11 @@ class Renderer:
         composites = state.composites
 
         # Single batched GPU→CPU transfer — one CUDA sync + one DMA instead of 13
-        (pos, vel, species, alive, mass, _energy, comp_id,
+        (pos, vel, species, mass, _energy, comp_id,
          comp_members, comp_count, comp_alive,
          total_energy, step_count, sim_time) = jax.device_get((
             particles.position, particles.velocity,
-            particles.species,  particles.alive,
+            particles.species,
             particles.mass,     particles.energy,
             particles.composite_id,
             composites.members, composites.member_count, composites.alive,
@@ -529,7 +528,7 @@ class Renderer:
         ))
 
         # ── Particle vertex data ──────────────────────────────────────────────
-        alive_idx = np.where(alive)[0]
+        alive_idx = np.arange(len(pos))
         n_alive   = len(alive_idx)
 
         if n_alive > 0:
@@ -633,8 +632,8 @@ class Renderer:
             self._n_particles_to_draw = n_alive + n_m
 
         # ── Stats ─────────────────────────────────────────────────────────────
-        self._stats_alive    = int(np.sum(alive))
-        self._stats_free     = int(np.sum(alive & (comp_id < 0)))
+        self._stats_alive    = len(pos)
+        self._stats_free     = int(np.sum(comp_id < 0))
         self._stats_n_comp   = int(np.sum(comp_alive))
         self._stats_energy   = float(total_energy)
         self._stats_step     = int(step_count)
@@ -660,7 +659,7 @@ class Renderer:
             if current_sim_time - ev[5] < ev[6]
         ]
 
-        if self._show_events and self._prev_alive is not None:
+        if self._show_events and self._prev_comp_alive is not None:
             new_comps  = ~self._prev_comp_alive & comp_alive
             dead_comps = self._prev_comp_alive  & ~comp_alive
 
@@ -694,7 +693,7 @@ class Renderer:
             self._events = self._events[-self._event_max:]
 
         # Accumulate event counts (composite-level only; free particles don't decay)
-        if self._prev_alive is not None:
+        if self._prev_comp_alive is not None:
             n_fusion = int(np.sum(~self._prev_comp_alive & comp_alive))
             n_decay  = int(np.sum(self._prev_comp_alive  & ~comp_alive))
             self._fusion_total += n_fusion
@@ -716,7 +715,6 @@ class Renderer:
         self._spark_fusion.append(self._fusion_rate)
         self._spark_decay.append(self._decay_rate)
 
-        self._prev_alive      = alive.copy()
         self._prev_comp_alive = comp_alive.copy()
 
         # ── Build event VBO ───────────────────────────────────────────────────
