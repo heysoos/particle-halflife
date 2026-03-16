@@ -626,12 +626,16 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         # Concat first half of each into a (M,) buffer
         half = M // 2
         merged_members = jnp.concatenate([i_members[:half], j_members[:half]])  # (M,)
-        # Compact: valid IDs (>=0) must occupy slots [0..mc-1]; -1 sentinels at the end.
-        # Without compaction, the concat produces e.g. [i, -1, -1, -1, j, -1, -1, -1]
-        # while member_count=2 implies members[0] and members[1] are both valid.
-        # Fix: argsort by validity descending (1=valid, 0=-1) moves valid IDs to front.
-        order = jnp.argsort(-(merged_members >= 0).astype(jnp.int32), stable=True)
-        merged_members = merged_members[order]
+
+        # Compact valid IDs to front using cumsum — O(M), no separate argsort kernel.
+        # Invalid entries are routed to index M (OOB) and dropped, preventing
+        # write-conflicts with valid entries that land at index 0.
+        valid_mask = merged_members >= 0
+        pos     = jnp.cumsum(valid_mask.astype(jnp.int32)) - 1  # [0, n_valid)
+        out_pos = jnp.where(valid_mask, pos, M)                  # invalid → OOB
+        merged_members = jnp.full(M, -1, dtype=jnp.int32).at[out_pos].set(
+            merged_members, mode='drop'
+        )
 
         # Write to target composite
         safe_target = jnp.where(can_fuse, target, 0)
