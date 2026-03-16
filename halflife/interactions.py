@@ -127,7 +127,6 @@ def pairwise_force(pos_i: jnp.ndarray, pos_j: jnp.ndarray,
 def compute_forces_for_particle(i: jnp.ndarray,
                                   positions: jnp.ndarray,
                                   species: jnp.ndarray,
-                                  alive: jnp.ndarray,
                                   neighbors: jnp.ndarray,
                                   params: InteractionParams,
                                   config: SimConfig,
@@ -140,7 +139,6 @@ def compute_forces_for_particle(i: jnp.ndarray,
         i:          scalar int32 — particle index
         positions:  (N, 2)
         species:    (N,)
-        alive:      (N,)
         neighbors:  (max_neighbors,) int32 — neighbor indices for particle i
         params:     InteractionParams
         config:     SimConfig (static)
@@ -154,7 +152,7 @@ def compute_forces_for_particle(i: jnp.ndarray,
     mod_i = attr_mod[i]
 
     def force_from_neighbor(j):
-        valid = (j >= 0) & alive[j]
+        valid = (j >= 0)
         pos_j = jnp.where(valid, positions[j], pos_i)  # safe fallback
         sp_j  = jnp.where(valid, species[j], sp_i)
         mod_j = attr_mod[j]  # safe: result is masked below when j invalid
@@ -168,7 +166,6 @@ def compute_forces_for_particle(i: jnp.ndarray,
 
 def compute_all_forces(positions: jnp.ndarray,
                         species: jnp.ndarray,
-                        alive: jnp.ndarray,
                         neighbors: jnp.ndarray,
                         params: InteractionParams,
                         config: SimConfig,
@@ -180,7 +177,6 @@ def compute_all_forces(positions: jnp.ndarray,
     Args:
         positions:  (N, 2) float32
         species:    (N,)   int32
-        alive:      (N,)   bool
         neighbors:  (N, max_neighbors) int32
         params:     InteractionParams
         config:     SimConfig (static)
@@ -190,15 +186,13 @@ def compute_all_forces(positions: jnp.ndarray,
         (N, 2) float32 — force vectors per particle
     """
     if attr_mod is None:
-        attr_mod = jnp.ones(config.max_particles, dtype=jnp.float32)
+        attr_mod = jnp.ones(config.num_particles, dtype=jnp.float32)
 
-    particle_indices = jnp.arange(config.max_particles, dtype=jnp.int32)
+    particle_indices = jnp.arange(config.num_particles, dtype=jnp.int32)
 
     def forces_for_i(i):
         return compute_forces_for_particle(
-            i, positions, species, alive, neighbors[i], params, config, physics, attr_mod
+            i, positions, species, neighbors[i], params, config, physics, attr_mod
         )
 
-    forces = jax.vmap(forces_for_i)(particle_indices)   # (N, 2)
-    # Dead particles have zero force
-    return forces * alive[:, None].astype(jnp.float32)
+    return jax.vmap(forces_for_i)(particle_indices)   # (N, 2)

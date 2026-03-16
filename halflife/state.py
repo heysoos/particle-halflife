@@ -26,16 +26,14 @@ from halflife.utils import make_species_colors
 
 class ParticleState(NamedTuple):
     """
-    State of the full particle pool. Leading dimension is MAX_PARTICLES.
-    Use `alive` mask to distinguish active particles from empty slots.
+    State of the full particle pool. Leading dimension is NUM_PARTICLES.
+    All particles are always alive; no dead slots exist.
     """
     position:     jnp.ndarray  # (N, 2)  float32 — spatial position
     velocity:     jnp.ndarray  # (N, 2)  float32 — velocity
     species:      jnp.ndarray  # (N,)    int32   — species index [0, NUM_SPECIES)
-    alive:        jnp.ndarray  # (N,)    bool    — active slot mask
     energy:       jnp.ndarray  # (N,)    float32 — kinetic + internal energy
     mass:         jnp.ndarray  # (N,)    float32 — particle mass
-    half_life:    jnp.ndarray  # (N,)    float32 — decay half-life (sim time units)
     age:          jnp.ndarray  # (N,)    float32 — time since creation/last spawn
     composite_id: jnp.ndarray  # (N,)    int32   — composite index, -1 = free particle
 
@@ -77,7 +75,6 @@ def initialize_world(config: SimConfig, seed: int = 0) -> WorldState:
     Particles are placed uniformly at random within the world bounds.
     Species are assigned uniformly at random.
     Speeds are sampled from a Maxwell-Boltzmann-like distribution.
-    Half-lives are sampled uniformly from config.half_life_min/max.
     All particles start as free (composite_id = -1).
 
     Args:
@@ -88,8 +85,7 @@ def initialize_world(config: SimConfig, seed: int = 0) -> WorldState:
         WorldState ready for simulation
     """
     key = jax.random.PRNGKey(seed)
-    N = config.max_particles
-    n_init = config.num_particles_init
+    N = config.num_particles
     C = config.max_composites
     M = config.max_composite_size
 
@@ -111,18 +107,9 @@ def initialize_world(config: SimConfig, seed: int = 0) -> WorldState:
     # Species: uniform random
     species = jax.random.randint(k4, (N,), 0, config.num_species)
 
-    # Alive: first n_init slots are alive
-    alive = jnp.arange(N) < n_init
-
     # Energy: 0.5 * mass * |v|^2
     mass = jnp.ones(N, dtype=jnp.float32)
     energy = 0.5 * mass * jnp.sum(vel ** 2, axis=-1)
-
-    # Half-lives: uniform in [min, max]
-    key, k6 = jax.random.split(key)
-    half_life = jax.random.uniform(k6, (N,),
-                                    minval=config.half_life_min,
-                                    maxval=config.half_life_max)
 
     age = jnp.zeros(N, dtype=jnp.float32)
     composite_id = jnp.full(N, -1, dtype=jnp.int32)
@@ -131,10 +118,8 @@ def initialize_world(config: SimConfig, seed: int = 0) -> WorldState:
         position=pos,
         velocity=vel,
         species=species,
-        alive=alive,
         energy=energy,
         mass=mass,
-        half_life=half_life,
         age=age,
         composite_id=composite_id,
     )
@@ -152,7 +137,7 @@ def initialize_world(config: SimConfig, seed: int = 0) -> WorldState:
     )
 
     # ── Global scalars ────────────────────────────────────────────────────────
-    total_energy = jnp.sum(energy * alive.astype(jnp.float32))
+    total_energy = jnp.sum(energy)
 
     return WorldState(
         particles=particles,

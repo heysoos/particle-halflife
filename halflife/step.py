@@ -51,7 +51,7 @@ def compute_bond_forces(state: WorldState, config: SimConfig,
     """
     particles = state.particles
     composites = state.composites
-    N = config.max_particles
+    N = config.num_particles
     M = config.max_composite_size
     spring_k = physics.spring_k
 
@@ -128,10 +128,10 @@ def simulation_step(state: WorldState, params: InteractionParams,
     particles = state.particles
 
     # ── Phase 1: Spatial Indexing ─────────────────────────────────────────────
-    cell_list = build_cell_list(particles.position, particles.alive, config)
+    cell_list = build_cell_list(particles.position, config)
 
     # ── Phase 2: Neighbor Finding ─────────────────────────────────────────────
-    neighbors = find_all_neighbors(particles.position, particles.alive, cell_list, config)
+    neighbors = find_all_neighbors(particles.position, cell_list, config)
 
     # ── Phase 3: Force Computation ────────────────────────────────────────────
     # Polarity modifier: composite members use their composite's net_polarity;
@@ -142,7 +142,7 @@ def simulation_step(state: WorldState, params: InteractionParams,
     attr_mod = jnp.where(is_composite, net_pol, 1.0)    # (N,) float32
 
     forces = compute_all_forces(
-        particles.position, particles.species, particles.alive, neighbors, params, config,
+        particles.position, particles.species, neighbors, params, config,
         physics, attr_mod
     )
 
@@ -156,11 +156,6 @@ def simulation_step(state: WorldState, params: InteractionParams,
     new_vel = new_vel * physics.damping
     new_vel = jnp.clip(new_vel, -config.max_velocity, config.max_velocity)
     new_pos = particles.position + new_vel * config.dt
-
-    # Dead particles stay put (no NaN propagation)
-    alive_f = particles.alive[:, None].astype(jnp.float32)
-    new_vel = new_vel * alive_f
-    new_pos = new_pos * alive_f + particles.position * (1.0 - alive_f)
 
     # ── Phase 5: Boundary Conditions ─────────────────────────────────────────
     new_pos, new_vel = apply_boundary(new_pos, new_vel, config)
@@ -180,7 +175,7 @@ def simulation_step(state: WorldState, params: InteractionParams,
     state = apply_soft_energy_conservation(state, state.total_energy)
 
     # ── Phase 9: Increment Ages and Counters ──────────────────────────────────
-    new_age = state.particles.age + config.dt * state.particles.alive.astype(jnp.float32)
+    new_age = state.particles.age + config.dt
     new_comp_age = state.composites.age + config.dt * state.composites.alive.astype(jnp.float32)
 
     return state._replace(

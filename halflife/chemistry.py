@@ -120,162 +120,6 @@ def _hash_to_decay_products(h: jnp.ndarray, parent_species: jnp.ndarray,
     return product_species, n_prods
 
 
-# ── Decay ─────────────────────────────────────────────────────────────────────
-
-def apply_particle_decay(state: WorldState, config: SimConfig) -> WorldState:
-    """
-    Apply probabilistic decay to all alive free particles.
-
-    P(decay in dt) = 1 - exp(-dt * ln2 / half_life)
-
-    Decaying particles are killed and replaced by product particles
-    in nearby positions with a share of the parent's kinetic energy.
-
-    Args:
-        state:  WorldState
-        config: SimConfig (static)
-
-    Returns:
-        Updated WorldState
-    """
-    particles = state.particles
-    key, subkey = jax.random.split(state.rng_key)
-    N = config.max_particles
-
-    # Only free particles decay here (composites handled separately)
-    is_free = particles.alive & (particles.composite_id < 0)
-
-    # Draw uniform random for each particle
-    rand = jax.random.uniform(subkey, (N,))
-
-    # Decay probability
-    ln2 = jnp.log(2.0)
-    decay_prob = 1.0 - jnp.exp(-config.dt * ln2 / (particles.half_life + 1e-10))
-
-    # Which particles decay this step?
-    decays = is_free & (rand < decay_prob)
-
-    # ── Kill decaying particles ──────────────────────────────────────────────
-    new_alive = particles.alive & ~decays
-
-    # ── Spawn products ────────────────────────────────────────────────────────
-    # For each decaying particle, compute its hash and products
-    # We process all N particles but mask with `decays`
-
-    def compute_decay_products(i):
-        h = jnp.array(
-            (config.hash_prime_a * (particles.species[i].astype(jnp.int32) + 1)
-             + config.hash_prime_b) % config.hash_modulus,
-            dtype=jnp.uint32
-        )
-        # Sorted species multiset for single particle = just [species]
-        species_sorted = jnp.array([-1] * config.max_composite_size, dtype=jnp.int32)
-        species_sorted = species_sorted.at[0].set(particles.species[i])
-        return _hash_to_decay_products(h, particles.species[i], config)
-
-    # vmap over all particles — products for all, we'll mask later
-    all_product_species, all_product_counts = jax.vmap(
-        lambda i: compute_decay_products(i)
-    )(jnp.arange(N, dtype=jnp.int32))
-    # all_product_species: (N, max_decay_products) int32
-    # all_product_counts:  (N,) int32
-
-    # Find free slots for product spawning.
-    # Each decaying particle can produce up to max_decay_products offspring.
-    # We'll use find_free_slots on the updated alive array.
-    # For simplicity in Phase 4, limit spawning to 1 product per decaying particle.
-    # (Multi-product spawning is a Phase 5 enhancement.)
-    n_decaying = jnp.sum(decays.astype(jnp.int32))
-
-    # Find free slots — capped at max_decay_per_step to keep this O(N log N)
-    max_spawns = config.max_decay_per_step
-    free_slots = find_free_slots(new_alive, max_spawns)  # (max_spawns,)
-
-    # Assign decaying particles to spawn slots sequentially
-    decay_cumsum = jnp.cumsum(decays.astype(jnp.int32))  # 1-indexed
-
-    # For each decaying particle i with ordinal k, spawn into free_slots[k-1]
-    def spawn_into_slot(i):
-        """Given decaying particle i, return (target_slot, new_species, new_pos, new_vel)"""
-        k = decay_cumsum[i] - 1  # 0-indexed ordinal among decaying particles
-        slot = jnp.where((k >= 0) & (k < max_spawns), free_slots[k], -1)
-        slot = jnp.where(slot >= N, -1, slot)  # -1 if no free slot
-
-        # Product species: first product from decay hash
-        new_species = all_product_species[i, 0]
-
-        # Position: near parent (small random scatter added in post)
-        new_pos = particles.position[i]
-
-        # Velocity: inherit parent's direction, share energy
-        parent_speed = jnp.linalg.norm(particles.velocity[i]) + 1e-8
-        # Give product a random direction but similar speed
-        new_vel = particles.velocity[i]  # same velocity (products fly off together)
-
-        return slot, new_species, new_pos, new_vel
-
-    spawn_slots, spawn_species, spawn_pos, spawn_vel = jax.vmap(spawn_into_slot)(
-        jnp.arange(N, dtype=jnp.int32)
-    )
-    # spawn_slots: (N,) int32 — destination slot for each particle (if it decays)
-
-    # Apply spawns: update new_alive, species, position, velocity for spawned slots
-    # We write into the arrays using .at[].set() with masking
-    spawn_mask = decays & (spawn_slots >= 0)
-
-    def update_array_at_slots(arr, values, slots, mask):
-        """arr[slots[i]] = values[i] for all i where mask[i]"""
-        safe_slots = jnp.where(mask, slots, 0)
-        # Build updated array: scatter values into safe_slots
-        # Use a loop-free approach: for each slot, check if any spawner targets it
-        # This is simplified: we use .at[].set() which handles duplicate writes via last-wins
-        return arr.at[safe_slots].set(
-            jnp.where(mask, values, arr[safe_slots])
-        )
-
-    # Add random scatter to spawn positions
-    key, k_scatter = jax.random.split(key)
-    scatter = jax.random.normal(k_scatter, (N, 2)) * 0.1
-    spawn_pos = spawn_pos + scatter
-
-    new_alive       = update_array_at_slots(new_alive, jnp.ones(N, bool),    spawn_slots, spawn_mask)
-    new_species     = update_array_at_slots(particles.species,  spawn_species, spawn_slots, spawn_mask)
-    new_pos         = particles.position.copy()
-    new_vel_arr     = particles.velocity.copy()
-    # Scatter positions and velocities
-    safe_slots = jnp.where(spawn_mask, spawn_slots, 0)
-    new_pos = new_pos.at[safe_slots].set(
-        jnp.where(spawn_mask[:, None], spawn_pos, new_pos[safe_slots])
-    )
-    new_vel_arr = new_vel_arr.at[safe_slots].set(
-        jnp.where(spawn_mask[:, None], spawn_vel, new_vel_arr[safe_slots])
-    )
-
-    # Reset age and composite_id for new particles
-    new_age = particles.age.at[safe_slots].set(
-        jnp.where(spawn_mask, 0.0, particles.age[safe_slots])
-    )
-    new_cid = particles.composite_id.at[safe_slots].set(
-        jnp.where(spawn_mask, -1, particles.composite_id[safe_slots])
-    )
-    # New half-life: sample from parent's half-life with some variation
-    new_hl  = particles.half_life.at[safe_slots].set(
-        jnp.where(spawn_mask, particles.half_life[safe_slots], particles.half_life[safe_slots])
-    )
-
-    new_particles = particles._replace(
-        position=new_pos,
-        velocity=new_vel_arr,
-        species=new_species,
-        alive=new_alive,
-        age=new_age,
-        composite_id=new_cid,
-        half_life=new_hl,
-    )
-
-    return state._replace(particles=new_particles, rng_key=key)
-
-
 # ── Composite Decay / Fission ─────────────────────────────────────────────────
 
 def apply_composite_decay(state: WorldState, config: SimConfig) -> WorldState:
@@ -412,7 +256,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
     particles = state.particles
     composites = state.composites
     key, subkey = jax.random.split(state.rng_key)
-    N = config.max_particles
+    N = config.num_particles
     M = config.max_composite_size
 
     fusion_r2 = config.fusion_radius ** 2
@@ -424,7 +268,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         return jnp.where(is_free, i, composites.members[c, 0])
 
     all_reps = jax.vmap(get_rep)(jnp.arange(N, dtype=jnp.int32))  # (N,)
-    is_rep = (all_reps == jnp.arange(N)) & particles.alive  # (N,)
+    is_rep = (all_reps == jnp.arange(N))  # (N,)
 
     # ── Pre-cache entity hashes (computed once, reused in check_neighbor) ─────
     # Commutative hash: H(i union j) = (H(i) + H(j)) % modulus — no sort needed.

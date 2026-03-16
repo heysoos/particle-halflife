@@ -48,28 +48,25 @@ def _linearize_cell(cx: jnp.ndarray, cy: jnp.ndarray, config: SimConfig) -> jnp.
     return cx * config.num_cells_y + cy
 
 
-def build_cell_list(positions: jnp.ndarray, alive: jnp.ndarray,
+def build_cell_list(positions: jnp.ndarray,
                     config: SimConfig) -> CellList:
     """
     Build a cell list from particle positions.
 
     Args:
         positions: (N, 2) float32
-        alive:     (N,)   bool
         config:    SimConfig (static)
 
     Returns:
         CellList with particle_ids (num_cells, cell_capacity) and counts
     """
-    N = config.max_particles
+    N = config.num_particles
     num_cells = config.num_cells
     cap = config.cell_capacity
 
-    # Compute cell index for each particle (-1 for dead particles)
+    # Compute cell index for each particle
     cx, cy = _particle_to_cell_xy(positions, config)
     cell_idx = _linearize_cell(cx, cy, config)  # (N,) int32
-    # Dead particles get a sentinel beyond the grid
-    cell_idx = jnp.where(alive, cell_idx, num_cells)  # num_cells = invalid sentinel
 
     # Build cell list by iterating particles in sorted order.
     # We use a scatter approach: for each cell, collect particles.
@@ -108,8 +105,8 @@ def build_cell_list(positions: jnp.ndarray, alive: jnp.ndarray,
     # Scatter into particle_ids
     particle_ids = jnp.full((num_cells, cap), -1, dtype=jnp.int32)
 
-    # Only write alive particles within valid cells
-    valid = alive & (sorted_cells < num_cells) & (local_offset < cap)
+    # Only write particles within valid cells
+    valid = (sorted_cells < num_cells) & (local_offset < cap)
     row = jnp.clip(sorted_cells, 0, num_cells - 1)
     col = local_offset_clamped
 
@@ -130,7 +127,7 @@ def build_cell_list(positions: jnp.ndarray, alive: jnp.ndarray,
 
 
 def find_neighbors_for_particle(i: int, positions: jnp.ndarray,
-                                  alive: jnp.ndarray, cell_list: CellList,
+                                  cell_list: CellList,
                                   config: SimConfig) -> jnp.ndarray:
     """
     Find all particles within interaction_radius of particle i.
@@ -141,7 +138,6 @@ def find_neighbors_for_particle(i: int, positions: jnp.ndarray,
     Args:
         i:          scalar int — index of the query particle
         positions:  (N, 2) float32
-        alive:      (N,)   bool
         cell_list:  CellList
         config:     SimConfig (static)
 
@@ -180,10 +176,10 @@ def find_neighbors_for_particle(i: int, positions: jnp.ndarray,
     # candidate_blocks: (9, cap) int32
     candidates = candidate_blocks.reshape(-1)  # (9*cap,) int32
 
-    # Filter: alive, within radius, not self
+    # Filter: within radius, not self
     def check_candidate(pid):
-        valid = (pid >= 0) & (pid != i) & alive[pid]
-        pos_j = jnp.where(valid, positions[pid], pos_i)  # avoid OOB on dead
+        valid = (pid >= 0) & (pid != i)
+        pos_j = jnp.where(valid, positions[pid], pos_i)  # safe fallback
         # Minimum image displacement
         d = pos_i - pos_j
         if config.boundary_mode == "periodic":
@@ -209,19 +205,18 @@ def find_neighbors_for_particle(i: int, positions: jnp.ndarray,
     return neighbors
 
 
-def find_all_neighbors(positions: jnp.ndarray, alive: jnp.ndarray,
+def find_all_neighbors(positions: jnp.ndarray,
                         cell_list: CellList, config: SimConfig) -> jnp.ndarray:
     """
     Find neighbors for ALL particles simultaneously using vmap.
 
     Args:
         positions:  (N, 2) float32
-        alive:      (N,)   bool
         cell_list:  CellList
         config:     SimConfig (static)
 
     Returns:
         (N, max_neighbors) int32 — neighbor indices per particle, padded with -1
     """
-    find_fn = lambda i: find_neighbors_for_particle(i, positions, alive, cell_list, config)
-    return jax.vmap(find_fn)(jnp.arange(config.max_particles, dtype=jnp.int32))
+    find_fn = lambda i: find_neighbors_for_particle(i, positions, cell_list, config)
+    return jax.vmap(find_fn)(jnp.arange(config.num_particles, dtype=jnp.int32))

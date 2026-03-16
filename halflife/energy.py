@@ -13,11 +13,11 @@ from halflife.state import ParticleState, CompositeState, WorldState
 
 def compute_kinetic_energy(particles: ParticleState) -> jnp.ndarray:
     """
-    Sum of kinetic energies across all alive particles.
+    Sum of kinetic energies across all particles.
     KE_i = 0.5 * mass_i * |velocity_i|^2
     """
     ke = 0.5 * particles.mass * jnp.sum(particles.velocity ** 2, axis=-1)
-    return jnp.sum(ke * particles.alive.astype(jnp.float32))
+    return jnp.sum(ke)
 
 
 def compute_binding_energy(composites: CompositeState) -> jnp.ndarray:

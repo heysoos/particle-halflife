@@ -37,10 +37,10 @@ def _run_cached(n_steps: int, seed: int = 0):
     params = _params
     state = initialize_world(config, seed=seed)
     state = _step_jit(state, params, config)
-    state.particles.alive.block_until_ready()
+    state.particles.position.block_until_ready()
     for _ in range(n_steps - 1):
         state = _step_jit(state, params, config)
-    state.particles.alive.block_until_ready()
+    state.particles.position.block_until_ready()
     return state
 
 
@@ -50,15 +50,14 @@ def test_no_nan_in_positions():
     """After 100 steps, position, velocity, and energy must contain no NaN/Inf."""
     state = _run_cached(100)
     particles = state.particles
-    alive = np.array(particles.alive)
 
     pos = np.array(particles.position)
     vel = np.array(particles.velocity)
     energy = np.array(particles.energy)
 
-    nan_pos = np.sum(~np.isfinite(pos[alive]))
-    nan_vel = np.sum(~np.isfinite(vel[alive]))
-    nan_energy = np.sum(~np.isfinite(energy[alive]))
+    nan_pos = np.sum(~np.isfinite(pos))
+    nan_vel = np.sum(~np.isfinite(vel))
+    nan_energy = np.sum(~np.isfinite(energy))
 
     print(f"\nNaN/Inf check after 100 steps:")
     print(f"  position: {nan_pos}, velocity: {nan_vel}, energy: {nan_energy}")
@@ -70,35 +69,32 @@ def test_no_nan_in_positions():
 
 def test_positions_in_bounds():
     """
-    With periodic boundaries, all alive particle positions must stay in
+    With periodic boundaries, all particle positions must stay in
     [0, world_width) × [0, world_height).
     """
     state = _run_cached(100)
     pos = np.array(state.particles.position)
-    alive = np.array(state.particles.alive)
     W = _config.world_width
     H = _config.world_height
     eps = 1e-3  # small tolerance for float rounding at exactly 0 / W
 
-    alive_pos = pos[alive]
-    out_x = np.sum((alive_pos[:, 0] < -eps) | (alive_pos[:, 0] >= W + eps))
-    out_y = np.sum((alive_pos[:, 1] < -eps) | (alive_pos[:, 1] >= H + eps))
+    out_x = np.sum((pos[:, 0] < -eps) | (pos[:, 0] >= W + eps))
+    out_y = np.sum((pos[:, 1] < -eps) | (pos[:, 1] >= H + eps))
 
     print(f"\nPosition bounds check: out_x={out_x}, out_y={out_y} "
-          f"(world={W}x{H}, {alive.sum()} alive)")
+          f"(world={W}x{H}, {_config.num_particles} particles)")
     assert out_x == 0, f"{out_x} particles have x outside [0, {W}]"
     assert out_y == 0, f"{out_y} particles have y outside [0, {H}]"
 
 
 def test_velocity_clamped():
-    """All alive particle velocities must have |v| <= max_velocity + epsilon."""
+    """All particle velocities must have |v| <= max_velocity + epsilon."""
     state = _run_cached(100)
     vel = np.array(state.particles.velocity)
-    alive = np.array(state.particles.alive)
     max_v = _config.max_velocity
     eps = 0.1  # small tolerance for in-step computation before clamp
 
-    speeds = np.linalg.norm(vel[alive], axis=1)
+    speeds = np.linalg.norm(vel, axis=1)
     violations = np.sum(speeds > max_v + eps)
     max_speed = speeds.max() if len(speeds) > 0 else 0.0
 
@@ -123,7 +119,7 @@ def test_energy_bounded():
 
     # Warm up JIT
     state = step_fn(state, params, config)
-    state.particles.alive.block_until_ready()
+    state.particles.position.block_until_ready()
     initial_energy = float(compute_total_energy(state))
 
     if initial_energy < 1e-6:
@@ -173,18 +169,18 @@ def test_step_count_increments():
 def test_composite_id_valid():
     """
     After 100 steps:
-    - Alive particles with composite_id >= 0 must point to alive composites.
-    - Alive particles with composite_id < 0 are free (no constraint).
+    - Particles with composite_id >= 0 must point to alive composites.
+    - Particles with composite_id < 0 are free (no constraint).
     """
     state = _run_cached(100)
     particles = state.particles
     composites = state.composites
-    alive = np.array(particles.alive)
     cid = np.array(particles.composite_id)
     comp_alive = np.array(composites.alive)
+    N = _config.num_particles
 
     errors = []
-    for i in np.where(alive)[0]:
+    for i in range(N):
         c = cid[i]
         if c >= 0:
             if c >= _config.max_composites:
@@ -192,7 +188,7 @@ def test_composite_id_valid():
             elif not comp_alive[c]:
                 errors.append(f"Particle {i}: composite_id={c} points to dead composite")
 
-    print(f"\nComposite ID validity check: {len(errors)} errors among {alive.sum()} alive particles")
+    print(f"\nComposite ID validity check: {len(errors)} errors among {N} particles")
     if errors:
         for e in errors[:5]:
             print(f"  {e}")
@@ -215,8 +211,8 @@ def test_reset_deterministic():
     # Warm up with both (same operations)
     state_a = step_fn(state_a, params_a, config)
     state_b = step_fn(state_b, params_b, config)
-    state_a.particles.alive.block_until_ready()
-    state_b.particles.alive.block_until_ready()
+    state_a.particles.position.block_until_ready()
+    state_b.particles.position.block_until_ready()
 
     for _ in range(49):
         state_a = step_fn(state_a, params_a, config)
@@ -224,15 +220,10 @@ def test_reset_deterministic():
 
     pos_a = np.array(state_a.particles.position)
     pos_b = np.array(state_b.particles.position)
-    alive_a = np.array(state_a.particles.alive)
-    alive_b = np.array(state_b.particles.alive)
 
     pos_max_diff = np.max(np.abs(pos_a - pos_b))
-    alive_match = np.all(alive_a == alive_b)
 
-    print(f"\nDeterminism check after 50 steps: max_pos_diff={pos_max_diff:.6f}, "
-          f"alive_match={alive_match}")
-    assert alive_match, "Alive masks differ between two identical runs"
+    print(f"\nDeterminism check after 50 steps: max_pos_diff={pos_max_diff:.6f}")
     assert pos_max_diff < 1e-5, (
         f"Max position difference {pos_max_diff:.6f} > 1e-5. Run is not deterministic."
     )
