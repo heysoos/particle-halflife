@@ -408,28 +408,16 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         # Target composite slot (O(1) lookup instead of O(C) argmin)
         safe_ptr = jnp.clip(free_slot_ptr, 0, max_fusions - 1)
         free_comp_slot = free_comp_slots[safe_ptr]
-        target = jax.lax.switch(
-            (i_is_free.astype(jnp.int32) * 2 + j_is_free.astype(jnp.int32)),
-            [
-                # case 0: comp+comp → lower index absorbs
-                lambda: jnp.minimum(ci, cj),
-                # case 1: comp+free → ci
-                lambda: ci,
-                # case 2: free+comp → cj
-                lambda: cj,
-                # case 3: free+free → new slot
-                lambda: free_comp_slot,
-            ]
+        # Use jnp.where instead of jax.lax.switch — avoids GPU conditionals (2 switch
+        # calls previously dominated fusion at 33ms/step in profiler traces).
+        # target: free+free→new slot, i-comp+free→ci, free+j-comp→cj, comp+comp→min
+        target = jnp.where(
+            i_is_free,
+            jnp.where(j_is_free, free_comp_slot, cj),
+            jnp.where(j_is_free, ci, jnp.minimum(ci, cj)),
         )
-        absorbed = jax.lax.switch(
-            (i_is_free.astype(jnp.int32) * 2 + j_is_free.astype(jnp.int32)),
-            [
-                lambda: jnp.maximum(ci, cj),  # comp+comp: higher index killed
-                lambda: jnp.int32(-1),          # comp+free: no composite killed
-                lambda: jnp.int32(-1),          # free+comp: no composite killed
-                lambda: jnp.int32(-1),          # free+free: no composite killed
-            ]
-        )
+        # absorbed: only comp+comp kills the higher-index composite
+        absorbed = jnp.where(~i_is_free & ~j_is_free, jnp.maximum(ci, cj), jnp.int32(-1))
 
         # Energy-based half-life: high binding energy → stable, low → unstable
         t = jnp.clip(
