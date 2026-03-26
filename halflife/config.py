@@ -25,11 +25,11 @@ class SimConfig:
 
     # ── Particles ────────────────────────────────────────────────────────────
     num_particles: int = 2_000      # total particle count (fixed, all always alive)
-    num_species: int = 4           # number of distinct particle types
+    num_species: int = 64           # number of distinct particle types
     state_dim: int = 8              # internal state vector size (NCA-style, future use)
 
     # ── Composites ───────────────────────────────────────────────────────────
-    max_composites: int = 2_000       # fixed composite pool capacity
+    max_composites: int = 5_000       # fixed composite pool capacity
     max_composite_size: int = 64     # JAX buffer size — not a physics cap; chemistry determines stability
 
     # ── Spatial Indexing ─────────────────────────────────────────────────────
@@ -40,7 +40,7 @@ class SimConfig:
 
     # ── Interactions ─────────────────────────────────────────────────────────
     interaction_radius: float = 4.0   # pairwise force cutoff distance
-    max_neighbors: int = 16           # max neighbors per particle (cap for fixed arrays)
+    max_neighbors: int = 256           # max neighbors per particle (cap for fixed arrays)
 
     # Particle Life-style force shape:
     #   [0, repulsion_radius]       → strong repulsion (hard core)
@@ -57,11 +57,11 @@ class SimConfig:
 
     # ── Decay / Half-life ────────────────────────────────────────────────────
     # Composite half-lives are derived from their species hash using this range
-    half_life_min: float = 50.0       # shortest composite half-life (sim time units)
+    half_life_min: float = 100.0       # shortest composite half-life (sim time units)
     half_life_max: float = 500.0      # longest composite half-life
 
     # Composites get a half-life derived from their species hash; this scales it
-    composite_half_life_scale: float = 3.0  # composites live ~3x longer than particles
+    composite_half_life_scale: float = 5.0  # composites halflife scaling
 
     # ── Energy ───────────────────────────────────────────────────────────────
     # Kinetic energy scale at initialization (controls initial temperature)
@@ -88,13 +88,17 @@ class SimConfig:
     # Opposite polarities fuse more readily; neutral composites live longer.
     polarity_fusion_scale:      float = 0.3   # bonus/penalty to binding energy
     polarity_stability_scale:   float = 0.5   # neutrality boost to composite half-life
-    composite_size_decay_scale: float = 0.3   # size penalty on composite half-life (larger → shorter hl)
+    composite_size_decay_scale: float = 0.05   # size penalty on composite half-life (larger → shorter hl)
 
     # ── Performance Caps ─────────────────────────────────────────────────────
-    # Cap fusion scan to first K candidates per step (avoids O(N) sequential scan)
-    max_fusions_per_step: int = 100
+    # Fusion scan length — set to num_particles to ensure all candidates are processed
+    max_fusions_per_step: int = 200  # = num_particles
     # Enable spring bond forces between composite members (expensive; off by default)
     use_bond_forces: bool = True
+
+    # ── Profiling / Instrumentation ──────────────────────────────────────────
+    enable_profiling: bool = False
+    cc_fusion_event_logging: bool = False  # Log individual C+C fusion events to console
 
     # ── Rendering ────────────────────────────────────────────────────────────
     window_width: int = 1280
