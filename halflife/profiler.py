@@ -76,7 +76,7 @@ class CCFusionEvent:
 class ProfileMetrics:
     """Accumulates metrics over a simulation run."""
     cc_fusion_events: List[CCFusionEvent] = field(default_factory=list)
-    composite_size_samples: List[Tuple[int, int]] = field(default_factory=list)
+    composite_size_samples: List[Tuple[int, int, float, np.ndarray]] = field(default_factory=list)
     max_composite_size_observed: int = 0
     cc_fusion_count: int = 0
 
@@ -91,7 +91,7 @@ class ProfileMetrics:
         self.max_composite_size_observed = max(self.max_composite_size_observed, max_size)
 
     def get_cc_fusion_rate(self) -> float:
-        """Return fusions per step."""
+        """Return total composite-composite fusion count."""
         return float(self.cc_fusion_count)
 
     def get_be_statistics(self) -> Tuple[float, float, float]:
