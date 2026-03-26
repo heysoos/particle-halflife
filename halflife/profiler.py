@@ -42,6 +42,71 @@ from halflife.chemistry import attempt_fusion, apply_composite_decay
 from halflife.energy import compute_total_energy, apply_soft_energy_conservation
 
 
+# ── Metrics Classes ───────────────────────────────────────────────────────────
+
+from dataclasses import dataclass, field
+from typing import List, Tuple
+
+
+@dataclass
+class CompositeInfo:
+    """Snapshot of a composite at fusion time."""
+    composite_id: int
+    member_count: int
+    binding_energy: float
+    species_hash: int
+    net_polarity: float
+
+
+@dataclass
+class CCFusionEvent:
+    """Record of a composite-composite fusion event."""
+    step: int
+    composite_a_id: int
+    composite_b_id: int
+    a_members: int
+    b_members: int
+    a_be: float
+    b_be: float
+    merged_be: float
+    merged_members: int
+
+
+@dataclass
+class ProfileMetrics:
+    """Accumulates metrics over a simulation run."""
+    cc_fusion_events: List[CCFusionEvent] = field(default_factory=list)
+    composite_size_samples: List[Tuple[int, int]] = field(default_factory=list)
+    max_composite_size_observed: int = 0
+    cc_fusion_count: int = 0
+
+    def record_cc_fusion(self, event: CCFusionEvent) -> None:
+        """Record a composite-composite fusion event."""
+        self.cc_fusion_events.append(event)
+        self.cc_fusion_count += 1
+
+    def record_composite_sizes(self, step: int, max_size: int, mean_size: float, distribution: np.ndarray) -> None:
+        """Record composite size snapshot at a step."""
+        self.composite_size_samples.append((step, max_size, mean_size, distribution))
+        self.max_composite_size_observed = max(self.max_composite_size_observed, max_size)
+
+    def get_cc_fusion_rate(self) -> float:
+        """Return fusions per step."""
+        return float(self.cc_fusion_count)
+
+    def get_be_statistics(self) -> Tuple[float, float, float]:
+        """Return (mean_be, min_be, max_be) of fused composites."""
+        if not self.cc_fusion_events:
+            return 0.0, 0.0, 0.0
+
+        merged_bes = [e.merged_be for e in self.cc_fusion_events]
+        return (
+            float(np.mean(merged_bes)),
+            float(np.min(merged_bes)),
+            float(np.max(merged_bes)),
+        )
+
+
 # ── Timing Utility ────────────────────────────────────────────────────────────
 
 def _time_fn(fn, n_warmup=3, n_bench=50, n_runs=1):
