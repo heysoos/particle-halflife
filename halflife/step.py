@@ -26,8 +26,10 @@ Multi-step (no Python overhead):
 """
 
 import functools
+from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from halflife.config import SimConfig
 from halflife.state import WorldState, InteractionParams, PhysicsParams
@@ -36,6 +38,9 @@ from halflife.interactions import compute_all_forces
 from halflife.chemistry import attempt_fusion, apply_composite_decay
 from halflife.energy import compute_total_energy, apply_soft_energy_conservation
 from halflife.utils import apply_boundary
+
+if TYPE_CHECKING:
+    from halflife.profiler import ProfileMetrics
 
 
 # ── Bond Forces (particles within composites) ─────────────────────────────────
@@ -109,10 +114,42 @@ def compute_bond_forces(state: WorldState, config: SimConfig,
     return bond_forces
 
 
+# ── Composite Size Statistics ─────────────────────────────────────────────────
+
+def compute_composite_size_stats(composites, config: SimConfig) -> tuple:
+    """
+    Compute composite size statistics from CompositeState.
+
+    Returns:
+        (max_size, mean_size, distribution_histogram)
+        where distribution_histogram[i] = count of composites with i members
+    """
+    alive_composites = composites.alive.astype(jnp.int32)  # (max_composites,)
+    counts = composites.member_count * alive_composites  # (max_composites,)
+
+    # Convert to numpy for statistics (happens on CPU, not in JAX ops)
+    counts_np = np.asarray(counts)
+    alive_indices = np.where(counts_np > 0)[0]
+
+    if len(alive_indices) == 0:
+        return 0, 0.0, np.zeros(config.max_composite_size + 1, dtype=np.int32)
+
+    alive_counts = counts_np[alive_indices]
+    max_size = int(np.max(alive_counts))
+    mean_size = float(np.mean(alive_counts))
+
+    # Histogram: count of composites at each size
+    histogram = np.zeros(config.max_composite_size + 1, dtype=np.int32)
+    for count in alive_counts:
+        histogram[int(count)] += 1
+
+    return max_size, mean_size, histogram
+
+
 # ── Main Simulation Step ──────────────────────────────────────────────────────
 
 def simulation_step(state: WorldState, params: InteractionParams,
-                    config: SimConfig, physics: PhysicsParams) -> WorldState:
+                    config: SimConfig, physics: PhysicsParams, metrics: "ProfileMetrics" = None) -> WorldState:
     """
     Advance WorldState by one timestep (dt).
 
@@ -178,13 +215,25 @@ def simulation_step(state: WorldState, params: InteractionParams,
     new_age = state.particles.age + config.dt
     new_comp_age = state.composites.age + config.dt * state.composites.alive.astype(jnp.float32)
 
-    return state._replace(
+    final_state = state._replace(
         particles=state.particles._replace(age=new_age),
         composites=state.composites._replace(age=new_comp_age),
         time=state.time + config.dt,
         total_energy=current_energy,
         step_count=state.step_count + 1,
     )
+
+    # Record metrics if profiling enabled
+    if metrics is not None and config.enable_profiling:
+        max_size, mean_size, histogram = compute_composite_size_stats(final_state.composites, config)
+        metrics.record_composite_sizes(
+            step=final_state.step_count,
+            max_size=max_size,
+            mean_size=mean_size,
+            distribution=histogram,
+        )
+
+    return final_state
 
 
 # ── Multi-step Helper ─────────────────────────────────────────────────────────
