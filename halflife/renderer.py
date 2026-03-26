@@ -27,6 +27,7 @@ import jax
 
 from halflife.config import SimConfig
 from halflife.state import WorldState, get_species_colors
+from halflife.profiler import ProfileMetrics
 
 
 # ── GLSL Shaders ──────────────────────────────────────────────────────────────
@@ -263,8 +264,9 @@ class Renderer:
     MODE_BONDS  = "bonds"
     MODE_MERGED = "merged"
 
-    def __init__(self, config: SimConfig):
+    def __init__(self, config: SimConfig, metrics: ProfileMetrics = None):
         self.config = config
+        self.metrics = metrics
         self.composite_mode = self.MODE_BONDS
 
         # ── pygame + OpenGL context ──────────────────────────────────────────
@@ -305,7 +307,11 @@ class Renderer:
         )
         self.bond_prog['u_world_size'].value = (config.world_width, config.world_height)
 
-        max_bonds = config.max_composites * config.max_composite_size
+        # Allocate for up to ~16 members per composite on average (all-pairs = 120 pairs).
+        # max_composite_size=64 worst-case would be 184 MB; this keeps it ~23 MB while
+        # covering the common case. Bonds beyond the cap are silently dropped.
+        avg_pairs_per_comp = 16 * 15 // 2  # 120
+        max_bonds = config.max_composites * avg_pairs_per_comp
         self._bond_vertex_size = 6  # floats: x,y,r,g,b,a
         self._bond_buf_size = max_bonds * 2 * self._bond_vertex_size * 4
         self.bond_vbo = self.ctx.buffer(reserve=self._bond_buf_size)
@@ -599,7 +605,7 @@ class Renderer:
                     bond_verts[:, 5] = 0.5
                     n_bytes = min(bond_verts.nbytes, self._bond_buf_size)
                     self.bond_vbo.write(bond_verts.tobytes()[:n_bytes])
-                    self._n_bond_vertices = n_pairs * 2
+                    self._n_bond_vertices = n_bytes // (self._bond_vertex_size * 4)
 
         elif self.composite_mode == self.MODE_MERGED and len(alive_comp_idx) > 0:
             C_idx = alive_comp_idx
@@ -911,6 +917,24 @@ class Renderer:
                     lbl = font.render(str(tick), True, (120, 150, 190))
                     surface.blit(lbl, (tx - lbl.get_width() // 2, chart_y + chart_h + 2))
             y_off = chart_y + chart_h + 20
+
+            # Composite size metrics (if profiling enabled)
+            if self.metrics is not None:
+                max_comp_size = self.metrics.max_composite_size_observed
+                num_samples = len(self.metrics.composite_size_samples)
+
+                y_off += 4
+                txt = font.render(f"Max composite: {max_comp_size} members", True, (160, 185, 230))
+                surface.blit(txt, (panel_x + 6, y_off))
+                y_off += 16
+
+                if num_samples > 0:
+                    recent_samples = self.metrics.composite_size_samples[-10:]  # Last 10 samples
+                    recent_max_sizes = [s[1] for s in recent_samples]
+                    avg_recent = sum(recent_max_sizes) / len(recent_max_sizes)
+                    txt = font.render(f"Recent avg max: {avg_recent:.1f}", True, (160, 185, 230))
+                    surface.blit(txt, (panel_x + 6, y_off))
+                    y_off += 16
 
         # ── Params panel ──────────────────────────────────────────────────────
         if self._show_params:

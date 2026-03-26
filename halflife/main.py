@@ -94,10 +94,11 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
     state   = initialize_world(config, seed=seed)
     params  = initialize_interaction_params(config, seed=seed + 1)
     physics = initialize_physics_params(config)
-    renderer = Renderer(config)
 
     # Initialize profiler if enabled
     metrics = ProfileMetrics() if config.enable_profiling else None
+
+    renderer = Renderer(config, metrics=metrics)
 
     # JIT-compile via make_run_n_steps (first call triggers compilation)
     print("JIT-compiling simulation step... (this takes ~10-30 seconds first time)")
