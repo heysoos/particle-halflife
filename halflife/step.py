@@ -149,7 +149,7 @@ def compute_composite_size_stats(composites, config: SimConfig) -> tuple:
 # ── Main Simulation Step ──────────────────────────────────────────────────────
 
 def simulation_step(state: WorldState, params: InteractionParams,
-                    config: SimConfig, physics: PhysicsParams, metrics: "ProfileMetrics" = None) -> WorldState:
+                    config: SimConfig, physics: PhysicsParams) -> WorldState:
     """
     Advance WorldState by one timestep (dt).
 
@@ -222,16 +222,6 @@ def simulation_step(state: WorldState, params: InteractionParams,
         total_energy=current_energy,
         step_count=state.step_count + 1,
     )
-
-    # Record metrics if profiling enabled
-    if metrics is not None and config.enable_profiling:
-        max_size, mean_size, histogram = compute_composite_size_stats(final_state.composites, config)
-        metrics.record_composite_sizes(
-            step=final_state.step_count,
-            max_size=max_size,
-            mean_size=mean_size,
-            distribution=histogram,
-        )
 
     return final_state
 

@@ -239,6 +239,17 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
         if not paused:
             pending_state = next_pending
 
+        # Record metrics if profiling enabled (Python level, outside JIT)
+        if metrics is not None and config.enable_profiling:
+            from halflife.step import compute_composite_size_stats
+            max_size, mean_size, histogram = compute_composite_size_stats(pending_state.composites, config)
+            metrics.record_composite_sizes(
+                step=int(np.asarray(pending_state.step_count)),
+                max_size=max_size,
+                mean_size=mean_size,
+                distribution=histogram,
+            )
+
         # ── Timing ────────────────────────────────────────────────────────────
         clock.tick(config.fps_target)
         frame_count += 1
@@ -255,7 +266,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
     # Print profiling summary if enabled
     if metrics is not None:
         print(f"\n=== Phase 1 Profiling Summary ===")
-        print(f"Total steps: {state.step_count}")
+        print(f"Total steps: {int(np.asarray(pending_state.step_count))}")
         print(f"Max composite size observed: {metrics.max_composite_size_observed}")
         print(f"Total composite size samples collected: {len(metrics.composite_size_samples)}")
         print(f"C+C fusion count (note: approximated): {metrics.cc_fusion_count}")
