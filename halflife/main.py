@@ -43,6 +43,7 @@ from halflife.config import SimConfig
 from halflife.state import initialize_world, initialize_interaction_params, initialize_physics_params
 from halflife.step import make_run_n_steps
 from halflife.renderer import Renderer
+from halflife.profiler import ProfileMetrics
 
 
 def parse_args():
@@ -53,6 +54,11 @@ def parse_args():
     p.add_argument('--width',     type=float, default=None,   help='World width')
     p.add_argument('--height',    type=float, default=None,   help='World height')
     p.add_argument('--no-chemistry', action='store_true',     help='Disable fusion and decay (physics only)')
+    p.add_argument(
+        "--enable-profiling",
+        action="store_true",
+        help="Enable profiling and metrics collection during simulation"
+    )
     return p.parse_args()
 
 
@@ -64,6 +70,8 @@ def build_config(args) -> SimConfig:
     if args.particles is not None: kwargs['num_particles'] = args.particles
     if args.width     is not None: kwargs['world_width']        = args.width
     if args.height    is not None: kwargs['world_height']       = args.height
+    kwargs['enable_profiling'] = args.enable_profiling
+    kwargs['cc_fusion_event_logging'] = args.enable_profiling
     return SimConfig(**kwargs)
 
 
@@ -87,6 +95,9 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
     params  = initialize_interaction_params(config, seed=seed + 1)
     physics = initialize_physics_params(config)
     renderer = Renderer(config)
+
+    # Initialize profiler if enabled
+    metrics = ProfileMetrics() if config.enable_profiling else None
 
     # JIT-compile via make_run_n_steps (first call triggers compilation)
     print("JIT-compiling simulation step... (this takes ~10-30 seconds first time)")
@@ -239,6 +250,18 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
             if _t_update:
                 ms = lambda d: sum(d) / len(d) * 1000
                 print(f"  frame ms: sim={ms(_t_sim):.1f}  update={ms(_t_update):.1f}  render={ms(_t_render):.1f}")
+
+    # Print profiling summary if enabled
+    if metrics is not None:
+        print(f"\n=== Phase 1 Profiling Summary ===")
+        print(f"Total steps: {state.step_count}")
+        print(f"Max composite size observed: {metrics.max_composite_size_observed}")
+        print(f"Total composite size samples collected: {len(metrics.composite_size_samples)}")
+        print(f"C+C fusion count (note: approximated): {metrics.cc_fusion_count}")
+
+        if metrics.composite_size_samples:
+            sizes = [s[1] for s in metrics.composite_size_samples]  # Extract max_size from each sample
+            print(f"Max composite size trend: min={min(sizes)}, max={max(sizes)}, final={sizes[-1]}")
 
     renderer.close()
     print("Simulation ended.")
