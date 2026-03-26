@@ -232,7 +232,8 @@ def apply_composite_decay(state: WorldState, config: SimConfig) -> WorldState:
 
 def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
                    params: InteractionParams, config: SimConfig,
-                   physics: PhysicsParams) -> WorldState:
+                   physics: PhysicsParams,
+                   metrics=None) -> WorldState:
     """
     Unified entity-entity fusion: any entity (free particle or composite) can
     fuse with any neighboring entity.
@@ -373,7 +374,19 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         jnp.arange(N, dtype=jnp.int32),
         N,
     )
-    scan_indices = jnp.sort(candidate_i)[:max_fusions]
+    # NOTE: biased version (low-index particles always get priority):
+    # scan_indices = jnp.sort(candidate_i)[:max_fusions]
+    #
+    # Fair random sample — randomly selects up to max_fusions candidates with no index bias.
+    # Uses the same cumsum filter as the biased version, but over a shuffled ordering
+    # so the first max_fusions valid candidates are a random draw, not lowest-index-first.
+    perm = jax.random.permutation(subkey, N)
+    shuffled_has_partner = has_partner[perm]
+    cumsum_s = jnp.cumsum(shuffled_has_partner.astype(jnp.int32))
+    candidate_i_shuffled = jnp.where(
+        shuffled_has_partner & (cumsum_s <= max_fusions), perm, N
+    )
+    scan_indices = jnp.sort(candidate_i_shuffled)[:max_fusions]
 
     # Pre-compute free composite slots once (O(1) lookup in scan vs O(C) argmin)
     free_comp_slots = find_free_slots(composites.alive, max_fusions)  # (max_fusions,) int32
@@ -455,9 +468,9 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         j_members_free = jnp.full(M, -1, dtype=jnp.int32).at[0].set(safe_j)
         j_members = jnp.where(j_is_free, j_members_free, j_members_comp)
 
-        # Concat first half of each into a (M,) buffer
-        half = M // 2
-        merged_members = jnp.concatenate([i_members[:half], j_members[:half]])  # (M,)
+        # Concat full member lists into a (2M,) buffer; compaction below trims to M.
+        # would_overflow guarantees cnt_i + cnt_j <= M so no valid entries are lost.
+        merged_members = jnp.concatenate([i_members, j_members])  # (2M,)
 
         # Compact valid IDs to front using cumsum — O(M), no separate argsort kernel.
         # Invalid entries are routed to index M (OOB) and dropped, preventing
@@ -519,7 +532,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             )
             return pid, valid
 
-        i_pids, i_valid = jax.vmap(assign_i_member)(jnp.arange(half, dtype=jnp.int32))
+        i_pids, i_valid = jax.vmap(assign_i_member)(jnp.arange(M, dtype=jnp.int32))
         safe_i_pids = jnp.where(i_valid, i_pids, 0)
         new_composite_id = new_composite_id.at[safe_i_pids].set(
             jnp.where(i_valid, target, new_composite_id[safe_i_pids])
@@ -533,7 +546,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             )
             return pid, valid
 
-        j_pids, j_valid = jax.vmap(assign_j_member)(jnp.arange(half, dtype=jnp.int32))
+        j_pids, j_valid = jax.vmap(assign_j_member)(jnp.arange(M, dtype=jnp.int32))
         safe_j_pids = jnp.where(j_valid, j_pids, 0)
         new_composite_id = new_composite_id.at[safe_j_pids].set(
             jnp.where(j_valid, target, new_composite_id[safe_j_pids])
