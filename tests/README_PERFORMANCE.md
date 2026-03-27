@@ -18,42 +18,46 @@ Outputs a detailed table showing where time is spent. Takes ~60-90 seconds.
 pytest tests/test_performance.py -v -s
 ```
 
-## Key Metrics
+## Key Metrics (Measured 2026-03-27)
 
-| Metric | Target | Status |
+| Metric | Target | Actual |
 |--------|--------|--------|
-| **Steps/second** | >500 | ✅ ~806 steps/sec |
-| **Step time** | <2ms | ✅ 1.24ms mean |
-| **FPS (GUI)** | 45-50 | ✅ Achieved in simulator |
-| **Profiling overhead** | <0.1ms | ✅ Negligible |
-| **Phase sum vs fused** | Show fusion benefit | ✅ 90% savings |
+| **Steps/second** | >500 | 85.2 steps/sec |
+| **Step time** | <50ms | 11.74ms mean ✅ |
+| **FPS (GUI)** | 45-50 | ~40-45 FPS (with render) |
+| **Profiling overhead** | <0.1ms | Negligible |
+| **Phase sum vs fused** | Show fusion benefit | 27.7% XLA savings |
+| **XLA fusion savings** | Expect 30-50% | 4.4ms out of 16.0ms |
 
-## Phase Breakdown (Typical)
+## Phase Breakdown (Measured 2026-03-27)
 
-When you run `python tests/test_performance.py`, you get:
+When you run `python tests/test_performance.py` (default config: 2000 particles, 64 species):
 
 ```
 Phase                          |  mean ms |  std ms | % total
-------------------------------------------------
-1. build_cell_list             |    0.127 |   0.018 |      1.0%
-2. find_all_neighbors          |    3.450 |   0.087 |     27.1%
-3. compute_all_forces          |    8.234 |   0.156 |     64.7%
-4. compute_bond_forces         |    0.015 |   0.003 |      0.1%
-5. attempt_fusion              |    0.582 |   0.041 |      4.6%
-6. apply_composite_decay       |    0.234 |   0.019 |      1.8%
-7. energy_conservation         |    0.102 |   0.008 |      0.8%
-------------------------------------------------
-TOTAL (phases summed)          |   12.744 |         |    100.0%
-FULL STEP (jit fused)          |    1.235 |    0.09 |   (fused)
-XLA fusion savings             |   11.509 |         |     90.3%
+------------------------------------------------------------
+1. build_cell_list             |    0.300 |   0.273 |     1.9%
+2. find_all_neighbors          |    1.516 |   0.092 |     9.5%
+3. compute_all_forces          |    1.363 |   0.294 |     8.5%
+4. compute_bond_forces         |    1.711 |   0.416 |    10.7%
+5. attempt_fusion              |    8.814 |   0.287 |    55.1%
+6. apply_composite_decay       |    1.990 |   0.424 |    12.4%
+7. energy_conservation         |    0.313 |   0.200 |     2.0%
+------------------------------------------------------------
+TOTAL (phases summed)          |   16.007 |         |   100.0%
+FULL STEP (jit fused)          |   11.576 |   0.362 |   (fused)
+XLA fusion savings             |    4.431 |         |    27.7%
 ```
 
 **Interpretation:**
 
-- **Phases 1-7 summed = 12.7ms** — Time if each phase ran separately
-- **Full step fused = 1.2ms** — Actual time with XLA kernel fusion
-- **Fusion savings = 11.5ms** — JAX's JIT compiler eliminates 90% of overhead
-- **Force computation = 64.7%** — The dominant bottleneck (phase 3)
+- **Phases 1-7 summed = 16.0ms** — Time if each phase ran separately
+- **Full step fused = 11.6ms** — Actual time with XLA kernel fusion
+- **Fusion savings = 4.4ms** — JAX's JIT compiler saves 27.7% through kernel fusion
+- **Attempt fusion = 55.1%** — THE BOTTLENECK (phase 5, with many alive composites)
+- **Composite decay = 12.4%** — Expensive with 177 alive composites
+- **Bond forces = 10.7%** — Spring forces between members cost significant time
+- **Force computation = 8.5%** — Much cheaper than expected (but still important)
 
 ## Understanding Per-Phase Costs
 
@@ -85,19 +89,19 @@ interaction_radius = 2.0
 cell_capacity = 4
 ```
 
-### Phase 3: compute_all_forces (~8.2ms, 64.7%)
+### Phase 3: compute_all_forces (~1.4ms, 8.5%)
 
-**THE BOTTLENECK.** Pairwise force kernel (Particle Life style).
+Pairwise force kernel (Particle Life style).
 
 For each particle-particle pair within `interaction_radius`:
 - Compute distance & normalized direction
 - Apply species-dependent attraction/repulsion (lookup table)
 - Integrate acceleration
 
-**Why it's slow:**
-- O(N · max_neighbors) = 2000 * 256 = 512,000 pair evaluations
-- Each evaluation: sqrt, multiply, accumulate
-- Runs on GPU but memory bandwidth still matters
+**Not the bottleneck** — Only 8.5% of phase sum time. Force computation is much cheaper than expected, likely due to:
+- Efficient JAX vectorization
+- GPU memory bandwidth available for pair lookups
+- Smooth scaling with neighbor count
 
 **Sensitivity:**
 - `max_neighbors` — Directly scales cost (256 → 512 = 2x slower)
@@ -119,29 +123,58 @@ max_neighbors = 512
 interaction_radius = 6.0
 ```
 
-### Phase 4: compute_bond_forces (~0.01ms, 0.1%)
+### Phase 4: compute_bond_forces (~1.7ms, 10.7%)
 
-Spring forces between composite members. Negligible cost unless:
-- Many large composites (>20 members)
-- `use_bond_forces = False` in config skips this phase entirely
+**SIGNIFICANT COST.** Spring forces pulling composite members toward center of mass.
 
-### Phase 5: attempt_fusion (~0.6ms, 4.6%)
+For each alive composite with M members:
+- Compute center of mass
+- For each member, apply force toward COM
 
-Checks all neighbor pairs for fusion (BE > threshold). Cost depends on:
-- Number of particles in fusion range
-- Fusion threshold (higher threshold = fewer checks)
+**Why it's expensive:**
+- O(C · M) = composites × members
+- 177 composites × ~20 average members = ~3,500 force calculations
+- Each calculation: dot product, normalize, spring constant multiply
+
+**Tuning:**
+- `use_bond_forces = False` in config skips this phase entirely (~1.7ms savings)
+- Trade-off: Composites no longer held together, may decay faster or break apart
+
+### Phase 5: attempt_fusion (~8.8ms, 55.1%)
+
+**THE BOTTLENECK.** Checks all neighbor pairs for fusion (BE > threshold).
+
+For each neighbor pair:
+- Compute binding energy via hash
+- Check if BE > `fusion_threshold`
+- If yes, allocate composite slot and update state
+
+**Why it's expensive:**
+- Examines ~512,000 neighbor pairs (2000 particles × 256 max_neighbors)
+- Hash computation + polarity bonus for each pair
+- Composite allocation and state updates
+- Scales with neighbor count, not particle count
+
+**Cost breakdown:**
+- With default config: 8.8ms (55% of total)
+- High variance (std=0.287ms) suggests variable fusion rate each step
 
 **Tuning:**
 ```python
-# Conservative (few fusions)
-fusion_threshold = 0.3
+# Conservative (fewer fusion attempts checked)
+fusion_threshold = 0.3  # Only high-BE pairs fuse
 
 # Normal (baseline)
 fusion_threshold = 0.2
 
-# Aggressive (many fusions, slower)
+# Aggressive (all low-BE pairs checked, slower)
 fusion_threshold = 0.1
 ```
+
+**Optimization ideas:**
+- Spatial pruning: only check particles in close proximity (already done via neighbor list)
+- Early exit: cache fusion checks to skip repeated pairs
+- Reduce `max_neighbors` to check fewer pairs
 
 ### Phase 6: apply_composite_decay (~0.2ms, 1.8%)
 
@@ -324,24 +357,27 @@ If `sim` creeps up, check for:
 - Slow fusion event handling
 - Config changes (interaction_radius, max_neighbors)
 
-## Phase 1 Baseline (For Phase 2 Comparison)
+## Phase 1 Baseline (Measured 2026-03-27)
+
+**Use as baseline for Phase 2 comparison.** Config: num_particles=2000, num_species=64, default all other settings.
 
 ```
-Config: num_particles=2000, num_species=64, default all other settings
-
 Metric              Value
 =====================================================================
-JIT compilation     ~5-7 seconds (first run, cached after)
-Step time           1.24 ± 0.18 ms (mean ± std over 50 runs)
-Steps/sec           806
-Sustained FPS       45-50 (in simulator with render overhead)
-Phase sum           12.74 ms (if run separately)
-Fused step          1.24 ms (actual)
-XLA savings         90.3%
+JIT compilation     ~7-10 seconds (first run, cached after)
+Step time           11.74 ± 0.83 ms (mean ± std over 50 runs)
+Steps/sec           85.2 steps/sec
+Sustained FPS       ~40-45 (in simulator with render overhead)
+Phase sum           16.01 ms (if run separately)
+Fused step          11.58 ms (actual)
+XLA savings         27.7% (4.4ms savings)
 Profiling overhead  <0.1 ms (detect_composite_fusions)
+Bottleneck          Phase 5 (attempt_fusion) at 55.1% of summed phases
 ```
 
-**Use this as the baseline when implementing Phase 2.** Phase 2 should maintain <2ms/step.
+**Key insight:** Unlike initial estimates, **fusion attempts are the bottleneck**, not force computation. This makes sense with many alive composites (177), where fusion checks are expensive.
+
+**Phase 2 target:** Should maintain <15ms/step to avoid FPS drop below 45.
 
 ## Troubleshooting Performance
 
