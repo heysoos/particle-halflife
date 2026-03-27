@@ -107,6 +107,112 @@ class ProfileMetrics:
         )
 
 
+# ── C+C Fusion Detection ───────────────────────────────────────────────────────
+
+def detect_composite_fusions(old_state, new_state, step: int, metrics: ProfileMetrics) -> None:
+    """
+    Detect composite-composite fusions by comparing state before and after a step.
+
+    Algorithm:
+    1. Build maps of old and new composites by ID
+    2. Find which composites disappeared (marked dead)
+    3. For each new composite that's larger than expected, check if it's a fusion
+    4. Infer fusion events from size jumps and count decreases
+    5. Record CCFusionEvent to metrics
+
+    **Performance note:** Converts JAX arrays to numpy ONCE at function entry,
+    not per-element, to avoid repeated GPU→CPU synchronizations.
+
+    Args:
+        old_state: WorldState before step
+        new_state: WorldState after step
+        step: current step number
+        metrics: ProfileMetrics to record events to
+    """
+    old_composites = old_state.composites
+    new_composites = new_state.composites
+
+    # Convert JAX arrays to numpy once (avoid repeated GPU→CPU transfers in loop)
+    old_alive_np = np.asarray(old_composites.alive)
+    old_count_np = np.asarray(old_composites.member_count)
+    old_be_np = np.asarray(old_composites.binding_energy)
+
+    new_alive_np = np.asarray(new_composites.alive)
+    new_count_np = np.asarray(new_composites.member_count)
+    new_be_np = np.asarray(new_composites.binding_energy)
+
+    # Build maps: composite_id -> (member_count, alive, binding_energy)
+    old_map = {}
+    new_map = {}
+
+    for c_id in range(len(old_alive_np)):
+        if old_alive_np[c_id]:
+            old_map[c_id] = {
+                'count': int(old_count_np[c_id]),
+                'be': float(old_be_np[c_id]),
+            }
+
+    for c_id in range(len(new_alive_np)):
+        if new_alive_np[c_id]:
+            new_map[c_id] = {
+                'count': int(new_count_np[c_id]),
+                'be': float(new_be_np[c_id]),
+            }
+
+    # Find composites that grew (potential absorptions or fusions)
+    for c_id in new_map:
+        if c_id in old_map:
+            old_count = old_map[c_id]['count']
+            new_count = new_map[c_id]['count']
+
+            # Significant growth suggests fusion or multiple absorptions
+            growth = new_count - old_count
+            if growth >= 2:  # At least 2 new members = likely a fusion
+                old_be = old_map[c_id]['be']
+                new_be = new_map[c_id]['be']
+
+                # Record as fusion (estimate the partner)
+                metrics.record_cc_fusion(CCFusionEvent(
+                    step=step,
+                    composite_a_id=c_id,
+                    composite_b_id=-1,  # Unknown partner (fused composite died)
+                    a_members=old_count,
+                    b_members=growth,  # Estimate: absorbed this many
+                    a_be=old_be,
+                    b_be=new_be,  # Approximate
+                    merged_be=new_be,
+                    merged_members=new_count,
+                ))
+
+    # Detect complete mergers: old composites that disappeared, new ones that grew
+    old_disappeared = set(old_map.keys()) - set(new_map.keys())
+
+    if old_disappeared:
+        # Look for new composites with sizes matching sum of disappeared
+        for c_id in new_map:
+            if c_id not in old_map:
+                new_count = new_map[c_id]['count']
+
+                # Check if this composite's size matches a fusion of disappeared ones
+                for disappeared_id in old_disappeared:
+                    disappeared_count = old_map[disappeared_id]['count']
+                    disappeared_be = old_map[disappeared_id]['be']
+
+                    # If new composite is approximately same size, likely a merger
+                    if abs(new_count - disappeared_count) <= 1:
+                        metrics.record_cc_fusion(CCFusionEvent(
+                            step=step,
+                            composite_a_id=c_id,
+                            composite_b_id=disappeared_id,
+                            a_members=new_count - disappeared_count,  # Estimate
+                            b_members=disappeared_count,
+                            a_be=new_map[c_id]['be'],
+                            b_be=disappeared_be,
+                            merged_be=new_map[c_id]['be'],
+                            merged_members=new_count,
+                        ))
+
+
 # ── Timing Utility ────────────────────────────────────────────────────────────
 
 def _time_fn(fn, n_warmup=3, n_bench=50, n_runs=1):

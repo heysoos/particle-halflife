@@ -128,6 +128,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
 
     # Async pipeline: pre-dispatch first batch so GPU starts immediately
     pending_state = state
+    state_before_step = state  # Track for fusion detection
     if not paused:
         pending_state = run_n(pending_state, params, physics, steps_per_frame)
 
@@ -242,13 +243,24 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
         # Record metrics if profiling enabled (Python level, outside JIT)
         if metrics is not None and config.enable_profiling:
             from halflife.step import compute_composite_size_stats
+            from halflife.profiler import detect_composite_fusions
+
+            step_num = int(np.asarray(pending_state.step_count))
+
+            # C+C fusion detection (compare state before and after this step)
+            detect_composite_fusions(state_before_step, pending_state, step_num, metrics)
+
+            # Size metrics
             max_size, mean_size, histogram = compute_composite_size_stats(pending_state.composites, config)
             metrics.record_composite_sizes(
-                step=int(np.asarray(pending_state.step_count)),
+                step=step_num,
                 max_size=max_size,
                 mean_size=mean_size,
                 distribution=histogram,
             )
+
+            # Update state_before_step for next iteration's fusion detection
+            state_before_step = pending_state
 
         # ── Timing ────────────────────────────────────────────────────────────
         clock.tick(config.fps_target)
