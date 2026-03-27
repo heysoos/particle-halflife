@@ -42,6 +42,16 @@ TOTAL (phases summed)          |   16.007 |         |   100.0%
 FULL STEP (jit fused)          |   11.576 |   0.362 |   (fused)
 ```
 
+**Interpretation:**
+
+- **Phases 1-7 summed = 16.0ms** — Time if each phase ran separately
+- **Full step fused = 11.6ms** — Actual time with XLA kernel fusion
+- **Fusion savings = 4.4ms** — JAX's JIT compiler saves 27.7% through kernel fusion
+- **Attempt fusion = 55.1%** — THE BOTTLENECK (phase 5, with many alive composites)
+- **Composite decay = 12.4%** — Expensive with 177 alive composites
+- **Bond forces = 10.7%** — Spring forces between members cost significant time
+- **Force computation = 8.5%** — Much cheaper than expected (but still important)
+
 ## Understanding Per-Phase Costs
 
 ### Phase 1: build_cell_list (0.3 ms, 1.9%)
@@ -72,15 +82,34 @@ Pairwise force kernel (Particle Life style). For each particle-neighbor pair:
 - Apply species-dependent attraction/repulsion
 - Accumulate acceleration
 
-**Much cheaper than expected** due to GPU vectorization.
+**Sensitivity:**
+- `max_neighbors` — Directly scales cost (256 → 512 = 2x slower)
+- `interaction_radius` — Affects neighbor count
+- `num_particles` — O(N · neighbors) scaling
 
----
+**Tuning:**
+```python
+# Current (balanced)
+max_neighbors = 256
+interaction_radius = 4.0
 
-### Phase 4: compute_bond_forces (1.7 ms, 10.7%)
+# Faster (sparse interactions)
+max_neighbors = 128
+interaction_radius = 2.5
+```
 
-Spring forces pulling composite members toward center of mass.
+### Phase 4: compute_bond_forces (~1.7ms, 10.7%)
 
-**Why expensive:** O(C × M) = composites × members. With 177 composites and ~20 avg members = ~3500 force calculations per step.
+**SIGNIFICANT COST.** Spring forces pulling composite members toward center of mass.
+
+For each alive composite with M members:
+- Compute center of mass
+- For each member, apply force toward COM
+
+**Why it's expensive:**
+- O(C · M) = composites × members
+- 177 composites × ~20 average members = ~3,500 force calculations
+- Each calculation: dot product, normalize, spring constant multiply
 
 **Tuning:**
 - Disable completely: set `use_bond_forces = False` in config (~1.7ms savings)
@@ -95,18 +124,28 @@ Spring forces pulling composite members toward center of mass.
 - Check if BE > `fusion_threshold`
 - If yes, allocate composite slot
 
-**Why expensive:** Examines ~512,000 neighbor pairs (2000 particles × 256 max_neighbors). Hash computation + state updates are the main cost.
+**Why it's expensive:**
+- Examines ~512,000 neighbor pairs (2000 particles × 256 max_neighbors)
+- Hash computation + polarity bonus for each pair
+- Composite allocation and state updates
+- Scales with neighbor count, not particle count
+
+**Cost breakdown:**
+- With default config: 8.8ms (55% of total)
+- High variance (std=0.287ms) suggests variable fusion rate each step
 
 **Tuning:**
 - `max_neighbors` — Reduce from 256 → 128 cuts neighbor pairs by half (~4ms savings)
 - `fusion_threshold` — Higher threshold (0.3) checks fewer pairs than lower (0.1)
 - `interaction_radius` — Smaller radius reduces neighbor count
 
+**Optimization ideas:**
+- Spatial pruning: only check particles in close proximity (already done via neighbor list)
+- Early exit: cache fusion checks to skip repeated pairs
+- Reduce `max_neighbors` to check fewer pairs
 ---
 
 ### Phase 6: apply_composite_decay (2.0 ms, 12.4%)
-
-Probabilistic decay of composites. For each alive composite, roll dice on whether it decays.
 
 **Sensitivity:** Linear with number of alive composites (currently 177).
 
