@@ -7,7 +7,10 @@ Measure where simulation time is spent to identify bottlenecks and track regress
 ```bash
 python tests/test_performance.py
 ```
-
+or
+```bash
+pytest tests/test_performance.py -v -s 
+```
 Outputs detailed phase breakdown. Takes ~90 seconds.
 
 ## Key Metrics (Measured 2026-03-27)
@@ -42,26 +45,76 @@ FULL STEP (jit fused)          |   11.576 |   0.362 |   (fused)
 ## Understanding Per-Phase Costs
 
 ### Phase 1: build_cell_list (0.3 ms, 1.9%)
-Organizes particles into spatial grid. Very fast, not a bottleneck.
+
+Organizes particles into spatial grid cells. Very fast, not a bottleneck.
+
+**Sensitivity:** Linear with particle count. Not tunable.
+
+---
 
 ### Phase 2: find_all_neighbors (1.5 ms, 9.5%)
-Queries neighbors within `interaction_radius`. Cost scales with neighbor count.
+
+Queries which particles are within `interaction_radius` of each particle.
+
+**Sensitivity:**
+- `interaction_radius` — Larger radius = more neighbors = more expensive
+- `cell_capacity` — Should be ~4x expected density to avoid overflow
+- `num_particles` — Scales O(N · max_neighbors)
+
+**Tuning:** Reducing `interaction_radius` from 4.0 → 2.5 reduces neighbor count significantly.
+
+---
 
 ### Phase 3: compute_all_forces (1.4 ms, 8.5%)
-Pairwise force kernel. Much cheaper than expected due to GPU vectorization.
+
+Pairwise force kernel (Particle Life style). For each particle-neighbor pair:
+- Compute distance and direction
+- Apply species-dependent attraction/repulsion
+- Accumulate acceleration
+
+**Much cheaper than expected** due to GPU vectorization.
+
+---
 
 ### Phase 4: compute_bond_forces (1.7 ms, 10.7%)
-Spring forces keeping composite members together. Significant with many composites.
-- Can be disabled: set `use_bond_forces = False` in config (~1.7ms savings)
+
+Spring forces pulling composite members toward center of mass.
+
+**Why expensive:** O(C × M) = composites × members. With 177 composites and ~20 avg members = ~3500 force calculations per step.
+
+**Tuning:**
+- Disable completely: set `use_bond_forces = False` in config (~1.7ms savings)
+- Trade-off: Composites no longer held together physically
+
+---
 
 ### Phase 5: attempt_fusion (8.8 ms, 55.1%)
-**THE BOTTLENECK.** Checks all neighbor pairs for fusion. Scales with `max_neighbors`.
+
+**THE BOTTLENECK.** Checks all neighbor pairs for potential fusion:
+- Compute binding energy via hash
+- Check if BE > `fusion_threshold`
+- If yes, allocate composite slot
+
+**Why expensive:** Examines ~512,000 neighbor pairs (2000 particles × 256 max_neighbors). Hash computation + state updates are the main cost.
+
+**Tuning:**
+- `max_neighbors` — Reduce from 256 → 128 cuts neighbor pairs by half (~4ms savings)
+- `fusion_threshold` — Higher threshold (0.3) checks fewer pairs than lower (0.1)
+- `interaction_radius` — Smaller radius reduces neighbor count
+
+---
 
 ### Phase 6: apply_composite_decay (2.0 ms, 12.4%)
-Probabilistic decay of composites. Expensive with many alive composites.
+
+Probabilistic decay of composites. For each alive composite, roll dice on whether it decays.
+
+**Sensitivity:** Linear with number of alive composites (currently 177).
+
+---
 
 ### Phase 7: energy_conservation (0.3 ms, 2.0%)
-Global energy accounting. Constant time, negligible cost.
+
+Global energy accounting. Negligible cost.
 
 ## Performance Targets
 
