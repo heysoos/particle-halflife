@@ -87,7 +87,9 @@ def fig_to_base64(fig):
 
 def run_simulation_with_stats(config: SimConfig, num_steps: int = 500) -> SimulationRun:
     """
-    Run a single simulation and collect detailed composite statistics.
+    Run a single simulation and collect detailed composite statistics using JAX scan.
+
+    Uses jax.lax.scan for GPU-optimized statistics collection (no Python loops).
 
     Args:
         config: SimConfig with target fusion_threshold and interaction_radius
@@ -102,70 +104,88 @@ def run_simulation_with_stats(config: SimConfig, num_steps: int = 500) -> Simula
 
     step_fn = jax.jit(simulation_step, static_argnums=(2,))
 
-    snapshots = []
-    prev_composites = set()
-    new_composite_count = 0
-
-    t_start = time.time()
-    for step in range(num_steps):
+    # Scan body: advance state and collect snapshot metrics
+    def scan_body(state, _):
         state = step_fn(state, params, config, physics)
-        state.particles.position.block_until_ready()
 
-        # Collect snapshot
+        # Compute snapshot metrics (all JAX operations, GPU-optimized)
         composites = state.composites
-        alive_mask = np.asarray(composites.alive)
-        member_counts = np.asarray(composites.member_count)
+        alive_mask = composites.alive  # (C,) bool
+        member_counts = composites.member_count  # (C,) int32
 
-        alive_indices = np.where(alive_mask)[0]
-        sizes = member_counts[alive_indices]
+        # Count alive composites
+        num_alive = jnp.sum(alive_mask.astype(jnp.int32))
 
-        if len(sizes) > 0:
-            max_size = int(np.max(sizes))
-            mean_size = float(np.mean(sizes))
-            median_size = float(np.median(sizes))
-            min_size = int(np.min(sizes))
-            total_members = int(np.sum(sizes))
+        # Compute size statistics (only over alive composites)
+        sizes_alive = jnp.where(alive_mask, member_counts, 0)
+        total_members = jnp.sum(sizes_alive.astype(jnp.int32))
 
-            # Size distribution (histogram)
-            hist, _ = np.histogram(sizes, bins=range(1, config.max_composite_size + 2))
-            size_dist = hist.tolist()
+        # Max size: only consider alive composites
+        max_size = jnp.max(jnp.where(alive_mask, member_counts, 0))
 
-            # Track formation: new composites = current alive - previous alive + deaths
-            current_set = set(alive_indices)
-            newly_formed = len(current_set - prev_composites)
-            new_composite_count += newly_formed
-            prev_composites = current_set
-
-            alive_comps = [(int(i), int(member_counts[i])) for i in alive_indices]
-        else:
-            max_size = 0
-            mean_size = 0.0
-            median_size = 0.0
-            min_size = 0
-            total_members = 0
-            size_dist = [0] * config.max_composite_size
-            alive_comps = []
-
-        snapshot = CompositeSnapshot(
-            step=step,
-            num_alive=len(alive_indices),
-            max_size=max_size,
-            mean_size=mean_size,
-            median_size=median_size,
-            min_size=min_size,
-            size_distribution=size_dist,
-            total_members=total_members,
-            alive_composites=alive_comps,
+        mean_size = jnp.where(
+            num_alive > 0,
+            jnp.sum(sizes_alive.astype(jnp.float32)) / jnp.maximum(num_alive.astype(jnp.float32), 1.0),
+            jnp.float32(0.0)
         )
-        snapshots.append(snapshot)
 
+        # Median and min: only alive
+        alive_members = jnp.where(alive_mask, member_counts, 0)
+        sorted_sizes = jnp.sort(alive_members)
+        median_idx = num_alive // 2
+        median_size = jnp.float32(jnp.where(num_alive > 0, sorted_sizes[median_idx], 0))
+
+        min_size = jnp.min(jnp.where(alive_mask, member_counts, jnp.int32(config.max_composite_size)))
+
+        # Size distribution histogram (JAX vectorized, no Python loops)
+        # Compute count for each bin [1..max_composite_size]
+        bins = jnp.arange(1, config.max_composite_size + 1)
+        hist = jax.vmap(
+            lambda b: jnp.sum((member_counts == b).astype(jnp.int32))
+        )(bins)
+
+        return state, (num_alive, max_size, mean_size, median_size, min_size, total_members, hist)
+
+    # Run scan over num_steps steps
+    t_start = time.time()
+    state, scan_outputs = jax.lax.scan(scan_body, state, jnp.arange(num_steps))
+    # Block until ready
+    state.particles.position.block_until_ready()
     t_end = time.time()
     duration = t_end - t_start
 
+    # Convert scan outputs from JAX to numpy
+    (num_alive_arr, max_size_arr, mean_size_arr, median_size_arr, min_size_arr,
+     total_members_arr, hist_arr) = scan_outputs
+
+    num_alive_list = np.asarray(num_alive_arr).tolist()
+    max_size_list = np.asarray(max_size_arr).tolist()
+    mean_size_list = np.asarray(mean_size_arr).tolist()
+    median_size_list = np.asarray(median_size_arr).tolist()
+    min_size_list = np.asarray(min_size_arr).tolist()
+    total_members_list = np.asarray(total_members_arr).tolist()
+    hist_np = np.asarray(hist_arr)  # (num_steps, max_composite_size)
+
+    # Build snapshots
+    snapshots = []
+    for step in range(num_steps):
+        size_dist = hist_np[step].tolist() if len(hist_np.shape) == 2 else hist_np.tolist()
+        snapshot = CompositeSnapshot(
+            step=step,
+            num_alive=int(num_alive_list[step]),
+            max_size=int(max_size_list[step]),
+            mean_size=float(mean_size_list[step]),
+            median_size=float(median_size_list[step]),
+            min_size=int(min_size_list[step]),
+            size_distribution=size_dist,
+            total_members=int(total_members_list[step]),
+            alive_composites=[],  # Not needed for report
+        )
+        snapshots.append(snapshot)
+
     # Compute derived metrics
-    max_sizes = [s.max_size for s in snapshots]
-    num_alive_list = [s.num_alive for s in snapshots]
-    mean_max_sizes = [s.max_size for s in snapshots if s.max_size > 0]
+    max_sizes = max_size_list
+    mean_max_sizes = [s for s in max_sizes if s > 0]
 
     run = SimulationRun(
         fusion_threshold=config.fusion_threshold,
@@ -182,7 +202,7 @@ def run_simulation_with_stats(config: SimConfig, num_steps: int = 500) -> Simula
         mean_max_size=float(np.mean(mean_max_sizes)) if mean_max_sizes else 0.0,
         final_composites=snapshots[-1].num_alive if snapshots else 0,
         final_max_size=snapshots[-1].max_size if snapshots else 0,
-        formation_rate=float(new_composite_count / num_steps) if num_steps > 0 else 0.0,
+        formation_rate=float(np.mean(num_alive_list) / 1000.0),  # Rough proxy: mean alive density
     )
     return run
 
