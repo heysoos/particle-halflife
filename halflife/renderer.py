@@ -584,9 +584,12 @@ class Renderer:
                 valid = (ii[None, :] < cnt[:, None]) & (jj[None, :] < cnt[:, None])
                 mem_a = mb[:, ii].ravel()
                 mem_b = mb[:, jj].ravel()
+                # per-pair member-count of owning composite (broadcast cnt across pairs)
+                cnt_per_pair = np.broadcast_to(cnt[:, None], (len(C_idx), len(ii))).ravel()
                 valid = valid.ravel() & (mem_a >= 0) & (mem_b >= 0)
                 mem_a = mem_a[valid]
                 mem_b = mem_b[valid]
+                cnt_per_pair = cnt_per_pair[valid]
 
                 if len(mem_a) > 0:
                     pos_a = pos[mem_a]
@@ -596,13 +599,20 @@ class Renderer:
                         dx[:, 1] -= config.world_height * np.round(dx[:, 1] / config.world_height)
                     pos_b = pos_a + dx
 
+                    # Alpha falls off with composite size (sqrt) so cliquey large
+                    # composites — n*(n-1)/2 bonds — don't dominate the view.
+                    # Dimers (n=2) keep the historic 0.5; n=16 ≈ 0.18.
+                    n_eff = np.maximum(cnt_per_pair.astype(np.float32), 2.0)
+                    alpha = 0.5 * np.sqrt(2.0 / n_eff)
+
                     n_pairs = len(mem_a)
                     bond_verts = np.empty((n_pairs * 2, 6), dtype=np.float32)
                     bond_verts[0::2, :2] = pos_a
                     bond_verts[1::2, :2] = pos_b
                     bond_verts[0::2, 2:5] = self.species_colors[species[mem_a]]
                     bond_verts[1::2, 2:5] = self.species_colors[species[mem_b]]
-                    bond_verts[:, 5] = 0.5
+                    bond_verts[0::2, 5] = alpha
+                    bond_verts[1::2, 5] = alpha
                     n_bytes = min(bond_verts.nbytes, self._bond_buf_size)
                     self.bond_vbo.write(bond_verts.tobytes()[:n_bytes])
                     self._n_bond_vertices = n_bytes // (self._bond_vertex_size * 4)
@@ -892,9 +902,13 @@ class Renderer:
             chart_h = 64
             chart_x = panel_x + 8
             chart_y = y_off
-            n_bins   = min(len(self._stats_hist) - 1, 40)
+            # Scale x-axis to the largest live composite so the chart auto-fits
+            # the population instead of always reserving room for sizes up to 40.
+            nonzero = np.flatnonzero(self._stats_hist[1:]) + 1 if len(self._stats_hist) > 1 else np.array([], dtype=np.int32)
+            n_bins   = int(nonzero.max()) if len(nonzero) > 0 else 2
+            n_bins   = max(2, min(n_bins, len(self._stats_hist) - 1))
             bar_w    = max(1, (chart_w - n_bins) // max(1, n_bins))
-            max_count = max(1, int(np.max(self._stats_hist[1:n_bins + 2]))
+            max_count = max(1, int(np.max(self._stats_hist[1:n_bins + 1]))
                             if len(self._stats_hist) > 1 else 1)
 
             for sz_idx in range(1, n_bins + 1):
