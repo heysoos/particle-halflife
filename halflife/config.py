@@ -60,8 +60,9 @@ class SimConfig:
     half_life_min: float = 100.0       # shortest composite half-life (sim time units)
     half_life_max: float = 500.0      # longest composite half-life
 
-    # Composites get a half-life derived from their species hash; this scales it
-    composite_half_life_scale: float = 5.0  # composites halflife scaling
+    # ── REMOVED 2026-05-05: only read by the now-dead _hash_to_half_life ──
+    # composite_half_life_scale: float = 5.0
+    # Kept commented for revival reference; safe to delete in a follow-up.
 
     # ── Energy ───────────────────────────────────────────────────────────────
     # Kinetic energy scale at initialization (controls initial temperature)
@@ -80,8 +81,11 @@ class SimConfig:
     hash_prime_a: int = 1_000_003     # multiplier prime
     hash_prime_b: int = 7             # offset
 
-    # Max products from a single decay event (padded to this length)
-    max_decay_products: int = 3
+    # ── REMOVED 2026-05-05: only read by the now-dead _hash_to_decay_products
+    # No transmutation in current design — fission releases existing members
+    # with their original species, so there's no "products" array to size.
+    # max_decay_products: int = 3
+    # Kept commented for revival reference; safe to delete in a follow-up.
 
     # ── Polarity Chemistry ────────────────────────────────────────────────────
     # Each species has a signed polarity charge p[s] ∈ [-1, 1].

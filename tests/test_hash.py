@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from halflife.config import SimConfig
-from halflife.chemistry import _entity_hash_val, _hash_to_binding_energy, _hash_to_half_life
+from halflife.chemistry import _entity_hash_val, _hash_to_binding_energy
 
 _config = SimConfig()
 
@@ -131,40 +131,46 @@ def test_merged_hash_distribution():
     )
 
 
-def test_half_life_distribution():
-    """
-    _hash_to_half_life over 100 random hashes should span most of
-    [half_life_min, half_life_max] * composite_half_life_scale.
-    """
-    config = _config
-    rng = np.random.default_rng(7)
-    raw_hashes = rng.integers(0, config.hash_modulus, size=100, dtype=np.int64)
-
-    hls = np.array([
-        float(_hash_to_half_life(jnp.uint32(int(h)), config))
-        for h in raw_hashes
-    ])
-
-    expected_min = config.half_life_min * config.composite_half_life_scale
-    expected_max = config.half_life_max * config.composite_half_life_scale
-
-    print(f"\nHalf-life distribution over 100 random hashes:")
-    print(f"  min={hls.min():.1f}  max={hls.max():.1f}  "
-          f"expected range=[{expected_min:.1f}, {expected_max:.1f}]")
-
-    # Should cover at least 50% of the range
-    observed_range = hls.max() - hls.min()
-    expected_range = expected_max - expected_min
-    assert observed_range > 0.5 * expected_range, (
-        f"Half-life range {observed_range:.1f} < 50% of expected {expected_range:.1f}. "
-        f"Distribution collapsed."
-    )
-    assert hls.min() >= expected_min * 0.95, (
-        f"Min half-life {hls.min():.1f} below expected min {expected_min:.1f}"
-    )
-    assert hls.max() <= expected_max * 1.05, (
-        f"Max half-life {hls.max():.1f} above expected max {expected_max:.1f}"
-    )
+# ── REMOVED 2026-05-05: covered dead code (_hash_to_half_life) ─────────────
+# Composite half-life is now derived from binding energy in fusion_scan_body,
+# not directly from the species hash. Test_composite_half_life_valid in
+# test_chemistry.py exercises the live BE-driven path. Kept commented for
+# revival reference; safe to delete in a follow-up.
+#
+# def test_half_life_distribution():
+#     """
+#     _hash_to_half_life over 100 random hashes should span most of
+#     [half_life_min, half_life_max] * composite_half_life_scale.
+#     """
+#     config = _config
+#     rng = np.random.default_rng(7)
+#     raw_hashes = rng.integers(0, config.hash_modulus, size=100, dtype=np.int64)
+#
+#     hls = np.array([
+#         float(_hash_to_half_life(jnp.uint32(int(h)), config))
+#         for h in raw_hashes
+#     ])
+#
+#     expected_min = config.half_life_min * config.composite_half_life_scale
+#     expected_max = config.half_life_max * config.composite_half_life_scale
+#
+#     print(f"\nHalf-life distribution over 100 random hashes:")
+#     print(f"  min={hls.min():.1f}  max={hls.max():.1f}  "
+#           f"expected range=[{expected_min:.1f}, {expected_max:.1f}]")
+#
+#     # Should cover at least 50% of the range
+#     observed_range = hls.max() - hls.min()
+#     expected_range = expected_max - expected_min
+#     assert observed_range > 0.5 * expected_range, (
+#         f"Half-life range {observed_range:.1f} < 50% of expected {expected_range:.1f}. "
+#         f"Distribution collapsed."
+#     )
+#     assert hls.min() >= expected_min * 0.95, (
+#         f"Min half-life {hls.min():.1f} below expected min {expected_min:.1f}"
+#     )
+#     assert hls.max() <= expected_max * 1.05, (
+#         f"Max half-life {hls.max():.1f} above expected max {expected_max:.1f}"
+#     )
 
 
 def test_hash_commutative():

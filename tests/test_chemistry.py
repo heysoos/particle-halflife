@@ -131,7 +131,7 @@ def test_composite_half_life_valid():
         return  # Can't test if no composites exist (hash bug prevents fusion)
 
     max_expected_hl = (
-        _config.half_life_max * _config.composite_half_life_scale
+        _config.half_life_max
         * (1 + _config.polarity_stability_scale)  # polarity bonus
         * 2.0  # generous margin
     )
@@ -157,7 +157,6 @@ def test_decay_occurs():
     config = SimConfig(
         half_life_min=10.0,
         half_life_max=30.0,
-        composite_half_life_scale=1.0,
         num_particles=500,
     )
     state = initialize_world(config, seed=2)

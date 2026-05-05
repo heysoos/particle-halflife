@@ -141,7 +141,7 @@ def test_energy_bounded():
     )
     assert ratio > 0.05, (
         f"Energy collapsed to {ratio*100:.1f}% of initial. "
-        f"Particles may all be dead or velocities zeroed out."
+        f"Velocities have been damped to zero."
     )
 
 
