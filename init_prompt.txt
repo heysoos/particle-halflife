@@ -1,0 +1,28 @@
+I want to create a highly optimized particle simulator called "Half-life", which will be built around the notion that everything decays and has a half-life. I want the simulator to model the fusion and separation of sets of particles, as well as the energetic costs required to create, or are released, by its creation/annihilation. 
+
+Using the jax library, create highly optimized and compilable code to get as much use out of GPU parallel programming as possible. The code should be modular, readable, and editable such that I can experiment and augment with its settings at clear points in the code. 
+
+This simulator must also then be visualized efficiently, as we will be making many visualizations along with our simulations and it is important to prototype frequently and efficiently. 
+
+I want to tell you some inspirations of mine as I think of this particle simulator to better understand where my head is at. I will list them in no particular order:
+
+1. *The Ising model:* the nature of criticality, the simplicity and complexity of the model and what it says about the organization of matter, emergence, and life.  I think of the bonds, as edges in magnetic systems, as axons and dendrites in neurons , as edges in abstract connections.
+2. *Neural Cellular Automata:* from elementary 1D,  2D, then Lenia and neural cellular automata (NCA), I love this idea of an abstraction of physics, defining interactions but with random numbers. Optimizing those parameters for specific goals is also fascinating, in actively designing emerging systems instead of randomly (hopelessly) searching for one in the infinite parameter spaces.
+3. *Boids, Particle Life, Reintegration tracking shaders, Lenia and FlowLenia.* These models all exhibit a very rich set of behaviours that result from emerging interactions, either in grid or particle systems. Some of the most fascinating stuff is in this category, as well as visually stunning. The reintegration tracking shaders are very interesting as well, like FlowLenia, where these sort of natural conservation laws end up making very interesting consequences for these particle systems. The mass conserving ones seem to 'regularize' the behaviour of random parameters quite a bit, which is highly interesting.
+4. Evolutionary simulations and natural evolution, hash chemistry. The notion of 'what survives, survives', of autocatalysis and autopoiesis is at the very core of this simulator. A sandbox of creation and experimentation, a battle royale of survival. This is also to make a distinction between the sort of step-wise optimization that is conventionally done versus a more natural, entropic and emergent evolutionary simulator. Both are interesting, and perhaps can be combined, but the latter is the core detail that is at the heart of this project. I enjoyed the papers on Hash Chemistry by Hiroki Sayama and others evolving sets of objects [particles? I can't remember exactly] with a random hash function that took sets of arbitrary size as input and getting interesting results by  evolving groups of things instead of individual things. Very cool, this seems very important for getting rich behaviour out of randomness.
+
+Each of these inspirations contributes to the type of richness I want to be able to exhibit in Half-life, my particle simulator. Something to abstract the interactions between stuff, the ability to fuse, and form larger things, the constant evolutionary battle due to the constant possibility of collapse, of decay, of fission. 
+
+### Construct a plan to create this project.
+
+If you require to look up papers on the topics above, *READ* about them and familiarize yourself with their techniques. Create Haiku agents to create summaries of these papers, do NOT use Opus or Sonnet agents for long texts. Take notes of important details that might be worthy to keep in memory, but be efficient and mindful of growing memory costs.
+
+Consider the skills you might need to best accomplish these tasks. If needed, create a skill using the /skill-creator skill.
+
+Consider the libraries you may use to run this simulator. We will start with python, however if all goes well, this can then be ported as a shader to something like TouchDesigner to visualize live. If we stay in python, there is some overhead with doing it this way. In the past I'd combined pytorch with pygame to satisfying effect to visualize CPPNs (Compositional Pattern Producing Networks) and NCAs and Ising models live, but I haven't managed to figure out how to do it with jax yet. Figuring this out without performance losses would be amazing. As far as I know shaders do this best but perhaps there is a good way in Python, so figure this out.
+
+Consider the organization of the code and how to best modularize and reuse code as best as possible. 
+
+At the end of the planning you will create two files, first a CLAUDE.md file for this project to define the relevant context for the whole project. There are some skills related to that at your disposal that can trigger for creating and optimizing these processes. 
+
+The second file is a PLAN.md file, which will be a to-do list of what needs to be done in the project that we can track and check-off as we work on this repo. The point of this file to have a memory of the project progress so we can clear and resume the context window efficiently, update the progress of the repo, include issues we've come and the implementation and other project developments without overloading the CLAUDE.md.

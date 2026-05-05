@@ -52,7 +52,7 @@ class SimConfig:
     # ── Fusion ───────────────────────────────────────────────────────────────
     # Fusion occurs when two free particles are within fusion_radius AND
     # the hash-derived binding energy exceeds fusion_threshold
-    fusion_radius: float = 1.0        # must be < interaction_radius
+    fusion_radius: float = 4.0        # must be < interaction_radius
     fusion_threshold: float = 0.2     # minimum binding energy to trigger fusion [0,1]
 
     # ── Decay / Half-life ────────────────────────────────────────────────────
