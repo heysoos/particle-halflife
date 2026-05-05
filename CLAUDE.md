@@ -3,27 +3,43 @@
 ## Running Python in This Project
 
 This project uses a **WSL-based Python interpreter** (Ubuntu under Windows) with the venv at `.venv/`.
-The shell used by Claude Code is Git Bash (Windows), so activating the venv requires going through WSL.
+The user runs Claude Code from two environments — patterns differ:
 
-**Standard command pattern — always use this:**
+- **Git Bash on Windows** (`MINGW*` / `MSYS*`): venv activation must be tunneled through `wsl bash -c`.
+- **Claude Code running natively in WSL** (`Linux *microsoft-standard-WSL2*`): just activate the venv directly. No `wsl bash -c` wrapper — `wsl` isn't even on PATH inside WSL itself, and the wrapper would error with `command not found`.
+
+**Detect at session start** with `uname -a` and pick the matching pattern below.
+
+### Pattern A — Git Bash on Windows (needs `wsl bash -c`)
+
 ```bash
 wsl bash -c "source '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-particle/.venv/bin/activate' && cd '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-particle' && <your command here>"
 ```
 
-**Run the simulator:**
+Run the simulator:
 ```bash
 wsl bash -c "source '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-particle/.venv/bin/activate' && cd '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-particle' && python -m halflife.main"
 ```
 
-**Run a script:**
-```bash
-wsl bash -c "source '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-particle/.venv/bin/activate' && cd '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-particle' && python halflife/step.py"
-```
-
-**Install a package:**
+Install a package:
 ```bash
 wsl bash -c "source '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-particle/.venv/bin/activate' && pip install <package>"
 ```
+
+`cd` paths with spaces require single quotes inside the outer double-quoted `wsl bash -c "..."` string. Using double quotes inside will break the shell.
+
+### Pattern B — Claude Code running natively in WSL (no wrapper)
+
+```bash
+source .venv/bin/activate && python -m halflife.main
+```
+
+Or one-shot without activating:
+```bash
+.venv/bin/python -m halflife.main
+```
+
+Working directory is already the project root; absolute paths still work too.
 
 **Python version:** 3.10.12 (WSL/Ubuntu)
 **Venv path (WSL):** `/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-particle/.venv`
@@ -34,27 +50,21 @@ wsl bash -c "source '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-pa
 ## Git Operations
 
 **IMPORTANT: Git has no global identity configured in WSL.** Always supply `-c user.email` and
-`-c user.name` inline — never `git config --global` (that would mutate shared WSL state).
+`-c user.name` inline on every `add`/`commit` — never `git config --global` (that would mutate shared WSL state). This applies to **both** shell environments below.
 
-**The only working commit pattern:**
+### From Git Bash on Windows
 ```bash
 wsl bash -c "cd '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-particle' && git -c user.email='heysoos@local' -c user.name='Heysoos' add <files...> && git -c user.email='heysoos@local' -c user.name='Heysoos' commit -m 'message'"
 ```
 
-**Stage specific source files then commit (copy-paste template):**
+### From Claude Code running natively in WSL
+No wrapper, no `cd` (already at project root):
 ```bash
-wsl bash -c "cd '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-particle' \
-  && git -c user.email='heysoos@local' -c user.name='Heysoos' \
-     add halflife/foo.py halflife/bar.py \
-  && git -c user.email='heysoos@local' -c user.name='Heysoos' \
-     commit -m 'your message here'"
+git -c user.email='heysoos@local' -c user.name='Heysoos' add halflife/foo.py halflife/bar.py \
+  && git -c user.email='heysoos@local' -c user.name='Heysoos' commit -m 'your message here'
 ```
 
-**Never** use `git add -A` or `git add .` — the repo contains `.idea/`, `__pycache__/`,
-`bash.exe.stackdump`, and `init_prompt.txt` that should not be committed.
-
-**`cd` with spaces requires single quotes inside the `wsl bash -c "..."` string.**
-Using double quotes around the path inside the outer double-quoted string will break the shell.
+**Never** use `git add -A` or `git add .` — the repo contains `.idea/`, `__pycache__/`, `bash.exe.stackdump`, and `init_prompt.txt` that should not be committed.
 
 ---
 
