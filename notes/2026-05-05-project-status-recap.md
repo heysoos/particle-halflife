@@ -5,23 +5,23 @@
 
 ## Summary
 
-Project has matured from "all modules written, untested" (2026-03-14) through several optimization passes and into a Phase 1 *instrumentation/profiling* effort that wrapped on **2026-03-27** (~5 weeks before today). Last commit refactored composite-statistics collection to use `jax.lax.scan`. There's one **uncommitted edit** in [tests/test_composite_statistics.py](tests/test_composite_statistics.py) that parameterizes `num_steps` and bumps the default to 5000 — looks like the user was about to kick off a longer sweep and stopped. The big open question from when work paused: **composites plateau at ~5–8 members**, and we had three hypotheses but never definitively isolated the cause.
+Project has matured from "all modules written, untested" (2026-03-14) through several optimization passes and into a Phase 1 *instrumentation/profiling* effort that wrapped on **2026-03-27** (~5 weeks before today). Last commit refactored composite-statistics collection to use `jax.lax.scan`. There's one **uncommitted edit** in [tests/test_composite_statistics.py](../tests/test_composite_statistics.py) that parameterizes `num_steps` and bumps the default to 5000 — looks like the user was about to kick off a longer sweep and stopped. The big open question from when work paused: **composites plateau at ~5–8 members**, and we had three hypotheses but never definitively isolated the cause.
 
 ## What this project is (one-liner refresher)
 
 JAX/GPU 2D particle simulator where everything has a half-life. Particles fuse into composites whose properties are determined by a hash over the sorted multiset of member species (Sayama-style hash chemistry). Goal: emergent autocatalytic sets / autopoiesis. Live render via ModernGL+pygame.
 
-Full context: [CLAUDE.md](CLAUDE.md), [README.md](README.md), [PLAN.md](PLAN.md).
+Full context: [CLAUDE.md](../CLAUDE.md), [README.md](../README.md), [PLAN.md](../PLAN.md).
 
 ## Where we left off
 
 ### Last commit
-`29d75cf` (2026-03-27) — replaced a Python for-loop in [tests/test_composite_statistics.py](tests/test_composite_statistics.py) with `jax.lax.scan` for stats collection. Pure refactor, no behavior change.
+`29d75cf` (2026-03-27) — replaced a Python for-loop in [tests/test_composite_statistics.py](../tests/test_composite_statistics.py) with `jax.lax.scan` for stats collection. Pure refactor, no behavior change.
 
 ### Uncommitted local change
-[tests/test_composite_statistics.py:817](tests/test_composite_statistics.py#L817) — `test_composite_statistics()` now takes `num_steps` as a parameter (was hard-coded `600`); `__main__` calls it with `num_steps=5000`. Small signature change, suggests a long-run sweep was being prepped. Decide: commit this and run, or drop it.
+[tests/test_composite_statistics.py:817](../tests/test_composite_statistics.py#L817) — `test_composite_statistics()` now takes `num_steps` as a parameter (was hard-coded `600`); `__main__` calls it with `num_steps=5000`. Small signature change, suggests a long-run sweep was being prepped. Decide: commit this and run, or drop it.
 
-### Last *running* state (per [docs/PHASE1_ANALYSIS.md](docs/PHASE1_ANALYSIS.md))
+### Last *running* state (per [docs/PHASE1_ANALYSIS.md](../docs/PHASE1_ANALYSIS.md))
 - Steady 45–50 FPS at 2k particles, ~1.1–1.3 ms/step
 - Composites form readily, peak max-size = **8 members**, plateau around step 1000
 - C+C fusion rate ~0.065/step, mostly 2+2 → 4 mergers
@@ -35,7 +35,7 @@ Full context: [CLAUDE.md](CLAUDE.md), [README.md](README.md), [PLAN.md](PLAN.md)
 2. **Hash chemistry is biased** — the polynomial hash may produce unfavorable BE values for the multi-species combinations needed to keep growing. *Suggested test:* histogram BE across all reachable multisets.
 3. **Spatial isolation** — composites drift apart and don't encounter each other. *Suggested test:* track inter-composite distances over time.
 
-The composite-statistics sweep in [tests/test_composite_statistics.py](tests/test_composite_statistics.py) was set up specifically to attack hypothesis #1 across `(fusion_threshold, interaction_radius, composite_size_decay_scale)` triples. The 5000-step bump in the uncommitted edit was likely the next experiment.
+The composite-statistics sweep in [tests/test_composite_statistics.py](../tests/test_composite_statistics.py) was set up specifically to attack hypothesis #1 across `(fusion_threshold, interaction_radius, composite_size_decay_scale)` triples. The 5000-step bump in the uncommitted edit was likely the next experiment.
 
 ## Project arc — commit summary by theme
 
@@ -71,11 +71,11 @@ Recent work clusters into a few coherent phases. (Use `git log` for fine-grained
 `0098ed1` add `composite_size_decay_scale` axis, sortable tables, interactive histograms →
 `29d75cf` `jax.lax.scan` refactor for the stats loop.
 
-Generated reports sit in [tests/reports/](tests/reports/) — six HTML files from 2026-03-27.
+Generated reports sit in [tests/reports/](../tests/reports/) — six HTML files from 2026-03-27.
 
 ## Performance baseline (as of 2026-03-27)
 
-From [tests/README_PERFORMANCE.md](tests/README_PERFORMANCE.md):
+From [tests/README_PERFORMANCE.md](../tests/README_PERFORMANCE.md):
 
 | Phase | mean ms | % total |
 |---|---|---|
@@ -103,12 +103,12 @@ In rough priority order:
 ## Useful pointers
 
 - Memory records live at [Windows path] `/mnt/c/Users/Heysoos/.claude/projects/C--Users-Heysoos-Documents-Pycharm-Projects-halflife-particle/memory/` — five files covering project context, user background, WSL command pattern, composite design philosophy, subagent naming. WSL-side memory dir for this project is empty.
-- All runtime tuning lives in [halflife/config.py](halflife/config.py) (`SimConfig` frozen dataclass).
-- Full project roadmap and known-issues list: [PLAN.md](PLAN.md).
-- Phase-1 deep-dive: [docs/PHASE1_ANALYSIS.md](docs/PHASE1_ANALYSIS.md).
+- All runtime tuning lives in [halflife/config.py](../halflife/config.py) (`SimConfig` frozen dataclass).
+- Full project roadmap and known-issues list: [PLAN.md](../PLAN.md).
+- Phase-1 deep-dive: [docs/PHASE1_ANALYSIS.md](../docs/PHASE1_ANALYSIS.md).
 
 ## Nubs
 
 - ?? `tests/__pycache__/` and `halflife/__pycache__/profiler.cpython-310.pyc` show as untracked/modified — confirm they're in `.gitignore` and stop showing in `git status`.
-- ?? Six HTML sweep reports from 2026-03-27 in [tests/reports/](tests/reports/) — none ever opened in this recap. Worth eyeballing the most recent (`composite_statistics_20260327_211754.html`) before designing a new experiment; it may already answer hypothesis #1.
+- ?? Six HTML sweep reports from 2026-03-27 in [tests/reports/](../tests/reports/) — none ever opened in this recap. Worth eyeballing the most recent (`composite_statistics_20260327_211754.html`) before designing a new experiment; it may already answer hypothesis #1.
 - ?? Phase-1 profiler bug history: `fafa07c` moved metrics collection outside JIT. Check whether anything else still tries to mutate Python state from inside a JIT'd function.

@@ -19,7 +19,7 @@ The screenshot config has **`repulsion_radius=8.0` cranked above `interaction_ra
 
 ## Headline: kernel is degenerate at user's settings
 
-The Particle Life kernel in [halflife/interactions.py:31](halflife/interactions.py#L31) has three regions:
+The Particle Life kernel in [halflife/interactions.py:31](../halflife/interactions.py#L31) has three regions:
 
 ```
 r < r_repulse           →  hard-core repulsion (always negative)
@@ -29,9 +29,9 @@ r ≥ r_cutoff             →  zero
 
 **Required invariant:** `r_repulse < r_cutoff`.
 
-Screenshot values: `r_repulse = 8.0` (10× default), `r_cutoff = 4.0` (default `interaction_radius`). The attraction zone is the interval `[8.0, 4.0)` which is **empty**. `f_attract` is gated by `(r >= r_repulse) & (r < r_cutoff)` ([halflife/interactions.py:68–72](halflife/interactions.py#L68-L72)) — that condition is *never* true.
+Screenshot values: `r_repulse = 8.0` (10× default), `r_cutoff = 4.0` (default `interaction_radius`). The attraction zone is the interval `[8.0, 4.0)` which is **empty**. `f_attract` is gated by `(r >= r_repulse) & (r < r_cutoff)` ([halflife/interactions.py:68–72](../halflife/interactions.py#L68-L72)) — that condition is *never* true.
 
-Even worse, the `half_width = (r_cutoff - r_repulse) * 0.5` becomes **negative** ([halflife/interactions.py:66](halflife/interactions.py#L66)). That doesn't crash because the gate masks the result, but it's a sign that the kernel doesn't validate its preconditions.
+Even worse, the `half_width = (r_cutoff - r_repulse) * 0.5` becomes **negative** ([halflife/interactions.py:66](../halflife/interactions.py#L66)). That doesn't crash because the gate masks the result, but it's a sign that the kernel doesn't validate its preconditions.
 
 ### What's left in the force budget
 
@@ -59,7 +59,7 @@ So inside a composite, members feel huge repulsion (~12 force units each) balanc
 
 ## Hypothesis (a) — does the representative limit interaction?
 
-**Short answer: only for fusion, not for forces.** I grepped: `is_rep` / `all_reps` appear *only* in [halflife/chemistry.py](halflife/chemistry.py) (the fusion module). Force computation in [halflife/interactions.py](halflife/interactions.py) and bond springs in [halflife/step.py](halflife/step.py#L48) operate on every particle individually.
+**Short answer: only for fusion, not for forces.** I grepped: `is_rep` / `all_reps` appear *only* in [halflife/chemistry.py](../halflife/chemistry.py) (the fusion module). Force computation in [halflife/interactions.py](../halflife/interactions.py) and bond springs in [halflife/step.py](../halflife/step.py#L48) operate on every particle individually.
 
 So a composite *member* — any of them, not just the rep — feels and exerts force from/on:
 - Other members of its own composite (cancel pairwise)
@@ -68,11 +68,11 @@ So a composite *member* — any of them, not just the rep — feels and exerts f
 
 Where the rep does limit things: **fusion access**. Only the rep particle's neighborhood is scanned for partners. So a composite can only grow when a free particle wanders close to its lowest-index member specifically. Other members standing closer to a free particle don't generate fusion candidates. That matters for *growth* but not for *motion*.
 
-So: hypothesis (a) is the wrong target for the boring-dynamics complaint, but it's a real architectural bias for fusion. (The prior audit at [notes/2026-05-05-physics-audit.md](notes/2026-05-05-physics-audit.md#fusion-mechanics) covers this in more detail.)
+So: hypothesis (a) is the wrong target for the boring-dynamics complaint, but it's a real architectural bias for fusion. (The prior audit at [notes/2026-05-05-physics-audit.md](2026-05-05-physics-audit.md#fusion-mechanics) covers this in more detail.)
 
 ## Hypothesis (b) — is the attraction matrix boring?
 
-**Not boring.** The 64×64 random matrix from [halflife/state.py:188](halflife/state.py#L188) at the default seed:
+**Not boring.** The 64×64 random matrix from [halflife/state.py:188](../halflife/state.py#L188) at the default seed:
 
 ```
 mean:    -0.0025         (balanced — no global bias)
@@ -90,7 +90,7 @@ If/when the kernel is fixed, the matrix is *fine* as-is. Structured matrices (Pe
 
 ## Hypothesis (c) — polarity-induced inertness
 
-This is the one I added in the prior audit. Each composite member's force on others gets scaled by `attr_mod_i · attr_mod_j` where `attr_mod = composite.net_polarity` ([halflife/step.py:178–184](halflife/step.py#L178-L184)). As composites grow, member polarities average toward 0 by central-limit dynamics, so `attr_mod² → 0` and the composite becomes inert *with respect to attraction*.
+This is the one I added in the prior audit. Each composite member's force on others gets scaled by `attr_mod_i · attr_mod_j` where `attr_mod = composite.net_polarity` ([halflife/step.py:178–184](../halflife/step.py#L178-L184)). As composites grow, member polarities average toward 0 by central-limit dynamics, so `attr_mod² → 0` and the composite becomes inert *with respect to attraction*.
 
 Measured at the user's settled state:
 

@@ -1,125 +1,56 @@
 # Half-Life Particle Simulator — Project Roadmap
 
-## Status: All core modules written — ready to run and test
+## Status (2026-05-06)
+
+Simulator is running interactively at ~40 FPS with 2k particles, 200+ composites, full live-tunable physics via UI sliders. Core build phases (0–4) are complete; current work is on physics tuning and emergent-dynamics investigation.
 
 ---
 
-## Phase 0: Project Setup ✅
+## Next Session — TODO (queued 2026-05-06)
 
-- [x] Architecture designed and approved
-- [x] `CLAUDE.md` — project context
-- [x] `PLAN.md` — this file
-- [x] `requirements.txt`
-- [x] `halflife/__init__.py`
+After today's audit ([notes/2026-05-06-composite-dynamics-architecture.md](notes/2026-05-06-composite-dynamics-architecture.md)), four items to attack tomorrow:
 
----
+- [ ] **Rethink polarity scaling.** Current `attr_mod = net_polarity` makes neutral composites attractively inert in every direction, which biases the population toward boring blobs. Try alternatives: remove polarity scaling entirely, use `(1 + |net_pol|)/2` so composites stay reactive, or use `max(|p_i|)` instead of mean. Goal: stop the inertness/stability feedback loop. Context: [boring-dynamics note → polarity hypothesis](notes/2026-05-05-boring-dynamics-investigation.md#hypothesis-c--polarity-induced-inertness).
 
-## Phase 1: Foundation Modules ✅
+- [ ] **Composite interaction range + drop the "representative" trick.** Two coupled changes: (a) bump `interaction_radius` so composites can actually see each other (currently 4.0 ≈ composite diameter); (b) replace the rep-only fusion access ([halflife/chemistry.py:265–272](halflife/chemistry.py#L265)) — every member should be able to participate in fusion, not just the lowest-index one. The rep is an arbitrary architectural choice that limits growth.
 
-- [x] `halflife/config.py` — SimConfig frozen dataclass
-- [x] `halflife/state.py` — ParticleState, CompositeState, WorldState + initialize_world()
-- [x] `halflife/utils.py` — hash_multiset(), find_free_slots(), boundary helpers
-- [ ] Unit test: hash determinism, multiset order invariance
+- [ ] **Fix `cell_capacity` overflow.** Currently 8 — way too low for our typical compact composites (20+ members in one cell is common). 16% of composites are silently corrupted by truncated neighbor lists, producing fictitious "self-propulsion" forces (956× clean composites). Cheapest fix: bump capacity to 32 or 64, assert on `did_overflow`. See [composite-dynamics note → cell-list overflow bug](notes/2026-05-06-composite-dynamics-architecture.md#cell-list-overflow-bug-the-actual-cause).
 
----
-
-## Phase 2: Physics Core ✅
-
-- [x] `halflife/spatial.py` — build_cell_list(), find_all_neighbors()
-- [x] `halflife/interactions.py` — InteractionParams, pairwise_force(), compute_all_forces()
-- [x] `halflife/step.py` — full simulation step (forces + chemistry integrated)
-- [ ] Verify: particles move, interact by species, stay in bounds
-- [ ] Profile JIT compile time and step throughput
-
----
-
-## Phase 3: Visualization ✅
-
-- [x] `halflife/renderer.py` — ModernGL setup, shaders, VBO pipeline, point sprites
-- [x] `halflife/main.py` — pygame event loop, keyboard controls, FPS display
-- [x] Species color palette (HSV), size scaling from mass, brightness by speed
-- [x] Composite viz: bonds mode (GL_LINES) + merged mode (large point) — toggle `B`
-- [ ] Verify: real-time visualization of particle physics
-
----
-
-## Phase 4: Chemistry Engine ✅
-
-- [x] `halflife/chemistry.py` — hash_to_products(), attempt_fusion(), apply_decay(), apply_composite_decay()
-- [x] `halflife/energy.py` — energy tracking, soft conservation
-- [x] Integrated into `step.py`
-- [ ] Verify: fusion, composite formation, decay, fission, energy roughly conserved
-
----
-
-## NEXT: First Run and Debugging ✅ (partial)
-
-- [x] Install dependencies
-- [x] Fix chemistry.py bug: shape mismatch in `apply_composite_decay` center-of-mass calc
-- [x] All imports OK, JIT compiles, simulation step runs
-- [x] Composites forming (~11 after 10 steps), ~30ms/step on 1000-particle config
-- [ ] Run full GUI: `python -m halflife.main` (requires display — run locally in PyCharm)
-- [ ] Verify physics looks plausible (particles cluster by species, move around)
-- [ ] Tune parameters in config.py if behavior is degenerate
-
----
-
-## Performance Investigation (done after first ~2 FPS run)
-
-Four bottlenecks identified and fixed:
-
-| # | Bottleneck | Root cause | Fix | Speedup |
-|---|-----------|-----------|-----|---------|
-| 1 | `attempt_fusion` scan | `lax.scan` over all N=20K particles; each step carries full `CompositeState` | Pre-filter to `max_fusions_per_step=100` candidates before scan | ~200x on scan |
-| 2 | `find_free_slots` | O(N²): vmapped N `jnp.min()` reductions of size N | Replace with O(N log N) `jnp.sort` on candidate array | ~N/log(N) |
-| 3 | `compute_bond_forces` | Iterates ALL 5K composites × 28 pairs every step, even when dead | Gate on `config.use_bond_forces` (default False) | ~140K ops/step saved |
-| 4 | Default config size | `max_particles=20K` (10x benchmark size), causing all O(N) ops to be 10x worse | Reduced to `max_particles=4K, num_particles_init=2K, max_composites=500` | ~10x |
-
-Result: 3.9ms/step → ~258 FPS potential (at default 2K particles, no bond forces)
-
-Remaining known perf issues (not yet addressed):
-- `find_neighbors_for_particle`: `pack_slot` vmap is O(max_neighbors × max_candidates)
-  per particle — an O(N × K²) total, could be simplified to O(N × K)
-- Bond forces still O(max_composites) when re-enabled — needs alive-composite filtering
+- [ ] **Audit + experiment with force kernels.** Verify the attraction matrix is being used as intended (signed values? actually consulted? `r_attract[i,j]` per-pair is sampled but not used by the kernel — known dead arg). Then sketch 2–3 alternative kernels (e.g. Lennard-Jones, smooth Lenia-style, structured/sparse attraction matrix, Perlin-driven) and toggle between them via config to compare emergent richness. Goal: figure out which kernel substrate actually produces interesting dynamics.
 
 ---
 
 ## Phase 5: Polish and Optimization
 
-- [ ] Verify FPS is good in full GUI run
-- [ ] Async rendering overlap (simulate N+1 while rendering N)
-- [ ] Scale up to larger particle counts once perf baseline is solid
-- [ ] Profile with jax.profiler if FPS drops when chemistry becomes active
-- [ ] Interactive parameter controls (live sliders)
-- [ ] Statistics overlay (species distribution, composite count, energy histogram)
+- [x] Async rendering overlap (commit `086e9e1`)
+- [x] Interactive parameter controls / live sliders (`bb7d951`, `2b44ab9`, `196ba55`)
+- [x] Statistics overlay — FPS, composites, energy, histogram, sparklines (`c7142af`, `bb7d951`)
+- [x] Profiler infrastructure with phase-level timing (`edd8465`–`746b4ac`)
 - [ ] Frame recording (save to disk for videos)
+- [ ] Scale up to 10k+ particles (gated on cell_capacity fix in Next Session TODO)
 
 ---
 
 ## Phase 6: Evolution and Emergence
 
+- [x] Parameter sweep infrastructure ([tests/test_composite_statistics.py](tests/test_composite_statistics.py) generates HTML reports in [tests/reports/](tests/reports/))
 - [ ] Group fitness metrics
 - [ ] Spatial compartmentalization detection
-- [ ] Parameter sweep infrastructure
-- [ ] NCA-style learned update rules on internal state vector
-- [ ] Mass conservation mode (FlowLenia / reintegration tracking inspired)
+- [ ] NCA-style learned update rules — would need to restore the `internal` field removed in `b0c049f`
+- [ ] Mass conservation mode (FlowLenia / reintegration-tracking inspired)
 - [ ] Optimization loops (evolve interaction matrices for specific goals)
-
----
-
-## Known Issues / Notes
-
-- Fixed: `chemistry.py` — shape mismatch in `apply_composite_decay` CoM calc
-- Fixed: `renderer.py` — unused `u_window_size` uniform removed (GLSL optimizes it away)
-- Fixed: `attempt_fusion` scan O(N) → O(max_fusions_per_step)
-- Fixed: `find_free_slots` O(N²) → O(N log N)
-- Fixed: bond forces gated off by default (`use_bond_forces=False`)
 
 ---
 
 ## Implementation Log
 
-### 2026-03-14
-- Architecture designed after researching: Hash Chemistry (Sayama), FlowLenia/Particle Life/NCAs/Boids, JAX+rendering options
-- Key decisions: 2D, configurable boundaries, toggleable composite viz, ModernGL+pygame
-- Phase 0 files created
+Detailed history is in `git log`; thematic recap in [notes/2026-05-05-project-status-recap.md](notes/2026-05-05-project-status-recap.md). High-level arc:
+
+- **Phase A — Initial build & first-run debugging.** Modules written; first run hit 4 perf bottlenecks, fixed → 30ms → 3.9ms/step.
+- **Phase B — Polarity chemistry, UI, events, stats.** Live HUD, event sprites, sparklines, polarity-based fusion preference and stability. Closed with a 10–100× perf jump (`086e9e1`: commutative hash, COM-spring bonds, async pipeline).
+- **Phase C — Live tuning UX + fusion-scan optimization.** Log-scale sliders, fusion scan rewrites, dead-particle machinery removed (`b0c049f`), `lax.switch` → `jnp.where` (4× speedup).
+- **Phase D — Profiling instrumentation (2026-03).** Profiler module, C+C fusion detection, baseline performance docs.
+- **Phase E — Composite statistics analysis (2026-03-27).** HTML sweep reports over `(fusion_threshold, interaction_radius, composite_size_decay_scale)` (six runs in `tests/reports/`).
+- **Phase F — Physics audit (2026-05-05/06).** Diagnosed degenerate-kernel issue at user's UI settings, dead-code cleanup (`98abb0f`), fusion_radius bump 1.0→4.0 (`86eb78f`), discovered cell_capacity overflow bug. Notes: `notes/2026-05-05-*`, `notes/2026-05-06-*`.
+
+Performance baseline (2026-03-27): 11.6 ms/step fused, 85 steps/sec at 2k particles. Bottleneck is `attempt_fusion` at 55% of step time. Full breakdown in [tests/README_PERFORMANCE.md](tests/README_PERFORMANCE.md).
