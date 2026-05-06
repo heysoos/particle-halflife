@@ -156,11 +156,18 @@ class InteractionParams(NamedTuple):
     Species-dependent pairwise force parameters. Not part of WorldState.
     Passed as a regular JAX array argument (not static), so these can be
     changed without recompiling the simulation step.
+
+    Per-pair radii are stored as FRACTIONS of config.interaction_radius:
+      r_peak[i,j]   = interaction_radius * peak_fraction[i,j]
+      r_cutoff[i,j] = interaction_radius * cutoff_fraction[i,j]
+    Repulsion is global (physics.repulsion_radius, scalar) — steric exclusion
+    is universal across species pairs. Ordering invariant enforced at init:
+      0 < repulsion_fraction < peak_fraction[i,j] < cutoff_fraction[i,j] <= 1
     """
     # All matrices: (num_species, num_species) float32
     attraction:        jnp.ndarray  # signed strength in [-1, 1]
-    r_attract:         jnp.ndarray  # radius of peak attraction/repulsion
-    r_cutoff:          jnp.ndarray  # beyond this distance: zero force
+    peak_fraction:     jnp.ndarray  # peak-attraction radius / interaction_radius
+    cutoff_fraction:   jnp.ndarray  # zero-force radius / interaction_radius
     polarity:          jnp.ndarray  # (num_species,) float32 — species charge ∈ [-1, 1]
 
 
@@ -173,6 +180,11 @@ def initialize_interaction_params(config: SimConfig,
     - Asymmetric values (A attracts B but B repels A) produce chasing dynamics
     - Symmetric negative values produce clustering
     - Symmetric positive values produce avoidance
+
+    peak_fraction and cutoff_fraction are sampled per-species-pair so each
+    pair gets its own force-shape (peak position + range), not just amplitude.
+    The fractions are sampled in [0.3, 0.95] then sorted per-pair to enforce
+    peak < cutoff with at least a 0.1 gap.
 
     Args:
         config: SimConfig
@@ -187,23 +199,24 @@ def initialize_interaction_params(config: SimConfig,
     # Random signed attraction: uniform in [-1, 1]
     attraction = jax.random.uniform(k1, (S, S), minval=-1.0, maxval=1.0)
 
-    # Attraction radius: uniform in [repulsion_radius * 1.1, interaction_radius * 0.8]
-    r_attract = jax.random.uniform(
-        k2, (S, S),
-        minval=config.repulsion_radius * 1.5,
-        maxval=config.interaction_radius * 0.75
-    )
-
-    # Cutoff: all use global interaction_radius
-    r_cutoff = jnp.full((S, S), config.interaction_radius, dtype=jnp.float32)
+    # Per-pair radii as fractions of interaction_radius. Sample two values
+    # in [0.3, 0.95] and sort per-pair: smaller → peak, larger → cutoff.
+    # Lower bound 0.3 keeps the peak well outside repulsion_fraction
+    # (= repulsion_radius / interaction_radius, default 0.2). Enforce a
+    # minimum 0.1 gap so the triangle has non-degenerate width.
+    a = jax.random.uniform(k2, (S, S), minval=0.3, maxval=0.95)
+    b = jax.random.uniform(k3, (S, S), minval=0.3, maxval=0.95)
+    peak_fraction   = jnp.minimum(a, b)
+    cutoff_fraction = jnp.maximum(a, b)
+    cutoff_fraction = jnp.minimum(jnp.maximum(cutoff_fraction, peak_fraction + 0.1), 1.0)
 
     # Per-species polarity charge: uniform in [-1, 1]
     polarity = jax.random.uniform(k4, (S,), minval=-1.0, maxval=1.0)
 
     return InteractionParams(
         attraction=attraction,
-        r_attract=r_attract,
-        r_cutoff=r_cutoff,
+        peak_fraction=peak_fraction,
+        cutoff_fraction=cutoff_fraction,
         polarity=polarity,
     )
 

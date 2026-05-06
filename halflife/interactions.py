@@ -3,18 +3,21 @@ Pairwise force computation (Particle Life-style).
 
 Each particle species pair (i, j) has:
   - A signed attraction strength:  params.attraction[si, sj]
-  - A peak attraction radius:       params.r_attract[si, sj]
-  - A cutoff radius:                params.r_cutoff[si, sj]
-  - A global repulsion radius:      config.repulsion_radius (same for all species)
+  - A peak-attraction fraction:    params.peak_fraction[si, sj]
+  - A cutoff fraction:             params.cutoff_fraction[si, sj]
+  - A global repulsion radius:     physics.repulsion_radius (same for all species)
+  - A global span:                 config.interaction_radius (the unit fractions multiply)
 
-Force kernel shape (vs distance r):
+Force kernel shape (vs distance r), with
+    r_peak   = interaction_radius * peak_fraction[si, sj]
+    r_cutoff = interaction_radius * cutoff_fraction[si, sj]:
     r < repulsion_radius:            strong repulsive core
-    repulsion_radius <= r < r_attract: ramp toward peak attraction
-    r_attract <= r < r_cutoff:         ramp down to zero
-    r >= r_cutoff:                      zero
+    repulsion_radius <= r < r_peak:  asymmetric ramp UP to attraction[si, sj]
+    r_peak <= r < r_cutoff:          asymmetric ramp DOWN to 0
+    r >= r_cutoff:                   zero
 
-This is exactly the "Particle Life" kernel, with species-dependent
-attraction sign and magnitude.
+Both ramps are linear; r_peak is no longer constrained to the midpoint, so
+each species pair gets its own force-shape (where the well is + how wide).
 
 Forces are computed GPU-parallel via double vmap:
   outer vmap: over all particles i
@@ -29,9 +32,9 @@ from halflife.config import SimConfig
 
 
 def particle_life_force(r: jnp.ndarray, attraction: jnp.ndarray,
-                         r_repulse: float, r_attract: jnp.ndarray,
+                         r_repulse: jnp.ndarray, r_peak: jnp.ndarray,
                          r_cutoff: jnp.ndarray,
-                         repulsion_strength: float = 2.0) -> jnp.ndarray:
+                         repulsion_strength: jnp.ndarray) -> jnp.ndarray:
     """
     Scalar force magnitude for the Particle Life kernel.
 
@@ -42,10 +45,10 @@ def particle_life_force(r: jnp.ndarray, attraction: jnp.ndarray,
     Args:
         r:                  scalar — distance between particles
         attraction:         scalar — signed strength in [-1, 1]
-        r_repulse:          float  — repulsion cutoff (config-level constant)
-        r_attract:          scalar — peak attraction radius
-        r_cutoff:           scalar — zero-force cutoff
-        repulsion_strength: float  — hard-core repulsion magnitude scale
+        r_repulse:          scalar — repulsion cutoff (global, slider-tunable)
+        r_peak:             scalar — peak-attraction radius (per species pair)
+        r_cutoff:           scalar — zero-force cutoff (per species pair)
+        repulsion_strength: scalar — hard-core repulsion magnitude scale
 
     Returns:
         scalar float32 — force magnitude (negative = repulsive, positive = attractive)
@@ -60,16 +63,18 @@ def particle_life_force(r: jnp.ndarray, attraction: jnp.ndarray,
         0.0
     )
 
-    # Attraction zone: triangle kernel — POSITIVE = attractive, NEGATIVE = repulsive.
-    #   ramps up from 0 at r_repulse to peak at r_attract,
-    #   then ramps down to 0 at r_cutoff
-    half_width = (r_cutoff - r_repulse) * 0.5 + eps
-    peak = r_repulse + half_width
-    f_attract = jnp.where(
-        (r >= r_repulse) & (r < r_cutoff),
-        attraction * (1.0 - jnp.abs(r - peak) / half_width),
-        0.0
-    )
+    # Attraction zone: asymmetric triangle — POSITIVE = attractive, NEGATIVE = repulsive.
+    #   ramps up linearly from 0 at r_repulse to attraction at r_peak,
+    #   then ramps down linearly from attraction at r_peak to 0 at r_cutoff.
+    # The two halves can have different widths since r_peak is no longer
+    # constrained to the midpoint of [r_repulse, r_cutoff].
+    up_width   = jnp.maximum(r_peak - r_repulse, eps)
+    down_width = jnp.maximum(r_cutoff - r_peak, eps)
+    in_up   = (r >= r_repulse) & (r < r_peak)
+    in_down = (r >= r_peak)    & (r < r_cutoff)
+    f_up    = attraction * ((r - r_repulse) / up_width)
+    f_down  = attraction * (1.0 - (r - r_peak) / down_width)
+    f_attract = jnp.where(in_up, f_up, jnp.where(in_down, f_down, 0.0))
 
     return f_repulse + f_attract
 
@@ -107,16 +112,17 @@ def pairwise_force(pos_i: jnp.ndarray, pos_j: jnp.ndarray,
     r = jnp.linalg.norm(d) + 1e-10  # distance (avoid div-by-zero)
     d_hat = d / r                     # unit direction
 
-    # Look up species-pair parameters
+    # Look up species-pair parameters; convert fractions to absolute distances.
+    # interaction_radius is the static unit; per-pair fractions in (0, 1] scale it.
     aij = params.attraction[species_i, species_j]
-    r_a = params.r_attract[species_i, species_j]
-    r_c = params.r_cutoff[species_i, species_j]
+    r_peak  = config.interaction_radius * params.peak_fraction[species_i, species_j]
+    r_cut   = config.interaction_radius * params.cutoff_fraction[species_i, species_j]
 
     # Scale attraction by composite polarity modifiers (multiplicative)
     eff_attraction = aij * attr_mod_i * attr_mod_j
     f_mag = particle_life_force(r, eff_attraction * physics.attraction_scale,
-                                physics.repulsion_radius, r_a,
-                                r_c * physics.r_cutoff_scale,
+                                physics.repulsion_radius, r_peak,
+                                r_cut * physics.r_cutoff_scale,
                                 physics.repulsion_strength)
 
     # Positive f_mag = repulsive = in direction of d (i away from j)
