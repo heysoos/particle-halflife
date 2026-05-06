@@ -191,7 +191,12 @@ def simulation_step(state: WorldState, params: InteractionParams,
     # ── Phase 4: Integration (Euler) ──────────────────────────────────────────
     new_vel = particles.velocity + (forces / particles.mass[:, None]) * config.dt
     new_vel = new_vel * physics.damping
-    new_vel = jnp.clip(new_vel, -config.max_velocity, config.max_velocity)
+    # Magnitude clamp: cap |v| at max_velocity. Per-component clip would let
+    # diagonal motion reach |v| = sqrt(2) * max_velocity, which is unphysical.
+    speed = jnp.linalg.norm(new_vel, axis=-1, keepdims=True)
+    new_vel = new_vel * jnp.minimum(
+        1.0, config.max_velocity / (speed + 1e-10)
+    )
     new_pos = particles.position + new_vel * config.dt
 
     # ── Phase 5: Boundary Conditions ─────────────────────────────────────────
@@ -210,6 +215,19 @@ def simulation_step(state: WorldState, params: InteractionParams,
     # ── Phase 8: Energy Accounting ────────────────────────────────────────────
     current_energy = compute_total_energy(state)
     state = apply_soft_energy_conservation(state, state.total_energy)
+
+    # Re-clamp velocities. The post-integration clamp at phase 4 only catches
+    # force-driven overshoots; phase 7 fission kicks (chemistry.py) and phase 8
+    # soft energy rescale can both push speeds back over max_velocity. Without
+    # this final clamp, soft conservation alone compounds 1% per step into
+    # large violations within ~100 steps. Same magnitude semantics as phase 4.
+    final_speed = jnp.linalg.norm(state.particles.velocity, axis=-1, keepdims=True)
+    final_vel = state.particles.velocity * jnp.minimum(
+        1.0, config.max_velocity / (final_speed + 1e-10)
+    )
+    state = state._replace(
+        particles=state.particles._replace(velocity=final_vel)
+    )
 
     # ── Phase 9: Increment Ages and Counters ──────────────────────────────────
     new_age = state.particles.age + config.dt

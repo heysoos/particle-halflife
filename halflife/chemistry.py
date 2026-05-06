@@ -226,11 +226,17 @@ def apply_composite_decay(state: WorldState, config: SimConfig) -> WorldState:
     flat_valid = all_valid.reshape(-1)  # (C*M,)
     flat_kicks = all_kicks.reshape(-1, 2)  # (C*M, 2)
 
-    # Release particles: set composite_id to -1, add velocity kick
+    # Release particles: set composite_id to -1, add velocity kick.
+    # Route invalid entries to OOB index N (dropped) so they can't race against
+    # a real write to index 0 — JAX at[].set() with duplicate indices has
+    # indeterminate behavior, and the previous safe_pids=0 fallback caused
+    # particle 0's composite_id to be non-deterministically clobbered.
+    N = config.num_particles
+    drop_pids = jnp.where(flat_valid, flat_pids, N)
+    new_composite_id = particles.composite_id.at[drop_pids].set(-1, mode='drop')
+    # at[].add() with duplicates is well-defined as accumulation, and
+    # invalid entries add 0, so the original safe_pids=0 form is fine here.
     safe_pids = jnp.where(flat_valid, flat_pids, 0)
-    new_composite_id = particles.composite_id.at[safe_pids].set(
-        jnp.where(flat_valid, -1, particles.composite_id[safe_pids])
-    )
     new_velocity = particles.velocity.at[safe_pids].add(
         jnp.where(flat_valid[:, None], flat_kicks, 0.0)
     )
@@ -552,11 +558,14 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             )
             return pid, valid
 
+        # Route invalid entries to OOB index N (dropped) — see comment in
+        # apply_composite_decay above. Without this, the M-1 invalid slots in
+        # each scan iteration would all write to index 0 with the read-back
+        # value, racing against any real write to particle 0 and clobbering it
+        # non-deterministically.
         i_pids, i_valid = jax.vmap(assign_i_member)(jnp.arange(M, dtype=jnp.int32))
-        safe_i_pids = jnp.where(i_valid, i_pids, 0)
-        new_composite_id = new_composite_id.at[safe_i_pids].set(
-            jnp.where(i_valid, target, new_composite_id[safe_i_pids])
-        )
+        drop_i_pids = jnp.where(i_valid, i_pids, N)
+        new_composite_id = new_composite_id.at[drop_i_pids].set(target, mode='drop')
 
         # j-side: assign to target
         def assign_j_member(m_idx):
@@ -567,10 +576,8 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             return pid, valid
 
         j_pids, j_valid = jax.vmap(assign_j_member)(jnp.arange(M, dtype=jnp.int32))
-        safe_j_pids = jnp.where(j_valid, j_pids, 0)
-        new_composite_id = new_composite_id.at[safe_j_pids].set(
-            jnp.where(j_valid, target, new_composite_id[safe_j_pids])
-        )
+        drop_j_pids = jnp.where(j_valid, j_pids, N)
+        new_composite_id = new_composite_id.at[drop_j_pids].set(target, mode='drop')
 
         # Mark both representatives as claimed
         new_claimed = claimed.at[safe_i].set(claimed[safe_i] | can_fuse)
