@@ -1,0 +1,28 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE / editor metadata
+.idea/
+.vscode/
+
+# Claude Code session state
+.claude/
+
+# OS / shell artifacts
+bash.exe.stackdump
+.DS_Store
+Thumbs.db
+
+# Generated test artifacts
+tests/reports/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
