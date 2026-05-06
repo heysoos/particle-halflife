@@ -214,7 +214,7 @@ def simulation_step(state: WorldState, params: InteractionParams,
 
     # ── Phase 8: Energy Accounting ────────────────────────────────────────────
     current_energy = compute_total_energy(state)
-    state = apply_soft_energy_conservation(state, state.total_energy)
+    # state = apply_soft_energy_conservation(state, state.total_energy)
 
     # Re-clamp velocities. The post-integration clamp at phase 4 only catches
     # force-driven overshoots; phase 7 fission kicks (chemistry.py) and phase 8
