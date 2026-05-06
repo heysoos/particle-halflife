@@ -5,10 +5,13 @@
 
 ## Summary
 
-The simulation step is a **9-phase JIT'd graph** ([halflife/step.py:151](halflife/step.py#L151)). Particles never die (the alive-mask machinery was removed in `b0c049f`); only composites do. Several earlier-design functions are left as dead code: `hash_multiset`, `hash_scalar`, `_hash_to_half_life`, `_hash_to_decay_products`, plus `composite_half_life_scale` and `max_decay_products` config knobs that nothing reads. The actual half-life formula is **driven by binding energy**, not the hash directly. Fusion only operates on each entity's "representative" (its lowest-index member), and a quick experiment shows free-particle access to composites is **spatially limited**, not BE-limited.
+The simulation step is a **9-phase JIT'd graph** ([halflife/step.py:151](../halflife/step.py#L151)). Particles never die (the alive-mask machinery was removed in `b0c049f`); only composites do. Several earlier-design functions are left as dead code: `hash_multiset`, `hash_scalar`, `_hash_to_half_life`, `_hash_to_decay_products`, plus `composite_half_life_scale` and `max_decay_products` config knobs that nothing reads. The actual half-life formula is **driven by binding energy**, not the hash directly. Fusion only operates on each entity's "representative" (its lowest-index member), and a quick experiment shows free-particle access to composites is **spatially limited**, not BE-limited.
+
+> **Status update 2026-05-06:** most of the dead-code, `r_attract`, and `total_energy`-quirk findings below have since been resolved or partially addressed. See [Status update — 2026-05-06](#status-update--2026-05-06) for the per-finding mapping to commits, plus two new bugs that surfaced when the test suite was unblocked.
 
 ## Contents
 
+- [Status update — 2026-05-06](#status-update--2026-05-06)
 - [The simulation step (9 phases)](#the-simulation-step-9-phases)
 - [State model](#state-model)
 - [Force model — Particle Life kernel + polarity + bonds](#force-model--particle-life-kernel--polarity--bonds)
@@ -22,25 +25,57 @@ The simulation step is a **9-phase JIT'd graph** ([halflife/step.py:151](halflif
 - [What this means for the size-plateau question](#what-this-means-for-the-size-plateau-question)
 - [Nubs](#nubs)
 
+## Status update — 2026-05-06
+
+Five commits over 2026-05-05 → 2026-05-06 closed most of this audit's open items. Net diff is summarized here; the original sections below are kept intact for historical context with inline ✓ markers pointing at this section.
+
+### Resolved
+
+| Finding (audit section) | Status | Commit |
+|---|---|---|
+| All six dead chemistry/util/config items ([Dead code findings](#dead-code-findings)) | ✓ Commented out with revival banners; tests for dead code commented alongside | [`98abb0f`](https://github.com/heysoos/particle-halflife/commit/98abb0f) |
+| `r_attract[si,sj]` initialized but unused by kernel (also flagged in [Force model](#force-model--particle-life-kernel--polarity--bonds)) | ✓ Replaced. Per-pair `r_attract` and uniform `r_cutoff` matrices removed in favor of fractional `peak_fraction[S,S]` and `cutoff_fraction[S,S]`. Kernel now uses an asymmetric two-segment triangle (`r_peak` is no longer constrained to the midpoint). Each species pair now has its own force-shape, not just amplitude. | [`333df85`](https://github.com/heysoos/particle-halflife/commit/333df85) |
+| "Tests pass on dead code" false-signal ([Dead code findings](#dead-code-findings)) | ✓ `test_half_life_distribution` commented out; `composite_half_life_scale` references in `test_chemistry.py` adjusted | [`98abb0f`](https://github.com/heysoos/particle-halflife/commit/98abb0f) |
+| Test-rot meta-issue (suite couldn't even run because production signatures grew a `physics: PhysicsParams` arg without updating callers) | ✓ Threaded `physics` through every test setup; suite went from 13/28 → 28/28 passing | [`c6a917a`](https://github.com/heysoos/particle-halflife/commit/c6a917a) |
+| Velocity clamp ordering quirk ([Energy bookkeeping](#energy-bookkeeping-and-a-subtle-ordering-issue) — flagged that soft conservation rescales after the clamp) | ✓ Added a final magnitude-based clamp at the end of `simulation_step`, after fission kicks and soft conservation | [`ddce9fa`](https://github.com/heysoos/particle-halflife/commit/ddce9fa) |
+
+### New findings (surfaced once the test suite ran)
+
+| Finding | Detail | Commit |
+|---|---|---|
+| **Velocity clamp was per-component, not magnitude** | `jnp.clip(v, -V, V)` allowed diagonal motion to reach `\|v\| = √2 · max_velocity` — observed up to 11.26 with `max_velocity=8.0`. Replaced with vector-rescale form `v · min(1, V / \|v\|)` at both phase 4 and the new end-of-step clamp. | [`ddce9fa`](https://github.com/heysoos/particle-halflife/commit/ddce9fa) |
+| **JAX `at[safe_pids].set(...)` duplicate-index race on particle 0** | Three call sites in fusion (`assign_i_member`, `assign_j_member`) and decay (`apply_composite_decay`) used `safe_pids = jnp.where(valid, pids, 0)` as the fallback for invalid entries, then read back `composite_id[0]` as the value. JAX scatters with duplicate indices have indeterminate behavior, so M−1 invalid slots writing the read-back value to index 0 raced against any real write to particle 0 with a different value. **Particle 0 was uniquely vulnerable** because every invalid lookup defaulted to 0; matched the test failure pattern (4 alive composites all claiming `member[0]=0` with `composite_id[0]=−1`). Fix: route invalid entries to OOB index `N` and use `mode='drop'`. Working precedent for this pattern was already in [`chemistry.py:481-483`](../halflife/chemistry.py#L481-L483) (the merged-members compaction) — just hadn't been applied to the composite_id writes. | [`ddce9fa`](https://github.com/heysoos/particle-halflife/commit/ddce9fa) |
+
+### Still open (deliberately deferred)
+
+- **`total_energy` storage is the pre-correction snapshot** ([Energy bookkeeping](#energy-bookkeeping-and-a-subtle-ordering-issue)) — not fixed. The end-of-step velocity clamp added in [`ddce9fa`](https://github.com/heysoos/particle-halflife/commit/ddce9fa) partially mitigates the consequence (velocities don't drift unboundedly anymore) but the recorded `total_energy` is still pre-correction.
+- **Min-image displacement duplicated in 4 places** ([nub](#nubs)) — `pairwise_displacement` was commented out in [`98abb0f`](https://github.com/heysoos/particle-halflife/commit/98abb0f) rather than adopted; revival is the path to dedup.
+- **`find_neighbors_for_particle.pack_slot` complexity** ([nub](#nubs)) — untouched.
+- **Rep-only fusion rule at higher densities** ([nub](#nubs)) — untouched.
+
+### Adjacent change (UI, not physics)
+
+- Slider panel reorganization: `×` suffixes dropped, sliders grouped by relevance with visual gaps, full-track click target instead of pixel-precise on the knob. [`196ba55`](https://github.com/heysoos/particle-halflife/commit/196ba55).
+
 ## The simulation step (9 phases)
 
-[halflife/step.py:151–226](halflife/step.py#L151) — a single JIT'd function. `config` is `static_argnums=(2,)`, everything else is dynamic.
+[halflife/step.py:151–226](../halflife/step.py#L151) — a single JIT'd function. `config` is `static_argnums=(2,)`, everything else is dynamic.
 
-1. **Build cell list** — particles → grid, [halflife/spatial.py:51](halflife/spatial.py#L51)
-2. **Find neighbors** — for each particle, scan 3×3 cell window, [halflife/spatial.py:208](halflife/spatial.py#L208)
-3. **Compute forces** — Particle-Life kernel + polarity scaling, [halflife/interactions.py:167](halflife/interactions.py#L167); optional bond forces from [halflife/step.py:48](halflife/step.py#L48)
-4. **Integration** — explicit Euler: `v += (F/m)·dt; v *= damping; v = clip(v, ±max_velocity); x += v·dt`. [halflife/step.py:192](halflife/step.py#L192)
-5. **Boundaries** — periodic wrap or reflective bounce, [halflife/utils.py:129](halflife/utils.py#L129)
-6. **Fusion** — unified entity-entity, [halflife/chemistry.py:233](halflife/chemistry.py#L233)
-7. **Composite decay (fission)** — stochastic per composite, [halflife/chemistry.py:125](halflife/chemistry.py#L125)
-8. **Energy accounting** — recompute totals + soft correction, [halflife/energy.py](halflife/energy.py)
+1. **Build cell list** — particles → grid, [halflife/spatial.py:51](../halflife/spatial.py#L51)
+2. **Find neighbors** — for each particle, scan 3×3 cell window, [halflife/spatial.py:208](../halflife/spatial.py#L208)
+3. **Compute forces** — Particle-Life kernel + polarity scaling, [halflife/interactions.py:167](../halflife/interactions.py#L167); optional bond forces from [halflife/step.py:48](../halflife/step.py#L48)
+4. **Integration** — explicit Euler: `v += (F/m)·dt; v *= damping; v = clip(v, ±max_velocity); x += v·dt`. [halflife/step.py:192](../halflife/step.py#L192)
+5. **Boundaries** — periodic wrap or reflective bounce, [halflife/utils.py:129](../halflife/utils.py#L129)
+6. **Fusion** — unified entity-entity, [halflife/chemistry.py:233](../halflife/chemistry.py#L233)
+7. **Composite decay (fission)** — stochastic per composite, [halflife/chemistry.py:125](../halflife/chemistry.py#L125)
+8. **Energy accounting** — recompute totals + soft correction, [halflife/energy.py](../halflife/energy.py)
 9. **Increment ages and counters**
 
 Note on phase 8 ordering: `current_energy` is computed *before* the soft correction is applied, but it's the value stored as `state.total_energy`. The correction targets the *previous* step's total. See [Energy bookkeeping](#energy-bookkeeping-and-a-subtle-ordering-issue) below.
 
 ## State model
 
-Three NamedTuples in [halflife/state.py](halflife/state.py):
+Three NamedTuples in [halflife/state.py](../halflife/state.py):
 
 - **`ParticleState`** (N=2000): position, velocity, species, energy, mass, age, composite_id. **No `alive` mask** — every slot is always "alive" since `b0c049f`.
 - **`CompositeState`** (C=5000): members `(C, M=64)`, member_count, alive, binding_energy, half_life, age, species_hash, net_polarity. M=64 is a JAX buffer constraint, not a physics cap (per the design philosophy memory).
@@ -48,14 +83,14 @@ Three NamedTuples in [halflife/state.py](halflife/state.py):
 
 Two parameter bundles passed separately (so they're not part of `static_argnums` — slider changes don't recompile):
 
-- **`InteractionParams`**: per-species-pair `attraction[S,S]`, `r_attract[S,S]`, `r_cutoff[S,S]`, plus per-species `polarity[S]`. Random-initialized (seed 42).
+- **`InteractionParams`**: per-species-pair `attraction[S,S]`, `r_attract[S,S]`, `r_cutoff[S,S]`, plus per-species `polarity[S]`. Random-initialized (seed 42). ✓ *Updated 2026-05-06 in [`333df85`](https://github.com/heysoos/particle-halflife/commit/333df85): `r_attract`/`r_cutoff` replaced with fractional `peak_fraction[S,S]` and `cutoff_fraction[S,S]` (kernel multiplies them by `interaction_radius`).*
 - **`PhysicsParams`**: 10 runtime-tunable scalars (damping, repulsion_strength, fusion_threshold, polarity_*_scale, binding_energy_scale, repulsion_radius, r_cutoff_scale, spring_k, attraction_scale).
 
 A particle's composite membership is *only* the `composite_id` field on `ParticleState` (-1 = free). The composite's `members` array is the redundant reverse mapping. **Both must stay in sync** during fusion and fission.
 
 ## Force model — Particle Life kernel + polarity + bonds
 
-### The kernel ([halflife/interactions.py:31](halflife/interactions.py#L31))
+### The kernel ([halflife/interactions.py:31](../halflife/interactions.py#L31))
 
 Three regions, function of distance `r` between species `(si, sj)`:
 
@@ -69,23 +104,25 @@ Sign convention: positive → attractive (toward `j`), negative → repulsive. F
 
 **Note:** the per-species `r_attract[si,sj]` is sampled at init *but is not used in the actual kernel* — `peak` is computed solely from `r_repulse` and `r_cutoff`. That's a config-vs-implementation gap worth flagging. Effectively the peak position is uniform across all species pairs; only the *amplitude* (`attraction[si,sj]`) varies. (See [Nubs](#nubs).)
 
-### Polarity scaling ([halflife/step.py:175–184](halflife/step.py#L175))
+> ✓ **Resolved 2026-05-06 in [`333df85`](https://github.com/heysoos/particle-halflife/commit/333df85).** Kernel now uses an asymmetric two-segment triangle with `r_peak = interaction_radius * peak_fraction[i,j]` and `r_cutoff = interaction_radius * cutoff_fraction[i,j]`. Both halves of the triangle can have different widths (no longer fixed midpoint). Per-pair force-shape is real now, not just amplitude.
+
+### Polarity scaling ([halflife/step.py:175–184](../halflife/step.py#L175))
 
 Each particle gets an `attr_mod`:
 - Free particle: `attr_mod = 1.0`
 - Composite member: `attr_mod = composite.net_polarity` (mean polarity of members at formation)
 
-Effective attraction between i and j: `aij · attr_mod_i · attr_mod_j · attraction_scale` ([halflife/interactions.py:116](halflife/interactions.py#L116)). Result: a balanced (net_polarity ≈ 0) composite is **inert** — its members exert near-zero attraction on anything else. Polarized composites stay reactive.
+Effective attraction between i and j: `aij · attr_mod_i · attr_mod_j · attraction_scale` ([halflife/interactions.py:116](../halflife/interactions.py#L116)). Result: a balanced (net_polarity ≈ 0) composite is **inert** — its members exert near-zero attraction on anything else. Polarized composites stay reactive.
 
 The repulsive core is **not** scaled by polarity — it's a global hard core. So even inert composites still repel each other at close range.
 
-### Bond forces ([halflife/step.py:48](halflife/step.py#L48))
+### Bond forces ([halflife/step.py:48](../halflife/step.py#L48))
 
 Optional, on by default (`use_bond_forces=True`). Each composite member is pulled toward the composite's center of mass (computed using min-image displacement so periodic-boundary composites don't tear apart) with `F = spring_k · (com − pos)`. Cost is O(C·M), no all-pairs. `spring_k=50.0` (in `PhysicsParams`, runtime-tunable).
 
 ## Hash chemistry as actually implemented
 
-The current implementation does **not** use the polynomial-rolling `hash_multiset` from [halflife/utils.py:18](halflife/utils.py#L18). That function is dead code (see [Dead code findings](#dead-code-findings)). The live path is a **commutative additive hash**:
+The current implementation does **not** use the polynomial-rolling `hash_multiset` from [halflife/utils.py:18](../halflife/utils.py#L18). That function is dead code (see [Dead code findings](#dead-code-findings)). The live path is a **commutative additive hash**:
 
 ```
 entity_hash_val(s) = ((s+1)² · prime_a + (s+1) · prime_b) % modulus
@@ -93,9 +130,9 @@ H(entity) = sum(entity_hash_val(s) for s in members) % modulus
 H(i ∪ j) = (H(i) + H(j)) % modulus     ← single addition, no sort, no scan
 ```
 
-Defined at [halflife/chemistry.py:41–74](halflife/chemistry.py#L41). The commutative form is a perf win (commit `086e9e1`): merging two entities is O(1) instead of O(M log M).
+Defined at [halflife/chemistry.py:41–74](../halflife/chemistry.py#L41). The commutative form is a perf win (commit `086e9e1`): merging two entities is O(1) instead of O(M log M).
 
-### From hash to binding energy ([halflife/chemistry.py:86](halflife/chemistry.py#L86))
+### From hash to binding energy ([halflife/chemistry.py:86](../halflife/chemistry.py#L86))
 
 ```python
 h2 = (h * 2_654_435_761) ^ (h >> 13)        # Fibonacci hash mix
@@ -106,7 +143,7 @@ The Fibonacci mix is a bug fix (in-line comment): the additive `entity_hash_val`
 
 ### From hash to half-life
 
-**Not used in production.** [halflife/chemistry.py:77](halflife/chemistry.py#L77) `_hash_to_half_life` exists, but the actual fusion path computes half-life from binding energy directly:
+**Not used in production.** [halflife/chemistry.py:77](../halflife/chemistry.py#L77) `_hash_to_half_life` exists, but the actual fusion path computes half-life from binding energy directly:
 
 ```python
 t = clip((BE − fusion_threshold) / (1 − fusion_threshold), 0, 1)
@@ -116,11 +153,11 @@ hl = hl_base / size_penalty
 hl_eff = hl · (1 + polarity_stability_scale · (1 − |net_polarity|))   # neutral → boost
 ```
 
-[halflife/chemistry.py:436–458](halflife/chemistry.py#L436). So the design got reshaped: BE drives stability, not the species multiset directly. The hash still influences BE, so via that chain the species set still matters — but the mapping is now `species → BE → half-life` rather than `species → half-life` independently.
+[halflife/chemistry.py:436–458](../halflife/chemistry.py#L436). So the design got reshaped: BE drives stability, not the species multiset directly. The hash still influences BE, so via that chain the species set still matters — but the mapping is now `species → BE → half-life` rather than `species → half-life` independently.
 
 ## Fusion mechanics
 
-[halflife/chemistry.py:233](halflife/chemistry.py#L233). The **single most subtle module** in the codebase.
+[halflife/chemistry.py:233](../halflife/chemistry.py#L233). The **single most subtle module** in the codebase.
 
 ### The "representative" trick
 
@@ -128,31 +165,31 @@ Each entity (free particle or composite) is identified by a single particle, its
 - Free particle: itself
 - Composite: `members[c, 0]` — the first member, fixed at composition time
 
-Only representatives participate in the fusion scan ([halflife/chemistry.py:286](halflife/chemistry.py#L286), `i_is_rep` gate). This avoids double-counting (an N-member composite would otherwise contribute N candidates).
+Only representatives participate in the fusion scan ([halflife/chemistry.py:286](../halflife/chemistry.py#L286), `i_is_rep` gate). This avoids double-counting (an N-member composite would otherwise contribute N candidates).
 
 Implication worth flagging: **only the representative's local neighborhood drives fusion**. If the rep ends up surrounded by other composite members, free particles approaching from outside have to reach the rep specifically.
 
 ### Per-step fusion loop
 
 1. **Compute candidates in parallel** (`find_entity_partner`, vmapped over all reps): for each rep, scan its neighbor list, compute `merged_h`, `BE_eff = BE + polarity_fusion_scale·(−p_i·p_j)`, and pick the neighbor with highest BE that exceeds `fusion_threshold` and is within `fusion_radius`. Returns one candidate per rep.
-2. **Sample at most `max_fusions_per_step` candidates** ([halflife/chemistry.py:369–389](halflife/chemistry.py#L369)) using a *random* shuffle (not lowest-index priority — explicitly noted in code; the alternative biased version is left in a comment).
-3. **Conflict resolution** via `jax.lax.scan` ([halflife/chemistry.py:394](halflife/chemistry.py#L394), `fusion_scan_body`). Each candidate is processed sequentially, with a `claimed` mask preventing double-fusion in one step. Four cases handled in one branch via nested `jnp.where`:
+2. **Sample at most `max_fusions_per_step` candidates** ([halflife/chemistry.py:369–389](../halflife/chemistry.py#L369)) using a *random* shuffle (not lowest-index priority — explicitly noted in code; the alternative biased version is left in a comment).
+3. **Conflict resolution** via `jax.lax.scan` ([halflife/chemistry.py:394](../halflife/chemistry.py#L394), `fusion_scan_body`). Each candidate is processed sequentially, with a `claimed` mask preventing double-fusion in one step. Four cases handled in one branch via nested `jnp.where`:
     - free + free → new composite slot (consumes from `free_comp_slots` pre-computed pool)
     - free + composite → grow `cj`, target = `cj`
     - composite + free → grow `ci`, target = `ci`
     - composite + composite → merge into `min(ci, cj)`, mark `max(ci, cj)` dead
-4. **Member compaction**: concat `i_members ∥ j_members` (size 2M=128), cumsum to compact valid IDs to the front, drop overflow. [halflife/chemistry.py:473–483](halflife/chemistry.py#L473).
+4. **Member compaction**: concat `i_members ∥ j_members` (size 2M=128), cumsum to compact valid IDs to the front, drop overflow. [halflife/chemistry.py:473–483](../halflife/chemistry.py#L473).
 5. **Sync** `composite_id` for every member of both sides to point at the new target.
 
-The `would_overflow = (cnt_i + cnt_j) > M` check ([halflife/chemistry.py:333](halflife/chemistry.py#L333)) prevents fusions that would exceed buffer size M=64. With current dynamics composites max around 8, so M is not the cap.
+The `would_overflow = (cnt_i + cnt_j) > M` check ([halflife/chemistry.py:333](../halflife/chemistry.py#L333)) prevents fusions that would exceed buffer size M=64. With current dynamics composites max around 8, so M is not the cap.
 
 ### Performance note
 
-Fusion is **55% of step time** per [tests/README_PERFORMANCE.md](tests/README_PERFORMANCE.md). The scan over `max_fusions_per_step=200` candidates is the dominant cost.
+Fusion is **55% of step time** per [tests/README_PERFORMANCE.md](../tests/README_PERFORMANCE.md). The scan over `max_fusions_per_step=200` candidates is the dominant cost.
 
 ## Decay and fission
 
-[halflife/chemistry.py:125](halflife/chemistry.py#L125). Composites only — **free particles never decay**.
+[halflife/chemistry.py:125](../halflife/chemistry.py#L125). Composites only — **free particles never decay**.
 
 Per step, each alive composite `c`:
 - `P(decay) = 1 − exp(−dt · ln 2 / half_life)`
@@ -166,7 +203,7 @@ So `fission_cost` (=0.5) means **half the binding energy is dissipated** as the 
 
 ## Energy bookkeeping (and a subtle ordering issue)
 
-[halflife/energy.py](halflife/energy.py) defines:
+[halflife/energy.py](../halflife/energy.py) defines:
 - `KE = Σ 0.5 · m · |v|²`
 - `BE = Σ binding_energy · alive` (treated as a stored potential)
 - `total = KE + BE`
@@ -175,7 +212,7 @@ The soft correction scales velocities by `√(target_KE / current_KE)`, clamped 
 
 ### The ordering quirk
 
-In [halflife/step.py:210–223](halflife/step.py#L210):
+In [halflife/step.py:210–223](../halflife/step.py#L210):
 
 ```python
 current_energy = compute_total_energy(state)              # snapshot
@@ -190,9 +227,11 @@ So:
 
 Effect: total energy walks slowly because the recorded "target" is always the pre-correction state, but the velocities have already been nudged. Over many steps the system tracks toward whatever balance the chemistry phases produce. Not necessarily wrong (the design is "soft" conservation, not strict), but worth being aware that **the recorded `total_energy` is not literally the energy of the state being returned**. If anything in the future tries to use `total_energy` for a precise energy-balance calculation, it'll be off by the correction amount.
 
+> ⚠ **Partially resolved 2026-05-06 in [`ddce9fa`](https://github.com/heysoos/particle-halflife/commit/ddce9fa).** A separate consequence of this ordering — that the soft conservation could compound velocities back over `max_velocity` (~1% per step → ~21× over 100 steps) — was fixed by adding a final magnitude-based velocity clamp at end-of-step. The recorded `total_energy` is still pre-correction, so any precise energy-balance calculation downstream is still affected. Also note: the phase-4 velocity clamp was changed from per-component (`jnp.clip(v, -V, V)`) to magnitude-based (`v · min(1, V/|v|)`) since the per-component form let diagonal motion reach `|v| = √2 · V`.
+
 ## Boundaries
 
-[halflife/utils.py:84–141](halflife/utils.py#L84). Two modes, set at config:
+[halflife/utils.py:84–141](../halflife/utils.py#L84). Two modes, set at config:
 - **Periodic** (default) — `pos % world_size`, plus minimum-image displacement in force/fusion/bond computations.
 - **Reflective** — flip position and velocity sign at walls.
 
@@ -200,18 +239,18 @@ The min-image convention is duplicated **four times** across the code: `pairwise
 
 ## Dead code findings
 
-The chemistry module shows clear evolutionary scarring — earlier designs that got replaced but the old code is still around:
+The chemistry module shows clear evolutionary scarring — earlier designs that got replaced but the old code is still around. **All six items below were commented out (with revival banners) in [`98abb0f`](https://github.com/heysoos/particle-halflife/commit/98abb0f) on 2026-05-06 — line numbers preserved for historical reference.**
 
 | Dead symbol | Location | Replaced by |
 |---|---|---|
-| `hash_multiset` (polynomial rolling hash) | [halflife/utils.py:18](halflife/utils.py#L18) | `_entity_hash_val` + commutative sum at [halflife/chemistry.py:41](halflife/chemistry.py#L41) |
-| `hash_scalar` | [halflife/utils.py:49](halflife/utils.py#L49) | `_entity_hash_val` |
-| `_hash_to_half_life` | [halflife/chemistry.py:77](halflife/chemistry.py#L77) | BE-based formula in `fusion_scan_body` |
-| `_hash_to_decay_products` | [halflife/chemistry.py:97](halflife/chemistry.py#L97) | Nothing — current decay just releases existing members, no transmutation |
-| `composite_half_life_scale` (config knob) | [halflife/config.py:64](halflife/config.py#L64) | Only used by dead `_hash_to_half_life` and tests |
-| `max_decay_products` (config knob) | [halflife/config.py:84](halflife/config.py#L84) | Only used by dead `_hash_to_decay_products` |
+| ✓ `hash_multiset` (polynomial rolling hash) | [halflife/utils.py:18](../halflife/utils.py#L18) | `_entity_hash_val` + commutative sum at [halflife/chemistry.py:41](../halflife/chemistry.py#L41) |
+| ✓ `hash_scalar` | [halflife/utils.py:49](../halflife/utils.py#L49) | `_entity_hash_val` |
+| ✓ `_hash_to_half_life` | [halflife/chemistry.py:77](../halflife/chemistry.py#L77) | BE-based formula in `fusion_scan_body` |
+| ✓ `_hash_to_decay_products` | [halflife/chemistry.py:97](../halflife/chemistry.py#L97) | Nothing — current decay just releases existing members, no transmutation |
+| ✓ `composite_half_life_scale` (config knob) | [halflife/config.py:64](../halflife/config.py#L64) | Only used by dead `_hash_to_half_life` and tests |
+| ✓ `max_decay_products` (config knob) | [halflife/config.py:84](../halflife/config.py#L84) | Only used by dead `_hash_to_decay_products` |
 
-The dead `_hash_to_*` functions are still **unit-tested** in `tests/test_hash.py` and `tests/test_chemistry.py`. Tests pass on dead code; this is a **false signal** that the chemistry is "covered."
+The dead `_hash_to_*` functions are still **unit-tested** in `tests/test_hash.py` and `tests/test_chemistry.py`. Tests pass on dead code; this is a **false signal** that the chemistry is "covered." ✓ *Resolved 2026-05-06 in [`98abb0f`](https://github.com/heysoos/particle-halflife/commit/98abb0f) — `test_half_life_distribution` commented out, `composite_half_life_scale` references in `test_chemistry.py` adjusted.*
 
 Earlier-design implication: the system was originally going to derive *both* half-life and decay product species from the hash (true Sayama-style hash chemistry). It pivoted to BE-driven half-life and no transmutation. That pivot has design consequences worth noting:
 
@@ -259,15 +298,20 @@ Combining the audit with the experiments:
 - **Size-decay penalty** (`composite_size_decay_scale=0.05`) means anything bigger than 2 is half-life-penalized. With BE-driven `hl_base` already capped at `half_life_max=500` and a size penalty, larger composites are increasingly unlikely to survive long enough to absorb more.
 
 The interesting next moves:
-1. Run with `composite_size_decay_scale=0.0` and see if the plateau lifts. The existing sweep covers this — read [tests/reports/composite_statistics_20260327_211754.html](tests/reports/composite_statistics_20260327_211754.html) before re-running.
+1. Run with `composite_size_decay_scale=0.0` and see if the plateau lifts. The existing sweep covers this — read [tests/reports/composite_statistics_20260327_211754.html](../tests/reports/composite_statistics_20260327_211754.html) before re-running.
 2. Test whether *polarized* composites (large `|net_polarity|`) preferentially grow vs balanced ones — confirms the "neutralization-as-inertness" mechanism is the real sink.
 3. Consider whether the design intent was for inert composites to be the goal (autopoiesis-like steady states) or if growth is the goal (autocatalysis). These pull in opposite directions.
 
 ## Nubs
 
-- ?? `r_attract[si, sj]` is initialized but **not used by the kernel** — the peak position is computed from `r_repulse` and `r_cutoff` only ([halflife/interactions.py:66–67](halflife/interactions.py#L66-L67)). Either the kernel intent is wrong (should use `r_attract` for peak) or `r_attract` should be deleted. Worth deciding.
-- ?? Dead chemistry functions (`hash_multiset`, `_hash_to_half_life`, `_hash_to_decay_products`) still have passing unit tests. Decide: delete dead code + tests, or revive the older design (transmutation on decay would be a significant qualitative addition).
-- ?? `total_energy` storage is the *pre-correction* snapshot; the +/-1% velocity rescale isn't reflected. Document or fix if anything uses `total_energy` for a precise balance.
-- ?? Min-image displacement is duplicated in 4 places. Consider extracting `pairwise_displacement` into the hot paths instead of inlining.
-- ?? `find_neighbors_for_particle.pack_slot` is O(max_neighbors × max_candidates) per particle — flagged in [PLAN.md](PLAN.md) but not yet addressed. Could simplify to O(N · K) with a cumsum compaction (same trick used for member merging in fusion).
+- ✓ ~~`r_attract[si, sj]` is initialized but **not used by the kernel** — the peak position is computed from `r_repulse` and `r_cutoff` only ([halflife/interactions.py:66–67](../halflife/interactions.py#L66-L67)). Either the kernel intent is wrong (should use `r_attract` for peak) or `r_attract` should be deleted. Worth deciding.~~ **Resolved 2026-05-06 in [`333df85`](https://github.com/heysoos/particle-halflife/commit/333df85): replaced with fractional `peak_fraction[S,S]` and `cutoff_fraction[S,S]`; kernel now actually uses them.**
+- ✓ ~~Dead chemistry functions (`hash_multiset`, `_hash_to_half_life`, `_hash_to_decay_products`) still have passing unit tests. Decide: delete dead code + tests, or revive the older design (transmutation on decay would be a significant qualitative addition).~~ **Resolved 2026-05-06 in [`98abb0f`](https://github.com/heysoos/particle-halflife/commit/98abb0f): commented out with revival banners (chose "preserve for revival" over delete since transmutation may be revived to break the size plateau). Tests for dead code commented alongside.**
+- ⚠ `total_energy` storage is the *pre-correction* snapshot; the +/-1% velocity rescale isn't reflected. Document or fix if anything uses `total_energy` for a precise balance. **Partially mitigated 2026-05-06 in [`ddce9fa`](https://github.com/heysoos/particle-halflife/commit/ddce9fa): end-of-step magnitude clamp prevents the velocity-compounding consequence. The bookkeeping itself is unchanged.**
+- ?? Min-image displacement is duplicated in 4 places. Consider extracting `pairwise_displacement` into the hot paths instead of inlining. **Note 2026-05-06: `pairwise_displacement` was commented out in [`98abb0f`](https://github.com/heysoos/particle-halflife/commit/98abb0f) since it had zero callers; revival is the path to dedup.**
+- ?? `find_neighbors_for_particle.pack_slot` is O(max_neighbors × max_candidates) per particle — flagged in [PLAN.md](../PLAN.md) but not yet addressed. Could simplify to O(N · K) with a cumsum compaction (same trick used for member merging in fusion).
 - ?? Experiment idea — does the rep-only fusion rule become important at higher densities? Re-run the spatial access experiment with `num_particles` doubled.
+
+### Nubs added 2026-05-06
+
+- ?? **JAX `at[].set()` duplicate-index pattern** is now a known footgun. Three sites used `safe_pids = where(valid, pids, 0)` with `mode='drop'`-less scatter, allowing M−1 invalid writes to race against any real write to particle 0. Worth a one-time grep across the codebase to make sure no other call site has the same shape (look for `jnp.where(..., ..., 0)` immediately followed by `.at[...].set(...)`).
+- ?? **Velocity clamp semantics** are now magnitude-based, not per-component. If anywhere else uses `jnp.clip(velocity, -V, V)` directly (e.g., a future debugging probe), it'll silently re-introduce the diagonal-motion sqrt-2 issue.
