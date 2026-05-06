@@ -241,8 +241,11 @@ class Slider:
                             self._reset_rect.centery - lbl.get_height() // 2))
 
     def hit_handle(self, pos) -> bool:
-        hx = self._handle_x()
-        return abs(pos[0] - hx) <= 8 and abs(pos[1] - self._track_rect.centery) <= 10
+        # Whole track is draggable, not just the knob — clicking anywhere on
+        # the bar grabs the slider and snaps the knob to that x.
+        r = self._track_rect
+        return (r.left <= pos[0] <= r.right and
+                abs(pos[1] - r.centery) <= 10)
 
     def handle_drag(self, pos) -> float:
         r = self._track_rect
@@ -388,24 +391,39 @@ class Renderer:
         # First slider starts just below the "Params" button (now index 4, 5 buttons total)
         slider_start_y = 8 + 5 * (btn_h + gap) + 8  # 8px below bottom of Params btn
         slider_row_h = 38
+        # Slider specs grouped by relevance. None entries mark group breaks
+        # and add an extra gap between groups (no slider drawn for None).
         slider_specs = [
+            # \u2500\u2500 Force kernel shape \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
             # (field, label, default, fmt, linear_range or None)
-            ("damping",                  "damping",     0.995, "{:.4f}", (0.0, 1.0)),
             ("repulsion_strength",       "repulsion",   2.0,   "{:.2f}", None),
+            ("repulsion_radius",         "repulse r",   0.8,   "{:.2f}", None),
+            ("attraction_scale",         "attract",     1.0,   "{:.2f}", None),
+            ("r_cutoff_scale",           "attract r",   1.0,   "{:.2f}", None),
+            None,
+            # \u2500\u2500 Fusion chemistry \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
             ("fusion_threshold",         "fuse thresh", 0.2,   "{:.3f}", None),
+            ("binding_energy_scale",     "bind energy", 1.0,   "{:.3f}", None),
             ("polarity_fusion_scale",    "pol fuse",    0.3,   "{:.3f}", None),
             ("polarity_stability_scale", "pol stab",    0.5,   "{:.3f}", None),
-            ("binding_energy_scale",     "bind energy", 1.0,   "{:.3f}", None),
-            ("repulsion_radius",         "repulse r",   0.8,   "{:.2f}", None),
-            ("r_cutoff_scale",           "attract r\u00d7",  1.0,   "{:.2f}", None),
+            None,
+            # \u2500\u2500 Particle dynamics \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+            ("damping",                  "damping",     0.995, "{:.4f}", (0.0, 1.0)),
             ("spring_k",                 "spring k",    50.0,  "{:.1f}", None),
-            ("attraction_scale",         "attract \u00d7",   1.0,   "{:.2f}", None),
         ]
+        group_gap = 14  # extra pixels inserted at each None sentinel
         self._sliders = []
-        for k, (field, label, default, fmt, lin) in enumerate(slider_specs):
-            row_y = slider_start_y + k * slider_row_h
+        row_y = slider_start_y
+        for spec in slider_specs:
+            if spec is None:
+                row_y += group_gap
+                continue
+            field, label, default, fmt, lin = spec
             track = pygame.Rect(panel_x + 4, row_y + 18, slider_track_w, 8)
             self._sliders.append(Slider(label, field, default, track, fmt, linear_range=lin))
+            row_y += slider_row_h
+        # Total content height (last row's bottom relative to slider_start_y).
+        self._slider_content_h = row_y - slider_start_y
         self._params_reset_rect = pygame.Rect(panel_x + 4, slider_start_y - 26, 100, 20)
 
         # ── Runtime state ─────────────────────────────────────────────────────
@@ -956,7 +974,7 @@ class Renderer:
             panel_x = 8 + btn_w + 8   # right of the button strip
             slider_start_y = 8 + 5 * (btn_h + gap) + 8   # 5 buttons now
             panel_w = 244   # track(200) + gap(4) + reset-btn(14) + margins
-            panel_h = len(self._sliders) * 38 + 10 + 26
+            panel_h = self._slider_content_h + 10 + 26
             panel_rect = pygame.Rect(panel_x - 4, slider_start_y - 30, panel_w, panel_h)
             pygame.draw.rect(surface, (15, 18, 35, 185), panel_rect, border_radius=6)
             pygame.draw.rect(surface, (70, 100, 150, 180), panel_rect, 1, border_radius=6)
