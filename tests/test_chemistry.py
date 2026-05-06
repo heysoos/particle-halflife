@@ -21,7 +21,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from halflife.config import SimConfig
-from halflife.state import initialize_world, initialize_interaction_params
+from halflife.state import (
+    initialize_world,
+    initialize_interaction_params,
+    initialize_physics_params,
+)
 from halflife.step import simulation_step
 
 # JIT-compiled step (compiled once per config, cached)
@@ -29,6 +33,7 @@ _step_jit = jax.jit(simulation_step, static_argnums=(2,))
 
 _config = SimConfig()
 _params = initialize_interaction_params(_config, seed=42)
+_physics = initialize_physics_params(_config)
 
 
 @functools.lru_cache(maxsize=None)
@@ -41,12 +46,13 @@ def _run_steps(n: int, config=_config, seed=0):
     """Run n steps from a fresh initial state, return final state."""
     state = initialize_world(config, seed=seed)
     params = initialize_interaction_params(config, seed=42)
+    physics = initialize_physics_params(config)
     step_fn = jax.jit(simulation_step, static_argnums=(2,))
     # Warm-up JIT on first call
-    state = step_fn(state, params, config)
+    state = step_fn(state, params, config, physics)
     state.particles.position.block_until_ready()
     for _ in range(n - 1):
-        state = step_fn(state, params, config)
+        state = step_fn(state, params, config, physics)
     state.particles.position.block_until_ready()
     return state
 
@@ -73,7 +79,7 @@ def test_fusion_occurs():
                 hi = int(_entity_hash_val(jnp.int32(i), _config))
                 hj = int(_entity_hash_val(jnp.int32(j), _config))
                 merged = (hi + hj) % _config.hash_modulus
-                matrix[i, j] = float(_hash_to_binding_energy(jnp.uint32(merged), _config))
+                matrix[i, j] = float(_hash_to_binding_energy(jnp.uint32(merged), _config, _physics))
         print(np.array2string(matrix, precision=3, suppress_small=True))
         print(f"All BEs are zero: {np.allclose(matrix, 0)}")
         print(f"fusion_threshold={_config.fusion_threshold}")
@@ -93,17 +99,18 @@ def test_fusion_count_grows():
     config = _config
     state = initialize_world(config, seed=1)
     params = initialize_interaction_params(config, seed=42)
+    physics = initialize_physics_params(config)
     step_fn = jax.jit(simulation_step, static_argnums=(2,))
 
     # Warm up
-    state = step_fn(state, params, config)
+    state = step_fn(state, params, config, physics)
     state.particles.position.block_until_ready()
 
     cumulative_fusions = 0
     prev_n_comp = int(jnp.sum(state.composites.alive.astype(jnp.int32)))
 
     for step in range(499):
-        state = step_fn(state, params, config)
+        state = step_fn(state, params, config, physics)
         n_comp = int(jnp.sum(state.composites.alive.astype(jnp.int32)))
         delta = max(0, n_comp - prev_n_comp)
         cumulative_fusions += delta
@@ -161,17 +168,18 @@ def test_decay_occurs():
     )
     state = initialize_world(config, seed=2)
     params = initialize_interaction_params(config, seed=42)
+    physics = initialize_physics_params(config)
     step_fn = jax.jit(simulation_step, static_argnums=(2,))
 
     # Warm up
-    state = step_fn(state, params, config)
+    state = step_fn(state, params, config, physics)
     state.particles.position.block_until_ready()
 
     max_composites_seen = 0
     fission_observed = False
 
     for _ in range(500):
-        state = step_fn(state, params, config)
+        state = step_fn(state, params, config, physics)
         n = int(jnp.sum(state.composites.alive.astype(jnp.int32)))
         if n > max_composites_seen:
             max_composites_seen = n
@@ -199,13 +207,14 @@ def test_no_particle_loss():
     config = _config
     state = initialize_world(config, seed=3)
     params = initialize_interaction_params(config, seed=42)
+    physics = initialize_physics_params(config)
     step_fn = jax.jit(simulation_step, static_argnums=(2,))
-    state = step_fn(state, params, config)
+    state = step_fn(state, params, config, physics)
     state.particles.position.block_until_ready()
 
     expected = config.num_particles
     for _ in range(299):
-        state = step_fn(state, params, config)
+        state = step_fn(state, params, config, physics)
     actual = state.particles.position.shape[0]
 
     print(f"\nParticle count: expected={expected}, actual={actual} (fixed)")

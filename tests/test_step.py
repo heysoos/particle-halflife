@@ -21,12 +21,17 @@ import jax.numpy as jnp
 import numpy as np
 
 from halflife.config import SimConfig
-from halflife.state import initialize_world, initialize_interaction_params
+from halflife.state import (
+    initialize_world,
+    initialize_interaction_params,
+    initialize_physics_params,
+)
 from halflife.step import simulation_step
 from halflife.energy import compute_total_energy
 
 _config = SimConfig()
 _params = initialize_interaction_params(_config, seed=42)
+_physics = initialize_physics_params(_config)
 _step_jit = jax.jit(simulation_step, static_argnums=(2,))
 
 
@@ -35,11 +40,12 @@ def _run_cached(n_steps: int, seed: int = 0):
     """Run n_steps from seed, cache result (JIT warm-up included)."""
     config = _config
     params = _params
+    physics = _physics
     state = initialize_world(config, seed=seed)
-    state = _step_jit(state, params, config)
+    state = _step_jit(state, params, config, physics)
     state.particles.position.block_until_ready()
     for _ in range(n_steps - 1):
-        state = _step_jit(state, params, config)
+        state = _step_jit(state, params, config, physics)
     state.particles.position.block_until_ready()
     return state
 
@@ -114,11 +120,12 @@ def test_energy_bounded():
     """
     config = _config
     params = _params
+    physics = _physics
     state = initialize_world(config, seed=0)
     step_fn = _step_jit
 
     # Warm up JIT
-    state = step_fn(state, params, config)
+    state = step_fn(state, params, config, physics)
     state.particles.position.block_until_ready()
     initial_energy = float(compute_total_energy(state))
 
@@ -127,7 +134,7 @@ def test_energy_bounded():
         return
 
     for _ in range(199):
-        state = step_fn(state, params, config)
+        state = step_fn(state, params, config, physics)
 
     final_energy = float(compute_total_energy(state))
     ratio = final_energy / (initial_energy + 1e-8)
@@ -149,15 +156,16 @@ def test_step_count_increments():
     """step_count must increase by exactly 1 per call."""
     config = _config
     params = _params
+    physics = _physics
     state = initialize_world(config, seed=5)
     step_fn = _step_jit
 
-    state = step_fn(state, params, config)
+    state = step_fn(state, params, config, physics)
     state.step_count.block_until_ready()
 
     for expected in range(2, 12):
         prev = int(state.step_count)
-        state = step_fn(state, params, config)
+        state = step_fn(state, params, config, physics)
         curr = int(state.step_count)
         assert curr == prev + 1, (
             f"step_count did not increment by 1: {prev} → {curr}"
@@ -203,20 +211,21 @@ def test_reset_deterministic():
     config = _config
     params_a = initialize_interaction_params(config, seed=42)
     params_b = initialize_interaction_params(config, seed=42)
+    physics = _physics
     step_fn = _step_jit
 
     state_a = initialize_world(config, seed=7)
     state_b = initialize_world(config, seed=7)
 
     # Warm up with both (same operations)
-    state_a = step_fn(state_a, params_a, config)
-    state_b = step_fn(state_b, params_b, config)
+    state_a = step_fn(state_a, params_a, config, physics)
+    state_b = step_fn(state_b, params_b, config, physics)
     state_a.particles.position.block_until_ready()
     state_b.particles.position.block_until_ready()
 
     for _ in range(49):
-        state_a = step_fn(state_a, params_a, config)
-        state_b = step_fn(state_b, params_b, config)
+        state_a = step_fn(state_a, params_a, config, physics)
+        state_b = step_fn(state_b, params_b, config, physics)
 
     pos_a = np.array(state_a.particles.position)
     pos_b = np.array(state_b.particles.position)

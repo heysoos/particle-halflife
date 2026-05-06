@@ -21,9 +21,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from halflife.config import SimConfig
+from halflife.state import initialize_physics_params
 from halflife.chemistry import _entity_hash_val, _hash_to_binding_energy
 
 _config = SimConfig()
+_physics = initialize_physics_params(_config)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -38,12 +40,12 @@ def _merged_hash(h_i: int, h_j: int, config=_config) -> int:
     return (h_i + h_j) % config.hash_modulus
 
 
-def _be_from_pair(s_i: int, s_j: int, config=_config) -> float:
+def _be_from_pair(s_i: int, s_j: int, config=_config, physics=_physics) -> float:
     """Binding energy for free particle pair (s_i, s_j)."""
     hi = int(_entity_hash_val(jnp.int32(s_i), config))
     hj = int(_entity_hash_val(jnp.int32(s_j), config))
     merged = _merged_hash(hi, hj, config)
-    return float(_hash_to_binding_energy(jnp.uint32(merged), config))
+    return float(_hash_to_binding_energy(jnp.uint32(merged), config, physics))
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -112,7 +114,7 @@ def test_merged_hash_distribution():
         hi = entity_hashes[rng.integers(0, config.num_species)]
         hj = entity_hashes[rng.integers(0, config.num_species)]
         merged = _merged_hash(hi, hj, config)
-        be = float(_hash_to_binding_energy(jnp.uint32(merged), config))
+        be = float(_hash_to_binding_energy(jnp.uint32(merged), config, _physics))
         bes.append(be)
 
     bes = np.array(bes)
