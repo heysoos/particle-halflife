@@ -189,7 +189,7 @@ def simulation_step(state: WorldState, params: InteractionParams,
         forces = forces + bond_forces
 
     # ── Phase 4: Integration (Euler) ──────────────────────────────────────────
-    new_vel = particles.velocity + (forces / particles.mass[:, None]) * config.dt
+    new_vel = particles.velocity + (forces / particles.mass[:, None]) * physics.dt
     new_vel = new_vel * physics.damping
     # Magnitude clamp: cap |v| at max_velocity. Per-component clip would let
     # diagonal motion reach |v| = sqrt(2) * max_velocity, which is unphysical.
@@ -197,7 +197,7 @@ def simulation_step(state: WorldState, params: InteractionParams,
     new_vel = new_vel * jnp.minimum(
         1.0, config.max_velocity / (speed + 1e-10)
     )
-    new_pos = particles.position + new_vel * config.dt
+    new_pos = particles.position + new_vel * physics.dt
 
     # ── Phase 5: Boundary Conditions ─────────────────────────────────────────
     new_pos, new_vel = apply_boundary(new_pos, new_vel, config)
@@ -210,7 +210,7 @@ def simulation_step(state: WorldState, params: InteractionParams,
     state = attempt_fusion(state, neighbors, params, config, physics)
 
     # ── Phase 7: Decay ────────────────────────────────────────────────────────
-    state = apply_composite_decay(state, config)
+    state = apply_composite_decay(state, config, physics)
 
     # ── Phase 8: Energy Accounting ────────────────────────────────────────────
     current_energy = compute_total_energy(state)
@@ -230,13 +230,13 @@ def simulation_step(state: WorldState, params: InteractionParams,
     )
 
     # ── Phase 9: Increment Ages and Counters ──────────────────────────────────
-    new_age = state.particles.age + config.dt
-    new_comp_age = state.composites.age + config.dt * state.composites.alive.astype(jnp.float32)
+    new_age = state.particles.age + physics.dt
+    new_comp_age = state.composites.age + physics.dt * state.composites.alive.astype(jnp.float32)
 
     final_state = state._replace(
         particles=state.particles._replace(age=new_age),
         composites=state.composites._replace(age=new_comp_age),
-        time=state.time + config.dt,
+        time=state.time + physics.dt,
         total_energy=current_energy,
         step_count=state.step_count + 1,
     )

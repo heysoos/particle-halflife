@@ -142,7 +142,8 @@ def _hash_to_binding_energy(h: jnp.ndarray, config: SimConfig,
 
 # ── Composite Decay / Fission ─────────────────────────────────────────────────
 
-def apply_composite_decay(state: WorldState, config: SimConfig) -> WorldState:
+def apply_composite_decay(state: WorldState, config: SimConfig,
+                           physics: PhysicsParams) -> WorldState:
     """
     Apply decay to all alive composites (fission).
 
@@ -153,8 +154,9 @@ def apply_composite_decay(state: WorldState, config: SimConfig) -> WorldState:
          distributed as radial velocity among released members
 
     Args:
-        state:  WorldState
-        config: SimConfig (static)
+        state:   WorldState
+        config:  SimConfig (static)
+        physics: PhysicsParams — provides dt for the per-step decay probability
 
     Returns:
         Updated WorldState
@@ -166,7 +168,7 @@ def apply_composite_decay(state: WorldState, config: SimConfig) -> WorldState:
     rand = jax.random.uniform(subkey, (config.max_composites,))
     ln2 = jnp.log(2.0)
     decay_prob = 1.0 - jnp.exp(
-        -config.dt * ln2 / (composites.half_life + 1e-10)
+        -physics.dt * ln2 / (composites.half_life + 1e-10)
     )
 
     fissions = composites.alive & (rand < decay_prob)  # (C,) bool

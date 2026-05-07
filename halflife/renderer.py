@@ -371,14 +371,18 @@ class Renderer:
         btn_x = 8
         self._buttons = []
         for k, (label, action) in enumerate([
-            ("Pause",  "pause"),
-            ("Bonds",  "toggle_bonds"),
-            ("Events", "toggle_events"),
-            ("Reset",  "reset"),
-            ("Params", "toggle_params"),
+            ("Pause",       "pause"),
+            ("Bonds",       "toggle_bonds"),
+            ("Events",      "toggle_events"),
+            ("Reset",       "reset"),
+            ("Params",      "toggle_params"),
+            ("Reroll All",  "reroll_all"),
+            ("Reroll IC",   "reroll_particles"),
+            ("Reroll Chem", "reroll_chemistry"),
         ]):
             rect = pygame.Rect(btn_x, 8 + k * (btn_h + gap), btn_w, btn_h)
             self._buttons.append((label, rect, action))
+        self._n_buttons = len(self._buttons)
         # Stats button lives in the top-right corner
         self._stats_btn_rect = pygame.Rect(config.window_width - btn_w - 8, 8, btn_w, btn_h)
 
@@ -388,8 +392,8 @@ class Renderer:
         self._physics_updates = {}
         panel_x = btn_x + btn_w + 8   # panel opens to the RIGHT of the button strip
         slider_track_w = 200
-        # First slider starts just below the "Params" button (now index 4, 5 buttons total)
-        slider_start_y = 8 + 5 * (btn_h + gap) + 8  # 8px below bottom of Params btn
+        # First slider starts 8px below the bottom of the last button in the strip
+        slider_start_y = 8 + self._n_buttons * (btn_h + gap) + 8
         slider_row_h = 38
         # Slider specs grouped by relevance. None entries mark group breaks
         # and add an extra gap between groups (no slider drawn for None).
@@ -408,6 +412,7 @@ class Renderer:
             ("polarity_stability_scale", "pol stab",    0.5,   "{:.3f}", None),
             None,
             # \u2500\u2500 Particle dynamics \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+            ("dt",                       "dt",          0.02,  "{:.4f}", (0.001, 0.1)),
             ("damping",                  "damping",     0.995, "{:.4f}", (0.0, 1.0)),
             ("spring_k",                 "spring k",    50.0,  "{:.1f}", None),
         ]
@@ -435,6 +440,13 @@ class Renderer:
         self._show_stats  = False
         self._show_events = True
         self._paused      = False   # mirror of main loop paused state
+
+        # HUD dirty flag: when False, skip the full pygame redraw + texture
+        # upload and just blit the cached texture. The stats panel updates
+        # every frame (sparklines, FPS), so it forces dirty=True while shown;
+        # all other UI changes (toggles, slider drags, button label flips)
+        # explicitly set dirty=True via the mutator that caused them.
+        self._hud_dirty = True
 
         self._prev_comp_alive = None
 
@@ -469,15 +481,20 @@ class Renderer:
             self.composite_mode = self.MODE_MERGED
         else:
             self.composite_mode = self.MODE_BONDS
+        self._hud_dirty = True
 
     def toggle_stats(self):
         self._show_stats = not self._show_stats
+        self._hud_dirty = True
 
     def toggle_events(self):
         self._show_events = not self._show_events
+        self._hud_dirty = True
 
     def set_paused(self, paused: bool):
         """Keep the renderer in sync with the main loop's pause state."""
+        if self._paused != paused:
+            self._hud_dirty = True
         self._paused = paused
 
     def handle_click(self, pos) -> str | None:
@@ -491,6 +508,7 @@ class Renderer:
 
     def toggle_params(self) -> None:
         self._show_params = not self._show_params
+        self._hud_dirty = True
 
     def handle_mousedown_slider(self, pos) -> bool:
         """Start dragging a slider if pos hits a handle, or reset if a reset button hit."""
@@ -500,17 +518,20 @@ class Renderer:
             for s in self._sliders:
                 s.reset()
             self._physics_updates.update({s.field: s.value for s in self._sliders})
+            self._hud_dirty = True
             return True
         for slider in self._sliders:
             if slider.hit_reset(pos):
                 slider.reset()
                 self._physics_updates[slider.field] = slider.value
+                self._hud_dirty = True
                 return True
         for slider in self._sliders:
             if slider.hit_handle(pos):
                 self._dragging_slider = slider
                 slider.handle_drag(pos)
                 self._physics_updates[slider.field] = slider.value
+                self._hud_dirty = True
                 return True
         return False
 
@@ -518,6 +539,7 @@ class Renderer:
         if self._dragging_slider is not None:
             self._dragging_slider.handle_drag(pos)
             self._physics_updates[self._dragging_slider.field] = self._dragging_slider.value
+            self._hud_dirty = True
 
     def handle_mouseup(self) -> None:
         self._dragging_slider = None
@@ -786,10 +808,20 @@ class Renderer:
             )
             self._event_vao.render(moderngl.POINTS, vertices=self._n_event_vertices)
 
-        # HUD overlay
-        self._render_hud_surface(fps)
-        surf_data = pygame.image.tostring(self._hud_surface, 'RGBA', True)
-        self._hud_texture.write(surf_data)
+        # HUD overlay — only re-render the pygame surface and re-upload the
+        # texture when the HUD has actually changed. The fullscreen-quad GL
+        # blit always runs (it's cheap; reads the cached texture).
+        # Stats panel updates every frame (sparklines, FPS), so force dirty
+        # while it's shown.
+        if self._show_stats:
+            self._hud_dirty = True
+
+        if self._hud_dirty:
+            self._render_hud_surface(fps)
+            surf_data = pygame.image.tostring(self._hud_surface, 'RGBA', True)
+            self._hud_texture.write(surf_data)
+            self._hud_dirty = False
+
         self._hud_texture.use(location=0)
         self.hud_prog['hud_tex'].value = 0
         self._hud_quad_vao.render(moderngl.TRIANGLES, vertices=6)
@@ -836,6 +868,8 @@ class Renderer:
                 bg_col = (90, 40, 40, 200)
             elif action == 'pause':
                 bg_col = (40, 80, 50, 200) if not self._paused else (80, 60, 30, 200)
+            elif action.startswith('reroll_'):
+                bg_col = (60, 40, 80, 200)
             else:
                 bg_col = (40, 55, 80, 200)
             pygame.draw.rect(surface, bg_col, rect, border_radius=4)
@@ -972,7 +1006,7 @@ class Renderer:
         if self._show_params:
             btn_w, btn_h, gap = 108, 26, 4
             panel_x = 8 + btn_w + 8   # right of the button strip
-            slider_start_y = 8 + 5 * (btn_h + gap) + 8   # 5 buttons now
+            slider_start_y = 8 + self._n_buttons * (btn_h + gap) + 8
             panel_w = 244   # track(200) + gap(4) + reset-btn(14) + margins
             panel_h = self._slider_content_h + 10 + 26
             panel_rect = pygame.Rect(panel_x - 4, slider_start_y - 30, panel_w, panel_h)

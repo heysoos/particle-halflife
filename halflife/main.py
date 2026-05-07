@@ -132,11 +132,17 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
     if not paused:
         pending_state = run_n(pending_state, params, physics, steps_per_frame)
 
+    # Reroll counter: bumps each click so successive rerolls draw fresh seeds.
+    # Reset (R-key / Reset button) does NOT bump this — Reset returns to the
+    # original seed for reproducibility.
+    reroll_counter = 0
+
     while running:
         t_frame_start = time.time()
 
         # ── Events ────────────────────────────────────────────────────────────
         reset_requested = False
+        reroll_kind = None  # 'all' | 'particles' | 'chemistry' | None
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -158,6 +164,12 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                     renderer.toggle_params()
                 elif action == 'reset':
                     reset_requested = True
+                elif action == 'reroll_all':
+                    reroll_kind = 'all'
+                elif action == 'reroll_particles':
+                    reroll_kind = 'particles'
+                elif action == 'reroll_chemistry':
+                    reroll_kind = 'chemistry'
                 else:
                     renderer.handle_mousedown_slider(event.pos)
 
@@ -205,6 +217,20 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
             pending_state = state
             if not paused:
                 pending_state = run_n(pending_state, params, physics, steps_per_frame)
+
+        if reroll_kind is not None:
+            reroll_counter += 1
+            # Stride keeps the particle and chemistry seed streams from colliding
+            # across successive rerolls (10000 >> any reasonable counter value).
+            new_seed = seed + reroll_counter * 10000
+            if reroll_kind in ('all', 'particles'):
+                state = initialize_world(config, seed=new_seed)
+                pending_state = state
+            if reroll_kind in ('all', 'chemistry'):
+                params = initialize_interaction_params(config, seed=new_seed + 1)
+            if not paused and reroll_kind in ('all', 'particles'):
+                pending_state = run_n(pending_state, params, physics, steps_per_frame)
+            print(f"Rerolled {reroll_kind} (offset {reroll_counter}, seed {new_seed})")
 
         # ── Consume slider updates (before next dispatch) ─────────────────────
         updates = renderer.get_physics_updates()

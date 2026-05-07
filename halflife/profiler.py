@@ -316,7 +316,7 @@ def profile_all_phases(config, physics, params, n_warmup=3, n_bench=50, n_runs=3
         if config.use_bond_forces:
             bond_jit(state, config, physics).block_until_ready()
         fusion_jit(state, nb_fixed, params, config, physics).particles.composite_id.block_until_ready()
-        decay_jit(state, config).particles.composite_id.block_until_ready()
+        decay_jit(state, config, physics).particles.composite_id.block_until_ready()
         energy_phase(state).particles.velocity.block_until_ready()
         step_fn(state, params, config, physics).particles.position.block_until_ready()
 
@@ -350,7 +350,7 @@ def profile_all_phases(config, physics, params, n_warmup=3, n_bench=50, n_runs=3
         n_warmup=0, n_bench=n_bench, n_runs=n_runs,
     )
     results['6. apply_composite_decay'] = _time_fn(
-        lambda: decay_jit(state, config).particles.composite_id.block_until_ready(),
+        lambda: decay_jit(state, config, physics).particles.composite_id.block_until_ready(),
         n_warmup=0, n_bench=n_bench, n_runs=n_runs,
     )
     results['7. energy_conservation'] = _time_fn(

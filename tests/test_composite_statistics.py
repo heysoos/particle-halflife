@@ -814,7 +814,7 @@ def generate_html_report(runs: list, output_path: str):
     print(f"✓ Report saved to {output_path}")
 
 
-def test_composite_statistics():
+def test_composite_statistics(num_steps: int = 500):
     """Main test: run parameter sweep and generate report."""
     print("\n" + "="*70)
     print("COMPOSITE STATISTICS TEST — Parameter Sensitivity Analysis")
@@ -824,7 +824,6 @@ def test_composite_statistics():
     fusion_thresholds = [0.10, 0.20]
     interaction_radii = [3.5, 4.5]
     size_decay_scales = [0.0, 0.05, 0.10]  # NEW: test how size penalty affects growth
-    num_steps = 600
 
     print(f"\nParameter sweep:")
     print(f"  Fusion thresholds: {fusion_thresholds}")
@@ -889,4 +888,4 @@ def test_composite_statistics():
 
 
 if __name__ == '__main__':
-    test_composite_statistics()
+    test_composite_statistics(num_steps=5000)

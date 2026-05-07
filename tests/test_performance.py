@@ -247,11 +247,11 @@ def benchmark_composite_decay():
     n_composites = int(jnp.sum(state.composites.alive.astype(jnp.int32)))
     decay_jit = jax.jit(apply_composite_decay, static_argnums=(1,))
 
-    r = decay_jit(state, config)
+    r = decay_jit(state, config, physics)
     r.particles.composite_id.block_until_ready()
 
     def one_call():
-        r = decay_jit(state, config)
+        r = decay_jit(state, config, physics)
         r.particles.composite_id.block_until_ready()
 
     mean_ms, std_ms = _time_fn(one_call, n_warmup=3, n_bench=50)
@@ -313,7 +313,7 @@ def benchmark_per_phase_breakdown():
         if config.use_bond_forces:
             bond_jit(state, config, physics).block_until_ready()
         fusion_jit(state, nb_fixed, params, config, physics).particles.composite_id.block_until_ready()
-        decay_jit(state, config).particles.composite_id.block_until_ready()
+        decay_jit(state, config, physics).particles.composite_id.block_until_ready()
         energy_phase(state).particles.velocity.block_until_ready()
         step_fn(state, params, config, physics).particles.position.block_until_ready()
 
@@ -340,7 +340,7 @@ def benchmark_per_phase_breakdown():
        lambda: fusion_jit(state, nb_fixed, params, config, physics)
                          .particles.composite_id.block_until_ready())
     _t("6. apply_composite_decay",
-       lambda: decay_jit(state, config).particles.composite_id.block_until_ready())
+       lambda: decay_jit(state, config, physics).particles.composite_id.block_until_ready())
     _t("7. energy_conservation",
        lambda: energy_phase(state).particles.velocity.block_until_ready())
 

@@ -16,30 +16,34 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class SimConfig:
     # ── World ────────────────────────────────────────────────────────────────
+    # World aspect ratio is matched to window aspect ratio (16:9) so the
+    # vertex shaders' (in_position / u_world_size) → NDC mapping doesn't
+    # stretch the world non-uniformly when it fills the window.
+    # 200 × 720/1280 = 112.5
     world_width: float = 200.0      # spatial extent in x
-    world_height: float = 200.0     # spatial extent in y
+    world_height: float = 112.5     # spatial extent in y
     dt: float = 0.02                # simulation timestep
 
     # Boundary mode: "periodic" (torus) or "reflect" (bouncing walls)
     boundary_mode: str = "periodic"
 
     # ── Particles ────────────────────────────────────────────────────────────
-    num_particles: int = 2_000      # total particle count (fixed, all always alive)
+    num_particles: int = 5_000      # total particle count (fixed, all always alive)
     num_species: int = 64           # number of distinct particle types
     state_dim: int = 8              # internal state vector size (NCA-style, future use)
 
     # ── Composites ───────────────────────────────────────────────────────────
-    max_composites: int = 5_000       # fixed composite pool capacity
-    max_composite_size: int = 64     # JAX buffer size — not a physics cap; chemistry determines stability
+    max_composites: int = 3_000       # fixed composite pool capacity
+    max_composite_size: int = 128     # JAX buffer size — not a physics cap; chemistry determines stability
 
     # ── Spatial Indexing ─────────────────────────────────────────────────────
     # cell_size should equal interaction_radius for optimal neighbor queries
-    cell_size: float = 4.0
+    cell_size: float = 8.0
     # max particles per cell in the cell list (4x expected density is safe)
-    cell_capacity: int = 8
+    cell_capacity: int = 64
 
     # ── Interactions ─────────────────────────────────────────────────────────
-    interaction_radius: float = 4.0   # pairwise force cutoff distance
+    interaction_radius: float = 8.0   # pairwise force cutoff distance
     max_neighbors: int = 256           # max neighbors per particle (cap for fixed arrays)
 
     # Particle Life-style force shape:
