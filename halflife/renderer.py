@@ -993,32 +993,52 @@ class Renderer:
             chart_h = 64
             chart_x = panel_x + 8
             chart_y = y_off
-            # Scale x-axis to the largest live composite so the chart auto-fits
-            # the population instead of always reserving room for sizes up to 40.
-            nonzero = np.flatnonzero(self._stats_hist[1:]) + 1 if len(self._stats_hist) > 1 else np.array([], dtype=np.int32)
-            n_bins   = int(nonzero.max()) if len(nonzero) > 0 else 2
-            n_bins   = max(2, min(n_bins, len(self._stats_hist) - 1))
-            bar_w    = max(1, (chart_w - n_bins) // max(1, n_bins))
-            max_count = max(1, int(np.max(self._stats_hist[1:n_bins + 1]))
-                            if len(self._stats_hist) > 1 else 1)
+            # X-axis is fixed at [1, max_composite_size] — the layout is stable
+            # across runs and parameter sweeps. To keep things readable when
+            # max_composite_size is large, bins are *widened* (each bar covers
+            # `bin_width` consecutive integer sizes) rather than the axis being
+            # truncated. Bin count is capped at MAX_BINS_HIST so 1px bars +
+            # 1px gaps always fit inside chart_w.
+            MAX_BINS_HIST = 100
+            size_max  = config.max_composite_size
+            bin_width = max(1, -(-size_max // MAX_BINS_HIST))   # ceil(size_max / MAX_BINS_HIST)
+            n_bins    = -(-size_max // bin_width)               # ceil(size_max / bin_width)
+            bar_w     = max(1, (chart_w - n_bins) // max(1, n_bins))
 
-            for sz_idx in range(1, n_bins + 1):
-                count = int(self._stats_hist[sz_idx]) if sz_idx < len(self._stats_hist) else 0
+            # Aggregate hist[i] (= count of composites with member_count == i+1)
+            # into n_bins of bin_width consecutive sizes. Right-pad with zeros
+            # so the reshape divides evenly without shifting counts.
+            padded  = np.zeros(n_bins * bin_width, dtype=np.int64)
+            src_len = min(len(self._stats_hist), padded.size)
+            padded[:src_len] = self._stats_hist[:src_len]
+            binned    = padded.reshape(n_bins, bin_width).sum(axis=1)
+            max_count = max(1, int(binned.max()))
+
+            for b in range(n_bins):
+                count = int(binned[b])
                 if count == 0:
                     continue
                 bh = max(1, int(chart_h * count / max_count))
-                bx = chart_x + (sz_idx - 1) * (bar_w + 1)
+                bx = chart_x + b * (bar_w + 1)
                 pygame.draw.rect(surface, (60, 140, 220, 200),
                                  pygame.Rect(bx, chart_y + chart_h - bh, bar_w, bh))
 
             pygame.draw.line(surface, (80, 110, 160),
                              (chart_x, chart_y + chart_h),
                              (chart_x + chart_w, chart_y + chart_h), 1)
-            raw_ticks = np.linspace(2, n_bins, 5).astype(int)
-            for tick in sorted(set(raw_ticks)):
-                tick_idx = tick - 1
-                if 0 <= tick_idx < n_bins:
-                    tx = chart_x + tick_idx * (bar_w + 1)
+            # Ticks label the upper-edge size of selected bins. Bin b spans
+            # sizes [b*bin_width + 1, (b+1)*bin_width]; ticks are evenly
+            # spaced along the size axis so the rightmost tick reads size_max.
+            raw_ticks = np.linspace(bin_width, size_max, 5).astype(int)
+            seen = set()
+            for tick in raw_ticks:
+                tick = int(tick)
+                if tick in seen:
+                    continue
+                seen.add(tick)
+                b = (tick - 1) // bin_width
+                if 0 <= b < n_bins:
+                    tx = chart_x + b * (bar_w + 1)
                     lbl = font.render(str(tick), True, (120, 150, 190))
                     surface.blit(lbl, (tx - lbl.get_width() // 2, chart_y + chart_h + 2))
             y_off = chart_y + chart_h + 20
