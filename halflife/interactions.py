@@ -102,10 +102,11 @@ def pairwise_force(pos_i: jnp.ndarray, pos_j: jnp.ndarray,
         d = d - config.world_width  * jnp.round(d[0] / config.world_width) * jnp.array([1., 0.])
         d = d - config.world_height * jnp.round(d[1] / config.world_height) * jnp.array([0., 1.])
 
-    r = jnp.linalg.norm(d) + 1e-10
-    d_hat = d / r
+    r = jnp.linalg.norm(d) + 1e-10  # distance (avoid div-by-zero)
+    d_hat = d / r                     # unit direction
 
-    # Look up species-pair parameters
+    # Look up species-pair parameters; convert fractions to absolute distances.
+    # interaction_radius is the static unit; per-pair fractions in (0, 1] scale it.
     aij = params.attraction[species_i, species_j]
     r_a = params.peak_fraction[species_i, species_j] * config.interaction_radius
     r_c = params.cutoff_fraction[species_i, species_j] * config.interaction_radius
@@ -115,7 +116,9 @@ def pairwise_force(pos_i: jnp.ndarray, pos_j: jnp.ndarray,
                                 r_c * physics.r_cutoff_scale,
                                 physics.repulsion_strength)
 
-    return -f_mag * d_hat
+    # Positive f_mag = repulsive = in direction of d (i away from j)
+    # Negative f_mag = attractive = in direction of -d (i toward j)
+    return -f_mag * d_hat  # sign convention: negative = toward j = attractive
 
 
 def compute_forces_for_particle(i: jnp.ndarray,
@@ -127,18 +130,31 @@ def compute_forces_for_particle(i: jnp.ndarray,
                                   physics: PhysicsParams) -> jnp.ndarray:
     """
     Net force on particle i from all its neighbors.
+
+    Args:
+        i:          scalar int32 — particle index
+        positions:  (N, 2)
+        species:    (N,)
+        neighbors:  (max_neighbors,) int32 — neighbor indices for particle i
+        params:     InteractionParams
+        config:     SimConfig (static)
+        physics:    PhysicsParams (runtime-tunable)
+
+    Returns:
+        (2,) float32 — total force on particle i
     """
     pos_i = positions[i]
     sp_i  = species[i]
 
     def force_from_neighbor(j):
         valid = (j >= 0)
-        pos_j = jnp.where(valid, positions[j], pos_i)
+        pos_j = jnp.where(valid, positions[j], pos_i)  # safe fallback
         sp_j  = jnp.where(valid, species[j], sp_i)
         f = pairwise_force(pos_i, pos_j, sp_i, sp_j, params, config, physics)
         return jnp.where(valid, f, jnp.zeros(2))
 
-    forces = jax.vmap(force_from_neighbor)(neighbors)
+    # vmap over the neighbor array
+    forces = jax.vmap(force_from_neighbor)(neighbors)  # (max_neighbors, 2)
     return jnp.sum(forces, axis=0)
 
 
@@ -150,6 +166,17 @@ def compute_all_forces(positions: jnp.ndarray,
                         physics: PhysicsParams) -> jnp.ndarray:
     """
     Compute net force for every particle simultaneously (outer vmap).
+
+    Args:
+        positions:  (N, 2) float32
+        species:    (N,)   int32
+        neighbors:  (N, max_neighbors) int32
+        params:     InteractionParams
+        config:     SimConfig (static)
+        physics:    PhysicsParams (runtime-tunable)
+
+    Returns:
+        (N, 2) float32 — force vectors per particle
     """
     particle_indices = jnp.arange(config.num_particles, dtype=jnp.int32)
 
@@ -158,4 +185,4 @@ def compute_all_forces(positions: jnp.ndarray,
             i, positions, species, neighbors[i], params, config, physics
         )
 
-    return jax.vmap(forces_for_i)(particle_indices)
+    return jax.vmap(forces_for_i)(particle_indices)   # (N, 2)

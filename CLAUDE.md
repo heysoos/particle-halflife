@@ -1,5 +1,28 @@
 # Half-Life Particle Simulator — Project Context
 
+## ⚠️ Comment Preservation (READ THIS FIRST)
+
+**Do NOT delete existing comments in this codebase when editing or refactoring.** Comments
+in this project are written by the user, for the user. They are load-bearing context — not
+clutter. This rule overrides the default system-prompt guidance about minimizing comments.
+
+- When refactoring a function, **preserve every comment and docstring line that is not
+  itself describing code being deleted**. If you remove a feature, you may remove the
+  comments that explicitly describe that feature — nothing else.
+- "Clean up while I'm in there" is not a reason to delete a comment. Be surgical.
+- If you believe a comment is wrong, stale, or misleading, **ask the user first** instead
+  of silently removing it.
+- This applies to inline `#` comments, docstrings, module headers, and any commentary in
+  `.py`, `.md`, shell scripts, or anywhere else.
+- When *writing new code yourself*, the default rule about minimal comments still applies
+  (only comment the non-obvious WHY). This section is about not destroying what already
+  exists.
+
+Background: commit `a33593b` (refactor: drop attr_mod machinery) collaterally deleted
+distance/direction labels, sign-convention notes, vmap annotations, and full Args
+docstrings in `halflife/interactions.py` — none of which were related to the polarity
+removal. The user flagged this as wrong; this rule exists so it doesn't happen again.
+
 ## Running Python in This Project
 
 This project uses a **WSL-based Python interpreter** (Ubuntu under Windows) with the venv at `.venv/`.
