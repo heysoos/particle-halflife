@@ -276,6 +276,7 @@ class Renderer:
 
     MODE_BONDS  = "bonds"
     MODE_MERGED = "merged"
+    MODE_NONE   = "none"   # plain particles, no bond overlay / no COM blob
 
     def __init__(self, config: SimConfig, metrics: ProfileMetrics = None):
         self.config = config
@@ -502,11 +503,13 @@ class Renderer:
     # ── Public interface ──────────────────────────────────────────────────────
 
     def toggle_composite_mode(self):
-        """Cycle between bonds and merged visualization modes."""
-        if self.composite_mode == self.MODE_BONDS:
-            self.composite_mode = self.MODE_MERGED
-        else:
-            self.composite_mode = self.MODE_BONDS
+        """Cycle bonds → merged → none → bonds."""
+        cycle = {
+            self.MODE_BONDS:  self.MODE_MERGED,
+            self.MODE_MERGED: self.MODE_NONE,
+            self.MODE_NONE:   self.MODE_BONDS,
+        }
+        self.composite_mode = cycle.get(self.composite_mode, self.MODE_BONDS)
         self._hud_dirty = True
 
     def toggle_stats(self):
@@ -922,7 +925,13 @@ class Renderer:
             if action == 'pause':
                 display_label = "Resume" if self._paused else "Pause"
             elif action == 'toggle_bonds':
-                display_label = "Merged" if self.composite_mode == self.MODE_BONDS else "Bonds"
+                # Label shows the mode the next click will switch TO.
+                next_label = {
+                    self.MODE_BONDS:  "Merged",
+                    self.MODE_MERGED: "None",
+                    self.MODE_NONE:   "Bonds",
+                }
+                display_label = next_label.get(self.composite_mode, "Bonds")
             elif action == 'toggle_events':
                 display_label = "Events ON" if self._show_events else "Events"
             elif action == 'toggle_params':
