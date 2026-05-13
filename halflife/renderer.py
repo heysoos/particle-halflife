@@ -30,6 +30,16 @@ from halflife.state import WorldState, get_species_colors
 from halflife.profiler import ProfileMetrics
 
 
+# ── Bond rendering cap ────────────────────────────────────────────────────────
+# Maximum number of forward-slot bonds emitted per composite member in
+# "bonds" view. For each member at slot i, bonds are emitted to slots
+# (i+1, i+2, …, i+MAX_BONDS_PER_PARTICLE). Each particle ends up touched by
+# at most ~2× this value's worth of bonds (forward + incoming). Pure visual
+# cap — does not affect physics. Bumping this above ~5 starts to undo the
+# performance win on big composites.
+MAX_BONDS_PER_PARTICLE = 3
+
+
 # ── GLSL Shaders ──────────────────────────────────────────────────────────────
 
 PARTICLE_VERTEX_SHADER = """
@@ -617,7 +627,22 @@ class Renderer:
             if max_n >= 2:
                 mb  = comp_members[C_idx, :max_n]   # (n_comps, max_n)
                 cnt = comp_count[C_idx]              # (n_comps,)
-                ii, jj = np.triu_indices(max_n, k=1)
+                # Deterministic per-particle bond cap: for each member at slot
+                # i, emit bonds to slots (i+1, i+2, ..., i+K). Each particle
+                # ends up touched by at most ~2K bonds. Cost is O(K·N) per
+                # composite vs the old O(N²) — large composites no longer
+                # explode the bond count. Slot order is stable across frames
+                # (fusion preserves it), so bonds don't flicker.
+                K = max(1, int(MAX_BONDS_PER_PARTICLE))
+                ii_grid = np.arange(max_n)
+                offsets = np.arange(1, K + 1)
+                ii_full = np.broadcast_to(ii_grid[:, None], (max_n, K)).ravel()
+                jj_full = (ii_grid[:, None] + offsets[None, :]).ravel()
+                # Drop pairs where the j-slot is past the widest composite —
+                # those can't be valid for any composite this frame.
+                in_range = jj_full < max_n
+                ii = ii_full[in_range]
+                jj = jj_full[in_range]
                 # valid: both pair indices in-range and member slots non-negative
                 valid = (ii[None, :] < cnt[:, None]) & (jj[None, :] < cnt[:, None])
                 mem_a = mb[:, ii].ravel()
