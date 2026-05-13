@@ -483,6 +483,9 @@ class Renderer:
         # frames to suppress jitter from churning small composites.
         self._hist_size_max_cached = 2
         self._hist_axis_age        = 0
+        # np.histogram on alive_counts runs once per N frames — the bar chart
+        # readout doesn't need 60-120 Hz refresh.
+        self._hist_compute_age     = 0
 
         # Event counters
         self._fusion_total   = 0
@@ -756,20 +759,29 @@ class Renderer:
         self._stats_step     = int(step_count)
         self._stats_sim_time = float(sim_time)
 
+        # Unique-type count is cheap (np.unique on ~3k uint32s is microseconds)
+        # and feeds the per-frame "Unique:" sparkline, so it runs every frame.
         if self._stats_n_comp > 0:
-            alive_counts = comp_count[comp_alive]
-            self._stats_hist, _ = np.histogram(
-                alive_counts,
-                bins=np.arange(1, config.max_composite_size + 2)
-            )
-            # Distinct composite "types": each species_hash identifies one
-            # multiset of member species, so the unique count is the size of
-            # the chemical zoo currently alive. np.unique on ~3k uint32s is
-            # microseconds — safe to call every frame.
             self._stats_n_unique = int(np.unique(comp_species_hash[comp_alive]).size)
         else:
-            self._stats_hist = np.zeros(config.max_composite_size, dtype=np.int32)
             self._stats_n_unique = 0
+
+        # Composite-size histogram is heavier and only feeds the bar chart,
+        # which the eye can't track at 60-120 Hz anyway. Recompute every
+        # HIST_COMPUTE_INTERVAL frames; in between, the chart shows the
+        # last-computed snapshot.
+        HIST_COMPUTE_INTERVAL = 10
+        self._hist_compute_age += 1
+        if self._hist_compute_age >= HIST_COMPUTE_INTERVAL:
+            self._hist_compute_age = 0
+            if self._stats_n_comp > 0:
+                alive_counts = comp_count[comp_alive]
+                self._stats_hist, _ = np.histogram(
+                    alive_counts,
+                    bins=np.arange(1, config.max_composite_size + 2)
+                )
+            else:
+                self._stats_hist = np.zeros(config.max_composite_size, dtype=np.int32)
 
         # ── Event detection ───────────────────────────────────────────────────
         current_sim_time  = self._stats_sim_time
