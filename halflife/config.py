@@ -22,14 +22,14 @@ class SimConfig:
     # 200 × 720/1280 = 112.5
     world_width: float = 200.0      # spatial extent in x
     world_height: float = 112.5     # spatial extent in y
-    dt: float = 0.02                # simulation timestep
+    dt: float = 0.06                # simulation timestep
 
     # Boundary mode: "periodic" (torus) or "reflect" (bouncing walls)
     boundary_mode: str = "periodic"
 
     # ── Particles ────────────────────────────────────────────────────────────
     num_particles: int = 5_000      # total particle count (fixed, all always alive)
-    num_species: int = 12           # number of distinct particle types
+    num_species: int = 3           # number of distinct particle types
     state_dim: int = 8              # internal state vector size (NCA-style, future use)
 
     # ── Composites ───────────────────────────────────────────────────────────
@@ -61,8 +61,8 @@ class SimConfig:
 
     # ── Decay / Half-life ────────────────────────────────────────────────────
     # Composite half-lives are derived from their species hash using this range
-    half_life_min: float = 100.0       # shortest composite half-life (sim time units)
-    half_life_max: float = 500.0      # longest composite half-life
+    half_life_min: float = 1.0       # shortest composite half-life (sim time units)
+    half_life_max: float = 15.0      # longest composite half-life
 
     # ── Energy ───────────────────────────────────────────────────────────────
     # Kinetic energy scale at initialization (controls initial temperature)
@@ -97,7 +97,7 @@ class SimConfig:
     # ── Rendering ────────────────────────────────────────────────────────────
     window_width: int = 1280
     window_height: int = 720
-    fps_target: int = 60
+    fps_target: int = 120
     point_size_min: float = 2.0       # minimum particle render size (pixels)
     point_size_max: float = 14.0      # maximum (scales with mass)
     background_color: tuple = (0.05, 0.05, 0.08, 1.0)  # dark blue-black
