@@ -367,6 +367,59 @@ def test_fission_creates_intermediate_size_products():
     )
 
 
+def test_observability_distinct_composite_types():
+    """
+    Observability instrument (slow): count distinct composite types observed
+    over 1000 steps and report. A 'type' is the sorted multiset of member
+    species (a tuple of sorted species ints).
+
+    With binary fission and 12 species, a healthy reaction network should
+    produce many distinct types but stabilize at far fewer than the
+    combinatorial max — that's selection.
+
+    This test does not assert dynamics; it asserts only that the counter
+    *runs* and produces a nonzero result. Use the printed numbers to study
+    the network.
+    """
+    config = SimConfig(
+        num_particles=1000,
+        half_life_min=20.0,
+        half_life_max=80.0,
+    )
+    state = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=42)
+    physics = initialize_physics_params(config)
+    step_fn = jax.jit(simulation_step, static_argnums=(2,))
+    state = step_fn(state, params, config, physics)
+
+    types_ever_seen = set()
+    types_alive_at_step = []
+
+    for s in range(1000):
+        state = step_fn(state, params, config, physics)
+        if s % 50 == 0:
+            alive = jnp.asarray(state.composites.alive)
+            members = jnp.asarray(state.composites.members)
+            mc = jnp.asarray(state.composites.member_count)
+            species = jnp.asarray(state.particles.species)
+            current = set()
+            for c_idx in jnp.where(alive)[0].tolist():
+                n = int(mc[c_idx])
+                mids = members[c_idx, :n].tolist()
+                spc = sorted(int(species[m]) for m in mids if m >= 0)
+                key = tuple(spc)
+                current.add(key)
+                types_ever_seen.add(key)
+            types_alive_at_step.append((s, len(current)))
+
+    print(f"\nDistinct composite types ever seen: {len(types_ever_seen)}")
+    print(f"Types alive at sampled steps:")
+    for s, n in types_alive_at_step:
+        print(f"  step {s:4d}: {n} distinct types alive")
+
+    assert len(types_ever_seen) > 0, "no composite types ever observed"
+
+
 # ── Standalone runner ─────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
