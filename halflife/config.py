@@ -64,10 +64,6 @@ class SimConfig:
     half_life_min: float = 100.0       # shortest composite half-life (sim time units)
     half_life_max: float = 500.0      # longest composite half-life
 
-    # ── REMOVED 2026-05-05: only read by the now-dead _hash_to_half_life ──
-    # composite_half_life_scale: float = 5.0
-    # Kept commented for revival reference; safe to delete in a follow-up.
-
     # ── Energy ───────────────────────────────────────────────────────────────
     # Kinetic energy scale at initialization (controls initial temperature)
     init_speed: float = 1.5
@@ -84,12 +80,6 @@ class SimConfig:
     hash_modulus: int = 100_000_007   # large prime
     hash_prime_a: int = 1_000_003     # multiplier prime
     hash_prime_b: int = 7             # offset
-
-    # ── REMOVED 2026-05-05: only read by the now-dead _hash_to_decay_products
-    # No transmutation in current design — fission releases existing members
-    # with their original species, so there's no "products" array to size.
-    # max_decay_products: int = 3
-    # Kept commented for revival reference; safe to delete in a follow-up.
 
     # ── Composite Stability ───────────────────────────────────────────────────
     composite_size_decay_scale: float = 0.05   # size penalty on composite half-life (larger → shorter hl)

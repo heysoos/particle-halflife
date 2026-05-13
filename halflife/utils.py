@@ -12,56 +12,6 @@ import jax.numpy as jnp
 import numpy as np
 
 
-# ── Numeric Hashing ──────────────────────────────────────────────────────────
-
-# ── REMOVED 2026-05-05: replaced by commutative additive hash ──────────────
-# hash_multiset() and hash_scalar() were the original sort-based polynomial
-# rolling hashes. Commit 086e9e1 replaced them with a commutative additive
-# hash in chemistry._compute_entity_hash / _entity_hash_val (10–100× faster
-# on merged-entity hashes since H(i ∪ j) = (H(i) + H(j)) % modulus needs no
-# sort or scan). Kept commented for revival reference; safe to delete in a
-# follow-up.
-#
-# def hash_multiset(species_sorted: jnp.ndarray, count: jnp.ndarray,
-#                   prime_a: int, prime_b: int, modulus: int) -> jnp.ndarray:
-#     """
-#     Polynomial rolling hash over a sorted multiset of species IDs.
-#
-#     Produces a deterministic uint32 hash from a sorted integer array.
-#     Sorting ensures multiset semantics: hash({A,B}) == hash({B,A}).
-#
-#     Args:
-#         species_sorted: (max_size,) int32 — sorted species IDs, padded with -1
-#         count:          scalar int32 — number of valid entries
-#         prime_a, prime_b, modulus: hash constants from SimConfig
-#
-#     Returns:
-#         scalar uint32 hash value
-#     """
-#     def body(carry, i):
-#         h = carry
-#         s = species_sorted[i]
-#         # Only incorporate valid entries (i < count)
-#         valid = (i < count) & (s >= 0)
-#         new_h = (h * prime_a + s + prime_b) % modulus
-#         h = jnp.where(valid, new_h, h)
-#         return h, None
-#
-#     max_size = species_sorted.shape[0]
-#     h_init = jnp.array(0, dtype=jnp.int32)
-#     h_final, _ = jax.lax.scan(body, h_init, jnp.arange(max_size))
-#     return h_final.astype(jnp.uint32)
-#
-#
-# def hash_scalar(species: jnp.ndarray, prime_a: int, prime_b: int,
-#                 modulus: int) -> jnp.ndarray:
-#     """Hash a single species ID (for single-particle decay)."""
-#     return jnp.array(
-#         (prime_a * (species + 1) + prime_b) % modulus,
-#         dtype=jnp.uint32
-#     )
-
-
 # ── Free-Slot Finding ────────────────────────────────────────────────────────
 
 def find_free_slots(alive: jnp.ndarray, n_needed: int) -> jnp.ndarray:

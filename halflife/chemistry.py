@@ -76,23 +76,6 @@ def _compute_entity_hash(pid: jnp.ndarray, particles, composites,
     return h, count
 
 
-# ── REMOVED 2026-05-05: design pivot from species → half_life direct ───────
-# _hash_to_half_life derived a composite's half-life directly from its species
-# multiset hash. Superseded by the BE-driven formula in fusion_scan_body
-# (search "Energy-based half-life" below): pivot was species → BE → half_life
-# instead of two parallel mappings out of the hash. The dead function still
-# read config.composite_half_life_scale, which is also being removed.
-# Kept commented for revival reference; safe to delete in a follow-up.
-#
-# def _hash_to_half_life(h: jnp.ndarray, config: SimConfig) -> jnp.ndarray:
-#     """Derive composite half-life from its species hash."""
-#     # Use bits [0..9] of h (normalized to [0,1]) to scale the half-life range
-#     frac = ((h % 1000).astype(jnp.float32)) / 999.0
-#     base = (config.half_life_min + config.half_life_max) * 0.5
-#     spread = (config.half_life_max - config.half_life_min) * 0.5
-#     return (base + spread * (frac * 2.0 - 1.0)) * config.composite_half_life_scale
-
-
 def _hash_to_binding_energy(h: jnp.ndarray, config: SimConfig,
                              physics: PhysicsParams) -> jnp.ndarray:
     """Derive binding energy from species hash (normalized to [0, 1])."""
@@ -102,42 +85,6 @@ def _hash_to_binding_energy(h: jnp.ndarray, config: SimConfig,
     h2 = (h * jnp.uint32(2_654_435_761)) ^ (h >> jnp.uint32(13))
     frac = (h2 % jnp.uint32(1000)).astype(jnp.float32) / 999.0
     return frac * physics.binding_energy_scale
-
-
-# ── REMOVED 2026-05-05: no transmutation in current design ─────────────────
-# _hash_to_decay_products derived per-decay product species from the parent's
-# hash. Never called — the live fission path in apply_composite_decay just
-# releases existing members back to free state with their original species.
-# The earlier design intended transmutation (parent multiset → totally
-# different product species); current design treats particles as conserved
-# entities. Read config.max_decay_products which is also being removed.
-# Kept commented for revival reference (Phase 2 may revisit transmutation
-# as a way to break the composite size plateau); safe to delete in a follow-up.
-#
-# def _hash_to_decay_products(h: jnp.ndarray, parent_species: jnp.ndarray,
-#                               config: SimConfig):
-#     """
-#     Derive decay product species from a hash value.
-#
-#     Returns:
-#         product_species: (max_decay_products,) int32 — species of each product
-#         product_count:   scalar int32 — how many products (1 to max_decay_products)
-#     """
-#     # Number of products: 1..max_decay_products, biased toward 1-2
-#     n_prods = jnp.array(1, dtype=jnp.int32) + (
-#         ((h >> 20) % config.max_decay_products).astype(jnp.int32)
-#     )
-#
-#     # Species of each product: derived from hash bits
-#     def get_product_species(k):
-#         bits = (h * jnp.uint32(1000003 * (k + 1))) % jnp.uint32(config.hash_modulus)
-#         sp = (bits % config.num_species).astype(jnp.int32)
-#         return sp
-#
-#     product_species = jax.vmap(get_product_species)(
-#         jnp.arange(config.max_decay_products, dtype=jnp.uint32)
-#     )
-#     return product_species, n_prods
 
 
 def _hash_to_partition(h: jnp.ndarray, n_members: jnp.ndarray,
