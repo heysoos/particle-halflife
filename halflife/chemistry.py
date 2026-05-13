@@ -204,13 +204,19 @@ def _hash_to_partition(h: jnp.ndarray, n_members: jnp.ndarray,
 def apply_composite_decay(state: WorldState, config: SimConfig,
                            physics: PhysicsParams) -> WorldState:
     """
-    Apply decay to all alive composites (fission).
+    Apply binary fission decay to all alive composites.
 
-    A decaying composite:
-      1. Marks itself dead
-      2. Releases all member particles back to free state
-      3. Injects (binding_energy - fission_cost * binding_energy) as kinetic energy,
-         distributed as radial velocity among released members
+    A decaying composite is partitioned into two products by _hash_to_partition.
+    Product 0 reuses the parent's composite slot. Product 1 takes a fresh free
+    slot from the composite pool. Products of size 1 become free particles;
+    products of size >= 2 become new composites with hash-derived properties.
+
+    Particle species are never modified — only their composite_id and velocity.
+
+    Energy: parent.binding_energy * (1 - fission_cost) is split equally between
+    the two products as kinetic energy, applied as a momentum-conserving kick
+    along the COM-vs-COM axis (product 0 → +direction, product 1 → -direction).
+    Each product's members all get the same kick (the product moves as a unit).
 
     Args:
         state:   WorldState
@@ -223,90 +229,242 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
     particles = state.particles
     composites = state.composites
     key, subkey = jax.random.split(state.rng_key)
+    N = config.num_particles
+    M = config.max_composite_size
+    C = config.max_composites
 
-    rand = jax.random.uniform(subkey, (config.max_composites,))
+    # ── Roll for which composites decay this step ───────────────────────────
+    rand = jax.random.uniform(subkey, (C,))
     ln2 = jnp.log(2.0)
-    decay_prob = 1.0 - jnp.exp(
-        -physics.dt * ln2 / (composites.half_life + 1e-10)
-    )
-
+    decay_prob = 1.0 - jnp.exp(-physics.dt * ln2 / (composites.half_life + 1e-10))
     fissions = composites.alive & (rand < decay_prob)  # (C,) bool
 
-    # Mark decayed composites as dead
-    new_comp_alive = composites.alive & ~fissions
+    # Pre-allocate fresh composite slots for product 1 of each fissioning composite.
+    free_slots = find_free_slots(composites.alive, C)  # (C,) int32
 
-    # For each composite that fissions, release its members
-    # and give them radial outward velocities
+    # Assign each fissioning composite a "fission rank" via cumsum so it
+    # picks free_slots[rank] as its product-1 target.
+    fission_rank = jnp.cumsum(fissions.astype(jnp.int32)) - 1  # (C,) — -1 for non-fissioning
 
-    def release_members_from_composite(c):
-        """Process composite c: if fissioning, free all its members."""
-        does_fission = fissions[c]
-        n_members = composites.member_count[c]
+    # ── Per-composite: compute partition assignment and COMs ────────────────
+    def per_composite(c):
+        n = composites.member_count[c]
+        h = composites.species_hash[c]
+        assignment = _hash_to_partition(h, n, config)  # (M,) ∈ {-1, 0, 1}
 
-        # Hoist COM computation here (computed once, not M times inside release_member)
+        # Compute each product's COM using min-image displacement from member 0.
         member_ids = composites.members[c]  # (M,)
-        valid_mask = (
-            (member_ids >= 0) & (jnp.arange(config.max_composite_size) < n_members)
-        ).astype(jnp.float32)  # (M,)
-        safe_member_ids = jnp.where(member_ids >= 0, member_ids, 0)  # (M,)
-        member_positions = particles.position[safe_member_ids]  # (M, 2)
-        com = jnp.sum(member_positions * valid_mask[:, None], axis=0) / (n_members + 1e-8)
+        safe_ids = jnp.where(member_ids >= 0, member_ids, 0)
+        valid = (member_ids >= 0) & (jnp.arange(M) < n)
+        ref = particles.position[safe_ids[0]]
 
-        energy_per_member = jnp.where(
-            n_members > 0,
-            composites.binding_energy[c] * (1.0 - config.fission_cost) / (n_members + 1e-8),
-            0.0
-        )
+        def disp_from_ref(idx):
+            d = particles.position[safe_ids[idx]] - ref
+            if config.boundary_mode == "periodic":
+                d = d - config.world_width  * jnp.round(d[0] / config.world_width)  * jnp.array([1., 0.])
+                d = d - config.world_height * jnp.round(d[1] / config.world_height) * jnp.array([0., 1.])
+            return d
 
-        def release_member(m_idx):
-            """Release member at slot m_idx of composite c."""
-            pid = composites.members[c, m_idx]
-            valid = does_fission & (m_idx < n_members) & (pid >= 0)
-            d = particles.position[pid] - com  # uses pre-computed com
-            d_norm = jnp.linalg.norm(d) + 1e-8
-            d_hat = d / d_norm
-            kick_speed = jnp.sqrt(jnp.maximum(0.0, 2.0 * energy_per_member))
-            kick = d_hat * kick_speed
-            return pid, valid, kick
+        rels = jax.vmap(disp_from_ref)(jnp.arange(M))  # (M, 2)
 
-        member_pids, member_valid, member_kicks = jax.vmap(release_member)(
-            jnp.arange(config.max_composite_size, dtype=jnp.int32)
-        )
-        return member_pids, member_valid, member_kicks
+        in_p0 = valid & (assignment == 0)
+        in_p1 = valid & (assignment == 1)
+        n0 = jnp.sum(in_p0.astype(jnp.float32))
+        n1 = jnp.sum(in_p1.astype(jnp.float32))
+        com0 = ref + jnp.sum(rels * in_p0[:, None].astype(jnp.float32), axis=0) / (n0 + 1e-8)
+        com1 = ref + jnp.sum(rels * in_p1[:, None].astype(jnp.float32), axis=0) / (n1 + 1e-8)
 
-    # vmap over composites
-    all_pids, all_valid, all_kicks = jax.vmap(release_members_from_composite)(
-        jnp.arange(config.max_composites, dtype=jnp.int32)
+        rank = fission_rank[c]
+        target_p1 = free_slots[jnp.clip(rank, 0, C - 1)]
+
+        return assignment, com0, com1, target_p1, n0.astype(jnp.int32), n1.astype(jnp.int32)
+
+    all_assignment, all_com0, all_com1, all_target_p1, all_n0, all_n1 = jax.vmap(per_composite)(
+        jnp.arange(C, dtype=jnp.int32)
     )
-    # all_pids:   (C, M) int32
-    # all_valid:  (C, M) bool
-    # all_kicks:  (C, M, 2) float32
+    # Shapes: (C, M), (C, 2), (C, 2), (C,), (C,), (C,)
 
-    # Flatten and apply to particle arrays
-    flat_pids  = all_pids.reshape(-1)   # (C*M,)
-    flat_valid = all_valid.reshape(-1)  # (C*M,)
-    flat_kicks = all_kicks.reshape(-1, 2)  # (C*M, 2)
+    # ── Update each member particle's composite_id and velocity ────────────
+    def per_member(c, m):
+        does_fission = fissions[c]
+        n = composites.member_count[c]
+        member_id = composites.members[c, m]
+        valid = does_fission & (m < n) & (member_id >= 0)
 
-    # Release particles: set composite_id to -1, add velocity kick.
-    # Route invalid entries to OOB index N (dropped) so they can't race against
-    # a real write to index 0 — JAX at[].set() with duplicate indices has
-    # indeterminate behavior, and the previous safe_pids=0 fallback caused
-    # particle 0's composite_id to be non-deterministically clobbered.
-    N = config.num_particles
-    drop_pids = jnp.where(flat_valid, flat_pids, N)
-    new_composite_id = particles.composite_id.at[drop_pids].set(-1, mode='drop')
-    # at[].add() with duplicates is well-defined as accumulation, and
-    # invalid entries add 0, so the original safe_pids=0 form is fine here.
-    safe_pids = jnp.where(flat_valid, flat_pids, 0)
+        a = all_assignment[c, m]
+        com0 = all_com0[c]
+        com1 = all_com1[c]
+        n0 = all_n0[c]
+        n1 = all_n1[c]
+        target_p1 = all_target_p1[c]
+
+        # Direction along COM-COM axis (min-image).
+        d = com0 - com1
+        if config.boundary_mode == "periodic":
+            d = d - config.world_width  * jnp.round(d[0] / config.world_width)  * jnp.array([1., 0.])
+            d = d - config.world_height * jnp.round(d[1] / config.world_height) * jnp.array([0., 1.])
+        d_norm = jnp.linalg.norm(d) + 1e-8
+        d_hat = d / d_norm
+
+        # Energy split: half to each product.
+        e_per = composites.binding_energy[c] * (1.0 - config.fission_cost) * 0.5
+
+        # Mass per product (mass=1 per particle).
+        mass_p0 = n0.astype(jnp.float32)
+        mass_p1 = n1.astype(jnp.float32)
+        v0 = jnp.sqrt(jnp.maximum(0.0, 2.0 * e_per / (mass_p0 + 1e-8)))
+        v1 = jnp.sqrt(jnp.maximum(0.0, 2.0 * e_per / (mass_p1 + 1e-8)))
+
+        # Kick: product 0 → +d_hat * v0, product 1 → -d_hat * v1.
+        kick = jnp.where(
+            a == 0,
+            d_hat * v0,
+            jnp.where(a == 1, -d_hat * v1, jnp.zeros(2)),
+        )
+
+        # New composite_id:
+        #   a==0 and n0>=2 → c (reuse parent slot)
+        #   a==0 and n0==1 → -1 (free)
+        #   a==1 and n1>=2 → target_p1
+        #   a==1 and n1==1 → -1 (free)
+        #   a==-1 (padding) → preserve original (the scatter is gated on `valid`,
+        #                     so this value is never written; use a safe default).
+        safe_member = jnp.where(member_id >= 0, member_id, 0)
+        new_cid = jnp.where(
+            a == 0,
+            jnp.where(n0 >= 2, c, jnp.int32(-1)),
+            jnp.where(a == 1,
+                      jnp.where(n1 >= 2, target_p1, jnp.int32(-1)),
+                      particles.composite_id[safe_member]),
+        )
+
+        return member_id, valid, new_cid, kick
+
+    pid_grid, valid_grid, cid_grid, kick_grid = jax.vmap(
+        lambda c: jax.vmap(lambda m: per_member(c, m))(jnp.arange(M, dtype=jnp.int32))
+    )(jnp.arange(C, dtype=jnp.int32))
+    # Shapes: (C, M), (C, M), (C, M), (C, M, 2)
+
+    flat_pid   = pid_grid.reshape(-1)
+    flat_valid = valid_grid.reshape(-1)
+    flat_cid   = cid_grid.reshape(-1)
+    flat_kick  = kick_grid.reshape(-1, 2)
+
+    # Route invalid entries to OOB index N (dropped). Without mode='drop',
+    # JAX scatters with duplicate indices have indeterminate behavior, so
+    # M-1 invalid slots writing the read-back value to index 0 would race
+    # against any real write to particle 0.
+    drop_pids = jnp.where(flat_valid, flat_pid, N)
+    new_composite_id = particles.composite_id.at[drop_pids].set(flat_cid, mode='drop')
+
+    # Velocity adds — duplicates accumulate, invalid entries add 0, so safe form is fine.
+    safe_pids = jnp.where(flat_valid, flat_pid, 0)
     new_velocity = particles.velocity.at[safe_pids].add(
-        jnp.where(flat_valid[:, None], flat_kicks, 0.0)
+        jnp.where(flat_valid[:, None], flat_kick, 0.0)
+    )
+
+    # ── Update CompositeState: parent slot becomes product 0; target_p1 slot becomes product 1 ──
+    def per_product(c):
+        does_fission = fissions[c]
+        assignment = all_assignment[c]
+        member_ids = composites.members[c]
+        n = composites.member_count[c]
+
+        # Compact members of each product to front using cumsum (same trick as fusion).
+        in_p0 = (assignment == 0) & (member_ids >= 0) & (jnp.arange(M) < n)
+        in_p1 = (assignment == 1) & (member_ids >= 0) & (jnp.arange(M) < n)
+
+        pos_p0 = jnp.cumsum(in_p0.astype(jnp.int32)) - 1
+        out_pos_p0 = jnp.where(in_p0, pos_p0, M)
+        members_p0 = jnp.full(M, -1, dtype=jnp.int32).at[out_pos_p0].set(member_ids, mode='drop')
+        count_p0 = jnp.sum(in_p0.astype(jnp.int32))
+
+        pos_p1 = jnp.cumsum(in_p1.astype(jnp.int32)) - 1
+        out_pos_p1 = jnp.where(in_p1, pos_p1, M)
+        members_p1 = jnp.full(M, -1, dtype=jnp.int32).at[out_pos_p1].set(member_ids, mode='drop')
+        count_p1 = jnp.sum(in_p1.astype(jnp.int32))
+
+        # Species hashes via commutative sum over each product's members.
+        def hash_for_product(members_arr, count_arr):
+            safe = jnp.where(members_arr >= 0, members_arr, 0)
+            sp = particles.species[safe]
+            valid_m = (members_arr >= 0) & (jnp.arange(M) < count_arr)
+            hvals = jax.vmap(lambda s: _entity_hash_val(s, config))(sp)
+            return jnp.sum(jnp.where(valid_m, hvals, 0)) % config.hash_modulus
+
+        h_p0 = hash_for_product(members_p0, count_p0).astype(jnp.uint32)
+        h_p1 = hash_for_product(members_p1, count_p1).astype(jnp.uint32)
+
+        return members_p0, count_p0, h_p0, members_p1, count_p1, h_p1
+
+    p0_members, p0_count, p0_hash, p1_members, p1_count, p1_hash = jax.vmap(per_product)(
+        jnp.arange(C, dtype=jnp.int32)
+    )
+
+    # ── Write product 0 into parent slot c (in place) ──
+    p0_alive = fissions & (p0_count >= 2)
+
+    # Half-life from BE + size penalty. Same formula as fusion_scan_body.
+    # Take both args explicitly so both can be vmapped (closing over p0_count
+    # would mis-broadcast against scalar `be` under vmap).
+    def _hl_from_be_and_n(be, n):
+        t = jnp.clip((be - physics.fusion_threshold) / (1.0 - physics.fusion_threshold + 1e-8), 0.0, 1.0)
+        hl_base = config.half_life_min + (config.half_life_max - config.half_life_min) * t
+        size_penalty = 1.0 + config.composite_size_decay_scale * jnp.maximum(
+            0.0, n.astype(jnp.float32) - 2.0
+        )
+        return hl_base / size_penalty
+
+    p0_be_all = jax.vmap(lambda h: _hash_to_binding_energy(h, config, physics))(p0_hash)
+    p0_hl_all = jax.vmap(_hl_from_be_and_n)(p0_be_all, p0_count)
+
+    new_alive = jnp.where(fissions, p0_alive, composites.alive)
+    new_members = jnp.where(fissions[:, None], p0_members, composites.members)
+    new_member_count = jnp.where(fissions, p0_count, composites.member_count)
+    new_species_hash = jnp.where(fissions, p0_hash, composites.species_hash)
+    new_binding_energy = jnp.where(fissions, p0_be_all, composites.binding_energy)
+    new_half_life = jnp.where(fissions, p0_hl_all, composites.half_life)
+    # Reset age on the parent slot (it's now a fresh product).
+    new_age = jnp.where(fissions, jnp.float32(0.0), composites.age)
+
+    # ── Write product 1 into all_target_p1[c] when fissions[c] AND p1_count[c] >= 2 ──
+    p1_writes = fissions & (p1_count >= 2)
+
+    p1_be_all = jax.vmap(lambda h: _hash_to_binding_energy(h, config, physics))(p1_hash)
+    p1_hl_all = jax.vmap(_hl_from_be_and_n)(p1_be_all, p1_count)
+
+    # Scatter-write product 1 to all_target_p1[c]. Guard against negative
+    # indices: find_free_slots returns -1 when there aren't enough free slots,
+    # and JAX's negative-index default would wrap to [C-1] — clobbering the
+    # last composite. Route those to C (OOB) so mode='drop' actually drops them.
+    drop_targets = jnp.where(
+        p1_writes & (all_target_p1 >= 0),
+        all_target_p1,
+        C,  # OOB → drop
+    )
+
+    new_alive          = new_alive.at[drop_targets].set(p1_writes, mode='drop')
+    new_members        = new_members.at[drop_targets].set(p1_members, mode='drop')
+    new_member_count   = new_member_count.at[drop_targets].set(p1_count, mode='drop')
+    new_species_hash   = new_species_hash.at[drop_targets].set(p1_hash, mode='drop')
+    new_binding_energy = new_binding_energy.at[drop_targets].set(p1_be_all, mode='drop')
+    new_half_life      = new_half_life.at[drop_targets].set(p1_hl_all, mode='drop')
+    new_age            = new_age.at[drop_targets].set(jnp.float32(0.0), mode='drop')
+
+    new_composites = composites._replace(
+        members=new_members,
+        member_count=new_member_count,
+        alive=new_alive,
+        binding_energy=new_binding_energy,
+        half_life=new_half_life,
+        age=new_age,
+        species_hash=new_species_hash,
     )
 
     new_particles = particles._replace(
         composite_id=new_composite_id,
         velocity=new_velocity,
     )
-    new_composites = composites._replace(alive=new_comp_alive)
 
     return state._replace(
         particles=new_particles,

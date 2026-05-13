@@ -261,6 +261,112 @@ def test_composite_member_consistency():
     assert not errors, f"{len(errors)} member consistency errors found (first: {errors[0]})"
 
 
+def test_fission_conserves_particles_and_species():
+    """
+    Run the sim with very short half-life so composites decay aggressively.
+    Total particle count and per-species counts must be exactly preserved.
+    """
+    config = SimConfig(
+        half_life_min=5.0,
+        half_life_max=20.0,
+        num_particles=500,
+    )
+    state = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=42)
+    physics = initialize_physics_params(config)
+    step_fn = jax.jit(simulation_step, static_argnums=(2,))
+    state = step_fn(state, params, config, physics)  # warm-up
+
+    initial_species = jnp.asarray(state.particles.species)
+    initial_count = config.num_particles
+    initial_per_species = jnp.bincount(initial_species, length=config.num_species)
+
+    for s in range(800):
+        state = step_fn(state, params, config, physics)
+
+    final_species = jnp.asarray(state.particles.species)
+    final_count = state.particles.position.shape[0]
+    final_per_species = jnp.bincount(final_species, length=config.num_species)
+
+    assert final_count == initial_count, (
+        f"particle count not conserved: {initial_count} → {final_count}"
+    )
+    assert jnp.all(initial_species == final_species), (
+        "particle species changed — fission must not transmute"
+    )
+    assert jnp.all(initial_per_species == final_per_species), (
+        f"per-species counts changed:\n  initial={initial_per_species}\n  final={final_per_species}"
+    )
+
+
+def test_fission_produces_two_products():
+    """
+    Run with short half-life and check that some composites have produced
+    fission products of size 1 (free particle) AND size 2+ (new composite),
+    indicating binary partitioning is actually splitting members.
+    """
+    config = SimConfig(
+        half_life_min=5.0,
+        half_life_max=20.0,
+        num_particles=500,
+    )
+    state = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=42)
+    physics = initialize_physics_params(config)
+    step_fn = jax.jit(simulation_step, static_argnums=(2,))
+
+    state = step_fn(state, params, config, physics)
+    sizes_seen = set()
+    for s in range(800):
+        state = step_fn(state, params, config, physics)
+        alive = jnp.asarray(state.composites.alive)
+        mc = jnp.asarray(state.composites.member_count)
+        for size in mc[alive].tolist():
+            sizes_seen.add(int(size))
+
+    # We must observe size-2 composites at minimum (from fission of size-3+).
+    # Size-3+ composites should also occur (from fusion or fission of size-5+).
+    assert 2 in sizes_seen, f"never saw size-2 composites in 800 steps: {sorted(sizes_seen)}"
+    assert max(sizes_seen) >= 3, f"never saw size-3+ composites: {sorted(sizes_seen)}"
+
+
+def test_fission_creates_intermediate_size_products():
+    """
+    With binary fission, a size-5 composite should split into products
+    of sizes (1,4), (2,3), (3,2), or (4,1). This produces composites at
+    sizes 2, 3, 4 that wouldn't easily form purely through fusion in the
+    same time window.
+
+    With the OLD `release everything as free` decay, a size-5 composite
+    fully dissociates to 5 free particles, and intermediate sizes would
+    only re-form through subsequent fusion (slow). With NEW binary fission,
+    intermediate sizes appear immediately.
+    """
+    config = SimConfig(
+        half_life_min=10.0,
+        half_life_max=30.0,
+        fusion_threshold=0.4,
+        num_particles=500,
+    )
+    state = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=42)
+    physics = initialize_physics_params(config)
+    step_fn = jax.jit(simulation_step, static_argnums=(2,))
+    state = step_fn(state, params, config, physics)
+
+    size_3_instances = 0
+    for s in range(500):
+        state = step_fn(state, params, config, physics)
+        alive = jnp.asarray(state.composites.alive)
+        mc = jnp.asarray(state.composites.member_count)
+        size_3_instances += int(jnp.sum((alive) & (mc == 3)))
+
+    assert size_3_instances >= 50, (
+        f"too few size-3 composite-instances observed: {size_3_instances} "
+        "(binary fission should produce these readily)"
+    )
+
+
 # ── Standalone runner ─────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
