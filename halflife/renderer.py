@@ -476,6 +476,12 @@ class Renderer:
         self._stats_step     = 0
         self._stats_sim_time = 0.0
         self._stats_hist     = np.zeros(config.max_composite_size, dtype=np.int32)
+        # Histogram x-axis state — see the histogram block in
+        # _render_hud_surface. Expansion is instant (so data never overflows
+        # the chart) but shrinking only happens every HIST_AXIS_SHRINK_FRAMES
+        # frames to suppress jitter from churning small composites.
+        self._hist_size_max_cached = 2
+        self._hist_axis_age        = 0
 
         # Event counters
         self._fusion_total   = 0
@@ -1027,7 +1033,21 @@ class Renderer:
             # largest live size = (highest non-zero index) + 1.
             nz = np.flatnonzero(self._stats_hist) if len(self._stats_hist) else np.array([], dtype=np.int32)
             largest_live = int(nz.max()) + 1 if len(nz) > 0 else 2
-            size_max  = max(2, min(largest_live, config.max_composite_size))
+            target_size  = max(2, min(largest_live, config.max_composite_size))
+            # Cached x-axis upper bound: grow immediately if a larger composite
+            # appears (otherwise its bar would clip off-chart), but only
+            # *shrink* once every HIST_AXIS_SHRINK_FRAMES frames so the axis
+            # doesn't twitch every time fusion/fission rearranges the tail.
+            HIST_AXIS_SHRINK_FRAMES = 100
+            self._hist_axis_age += 1
+            if target_size > self._hist_size_max_cached:
+                self._hist_size_max_cached = target_size
+                self._hist_axis_age = 0
+            elif (target_size < self._hist_size_max_cached
+                  and self._hist_axis_age >= HIST_AXIS_SHRINK_FRAMES):
+                self._hist_size_max_cached = target_size
+                self._hist_axis_age = 0
+            size_max  = self._hist_size_max_cached
             bin_width = max(1, -(-size_max // MAX_BINS_HIST))   # ceil(size_max / MAX_BINS_HIST)
             n_bins    = -(-size_max // bin_width)               # ceil(size_max / bin_width)
             bar_w     = max(1, (chart_w - n_bins) // max(1, n_bins))
