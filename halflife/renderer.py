@@ -408,8 +408,6 @@ class Renderer:
             # \u2500\u2500 Fusion chemistry \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
             ("fusion_threshold",         "fuse thresh", 0.2,   "{:.3f}", None),
             ("binding_energy_scale",     "bind energy", 1.0,   "{:.3f}", None),
-            ("polarity_fusion_scale",    "pol fuse",    0.3,   "{:.3f}", None),
-            ("polarity_stability_scale", "pol stab",    0.5,   "{:.3f}", None),
             None,
             # \u2500\u2500 Particle dynamics \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
             ("dt",                       "dt",          0.02,  "{:.4f}", (0.001, 0.1)),

@@ -91,11 +91,7 @@ class SimConfig:
     # max_decay_products: int = 3
     # Kept commented for revival reference; safe to delete in a follow-up.
 
-    # ── Polarity Chemistry ────────────────────────────────────────────────────
-    # Each species has a signed polarity charge p[s] ∈ [-1, 1].
-    # Opposite polarities fuse more readily; neutral composites live longer.
-    polarity_fusion_scale:      float = 0.3   # bonus/penalty to binding energy
-    polarity_stability_scale:   float = 0.5   # neutrality boost to composite half-life
+    # ── Composite Stability ───────────────────────────────────────────────────
     composite_size_decay_scale: float = 0.05   # size penalty on composite half-life (larger → shorter hl)
 
     # ── Performance Caps ─────────────────────────────────────────────────────

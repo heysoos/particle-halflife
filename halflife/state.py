@@ -225,8 +225,6 @@ class PhysicsParams(NamedTuple):
     damping:                  jnp.ndarray  # () float32 — velocity damping per step
     repulsion_strength:       jnp.ndarray  # () float32 — hard-core repulsion magnitude
     fusion_threshold:         jnp.ndarray  # () float32 — min binding energy to fuse [0,1]
-    polarity_fusion_scale:    jnp.ndarray  # () float32 — ionic bonding preference
-    polarity_stability_scale: jnp.ndarray  # () float32 — neutral composite stability bonus
     binding_energy_scale:     jnp.ndarray  # () float32 — energy released on fusion
     repulsion_radius:         jnp.ndarray  # () float32 — inner hard-core repulsion radius
     r_cutoff_scale:           jnp.ndarray  # () float32 — multiplier on per-species r_cutoff
@@ -241,8 +239,6 @@ def initialize_physics_params(config: SimConfig) -> PhysicsParams:
         damping=jnp.float32(config.damping),
         repulsion_strength=jnp.float32(config.repulsion_strength),
         fusion_threshold=jnp.float32(config.fusion_threshold),
-        polarity_fusion_scale=jnp.float32(config.polarity_fusion_scale),
-        polarity_stability_scale=jnp.float32(config.polarity_stability_scale),
         binding_energy_scale=jnp.float32(config.binding_energy_scale),
         repulsion_radius=jnp.float32(config.repulsion_radius),
         r_cutoff_scale=jnp.float32(1.0),
