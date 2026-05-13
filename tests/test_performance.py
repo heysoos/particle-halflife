@@ -216,15 +216,13 @@ def benchmark_compute_forces():
     nb  = neighbors_jit(particles.position, cl, config)
     nb.block_until_ready()
 
-    attr_mod = jnp.ones(config.num_particles, dtype=jnp.float32)
-
     f = forces_jit(particles.position, particles.species,
-                   nb, params, config, physics, attr_mod)
+                   nb, params, config, physics)
     f.block_until_ready()
 
     def one_call():
         f = forces_jit(particles.position, particles.species,
-                       nb, params, config, physics, attr_mod)
+                       nb, params, config, physics)
         f.block_until_ready()
 
     mean_ms, std_ms = _time_fn(one_call, n_warmup=3, n_bench=50)
@@ -295,9 +293,6 @@ def benchmark_per_phase_breakdown():
 
     # Pre-compute fixed intermediates (frozen state)
     particles = state.particles
-    is_comp   = particles.composite_id >= 0
-    safe_cid  = jnp.clip(particles.composite_id, 0, config.max_composites - 1)
-    attr_mod  = jnp.where(is_comp, state.composites.net_polarity[safe_cid], 1.0)
 
     cl_fixed = build_jit(particles.position, config)
     cl_fixed.particle_ids.block_until_ready()
@@ -309,7 +304,7 @@ def benchmark_per_phase_breakdown():
         build_jit(particles.position, config).particle_ids.block_until_ready()
         nb_jit(particles.position, cl_fixed, config).block_until_ready()
         forces_jit(particles.position, particles.species,
-                   nb_fixed, params, config, physics, attr_mod).block_until_ready()
+                   nb_fixed, params, config, physics).block_until_ready()
         if config.use_bond_forces:
             bond_jit(state, config, physics).block_until_ready()
         fusion_jit(state, nb_fixed, params, config, physics).particles.composite_id.block_until_ready()
@@ -331,7 +326,7 @@ def benchmark_per_phase_breakdown():
                      .block_until_ready())
     _t("3. compute_all_forces",
        lambda: forces_jit(particles.position, particles.species,
-                          nb_fixed, params, config, physics, attr_mod)
+                          nb_fixed, params, config, physics)
                          .block_until_ready())
     if config.use_bond_forces:
         _t("4. compute_bond_forces",

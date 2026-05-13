@@ -171,16 +171,8 @@ def simulation_step(state: WorldState, params: InteractionParams,
     neighbors = find_all_neighbors(particles.position, cell_list, config)
 
     # ── Phase 3: Force Computation ────────────────────────────────────────────
-    # Polarity modifier: composite members use their composite's net_polarity;
-    # free particles use 1.0 (no scaling).
-    is_composite = particles.composite_id >= 0
-    safe_cid = jnp.clip(particles.composite_id, 0, config.max_composites - 1)
-    net_pol = state.composites.net_polarity[safe_cid]   # (N,) float32
-    attr_mod = jnp.where(is_composite, net_pol, 1.0)    # (N,) float32
-
     forces = compute_all_forces(
-        particles.position, particles.species, neighbors, params, config,
-        physics, attr_mod
+        particles.position, particles.species, neighbors, params, config, physics
     )
 
     # Bond forces (optional — expensive; enable via config.use_bond_forces)

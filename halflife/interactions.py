@@ -82,23 +82,16 @@ def particle_life_force(r: jnp.ndarray, attraction: jnp.ndarray,
 def pairwise_force(pos_i: jnp.ndarray, pos_j: jnp.ndarray,
                    species_i: jnp.ndarray, species_j: jnp.ndarray,
                    params: InteractionParams, config: SimConfig,
-                   physics: PhysicsParams,
-                   attr_mod_i: jnp.ndarray = 1.0,
-                   attr_mod_j: jnp.ndarray = 1.0) -> jnp.ndarray:
+                   physics: PhysicsParams) -> jnp.ndarray:
     """
     Compute force on particle i due to particle j.
-
-    attr_mod_i/j: scalar polarity modifiers. For composite members, this is
-    the composite's net_polarity; for free particles, 1.0. The attraction
-    term is scaled by attr_mod_i * attr_mod_j — near-zero for balanced
-    composites, larger (and sign-flipping) for polarized ones.
 
     Args:
         pos_i, pos_j:      (2,) float32 — positions
         species_i/j:       scalar int32  — species indices
         params:            InteractionParams
         config:            SimConfig (static)
-        attr_mod_i/j:      scalar float32 — polarity modifier (default 1.0)
+        physics:           PhysicsParams (runtime-tunable)
 
     Returns:
         (2,) float32 — force vector on i (pointing away from j if repulsive)
@@ -109,25 +102,20 @@ def pairwise_force(pos_i: jnp.ndarray, pos_j: jnp.ndarray,
         d = d - config.world_width  * jnp.round(d[0] / config.world_width) * jnp.array([1., 0.])
         d = d - config.world_height * jnp.round(d[1] / config.world_height) * jnp.array([0., 1.])
 
-    r = jnp.linalg.norm(d) + 1e-10  # distance (avoid div-by-zero)
-    d_hat = d / r                     # unit direction
+    r = jnp.linalg.norm(d) + 1e-10
+    d_hat = d / r
 
-    # Look up species-pair parameters; convert fractions to absolute distances.
-    # interaction_radius is the static unit; per-pair fractions in (0, 1] scale it.
+    # Look up species-pair parameters
     aij = params.attraction[species_i, species_j]
-    r_peak  = config.interaction_radius * params.peak_fraction[species_i, species_j]
-    r_cut   = config.interaction_radius * params.cutoff_fraction[species_i, species_j]
+    r_a = params.peak_fraction[species_i, species_j] * config.interaction_radius
+    r_c = params.cutoff_fraction[species_i, species_j] * config.interaction_radius
 
-    # Scale attraction by composite polarity modifiers (multiplicative)
-    eff_attraction = aij * attr_mod_i * attr_mod_j
-    f_mag = particle_life_force(r, eff_attraction * physics.attraction_scale,
-                                physics.repulsion_radius, r_peak,
-                                r_cut * physics.r_cutoff_scale,
+    f_mag = particle_life_force(r, aij * physics.attraction_scale,
+                                physics.repulsion_radius, r_a,
+                                r_c * physics.r_cutoff_scale,
                                 physics.repulsion_strength)
 
-    # Positive f_mag = repulsive = in direction of d (i away from j)
-    # Negative f_mag = attractive = in direction of -d (i toward j)
-    return -f_mag * d_hat  # sign convention: negative = toward j = attractive
+    return -f_mag * d_hat
 
 
 def compute_forces_for_particle(i: jnp.ndarray,
@@ -136,37 +124,21 @@ def compute_forces_for_particle(i: jnp.ndarray,
                                   neighbors: jnp.ndarray,
                                   params: InteractionParams,
                                   config: SimConfig,
-                                  physics: PhysicsParams,
-                                  attr_mod: jnp.ndarray = None) -> jnp.ndarray:
+                                  physics: PhysicsParams) -> jnp.ndarray:
     """
     Net force on particle i from all its neighbors.
-
-    Args:
-        i:          scalar int32 — particle index
-        positions:  (N, 2)
-        species:    (N,)
-        neighbors:  (max_neighbors,) int32 — neighbor indices for particle i
-        params:     InteractionParams
-        config:     SimConfig (static)
-        attr_mod:   (N,) float32 — per-particle polarity modifier (1.0 = no change)
-
-    Returns:
-        (2,) float32 — total force on particle i
     """
     pos_i = positions[i]
     sp_i  = species[i]
-    mod_i = attr_mod[i]
 
     def force_from_neighbor(j):
         valid = (j >= 0)
-        pos_j = jnp.where(valid, positions[j], pos_i)  # safe fallback
+        pos_j = jnp.where(valid, positions[j], pos_i)
         sp_j  = jnp.where(valid, species[j], sp_i)
-        mod_j = attr_mod[j]  # safe: result is masked below when j invalid
-        f = pairwise_force(pos_i, pos_j, sp_i, sp_j, params, config, physics, mod_i, mod_j)
+        f = pairwise_force(pos_i, pos_j, sp_i, sp_j, params, config, physics)
         return jnp.where(valid, f, jnp.zeros(2))
 
-    # vmap over the neighbor array
-    forces = jax.vmap(force_from_neighbor)(neighbors)  # (max_neighbors, 2)
+    forces = jax.vmap(force_from_neighbor)(neighbors)
     return jnp.sum(forces, axis=0)
 
 
@@ -175,30 +147,15 @@ def compute_all_forces(positions: jnp.ndarray,
                         neighbors: jnp.ndarray,
                         params: InteractionParams,
                         config: SimConfig,
-                        physics: PhysicsParams,
-                        attr_mod: jnp.ndarray = None) -> jnp.ndarray:
+                        physics: PhysicsParams) -> jnp.ndarray:
     """
     Compute net force for every particle simultaneously (outer vmap).
-
-    Args:
-        positions:  (N, 2) float32
-        species:    (N,)   int32
-        neighbors:  (N, max_neighbors) int32
-        params:     InteractionParams
-        config:     SimConfig (static)
-        attr_mod:   (N,) float32 — per-particle polarity modifier (1.0 = no change)
-
-    Returns:
-        (N, 2) float32 — force vectors per particle
     """
-    if attr_mod is None:
-        attr_mod = jnp.ones(config.num_particles, dtype=jnp.float32)
-
     particle_indices = jnp.arange(config.num_particles, dtype=jnp.int32)
 
     def forces_for_i(i):
         return compute_forces_for_particle(
-            i, positions, species, neighbors[i], params, config, physics, attr_mod
+            i, positions, species, neighbors[i], params, config, physics
         )
 
-    return jax.vmap(forces_for_i)(particle_indices)   # (N, 2)
+    return jax.vmap(forces_for_i)(particle_indices)
