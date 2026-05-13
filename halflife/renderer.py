@@ -461,6 +461,7 @@ class Renderer:
         self._stats_alive    = 0
         self._stats_free     = 0
         self._stats_n_comp   = 0
+        self._stats_n_unique = 0   # # of distinct species_hash values across alive composites
         self._stats_energy   = 0.0
         self._stats_step     = 0
         self._stats_sim_time = 0.0
@@ -477,6 +478,7 @@ class Renderer:
         SPARK_LEN = 150
         self._spark_free   = collections.deque(maxlen=SPARK_LEN)
         self._spark_comp   = collections.deque(maxlen=SPARK_LEN)
+        self._spark_unique = collections.deque(maxlen=SPARK_LEN)
         self._spark_energy = collections.deque(maxlen=SPARK_LEN)
         self._spark_fusion = collections.deque(maxlen=SPARK_LEN)
         self._spark_decay  = collections.deque(maxlen=SPARK_LEN)
@@ -571,13 +573,14 @@ class Renderer:
 
         # Single batched GPU→CPU transfer — one CUDA sync + one DMA instead of 13
         (pos, vel, species, mass, _energy, comp_id,
-         comp_members, comp_count, comp_alive,
+         comp_members, comp_count, comp_alive, comp_species_hash,
          total_energy, step_count, sim_time) = jax.device_get((
             particles.position, particles.velocity,
             particles.species,
             particles.mass,     particles.energy,
             particles.composite_id,
             composites.members, composites.member_count, composites.alive,
+            composites.species_hash,
             state.total_energy, state.step_count, state.time,
         ))
 
@@ -740,8 +743,14 @@ class Renderer:
                 alive_counts,
                 bins=np.arange(1, config.max_composite_size + 2)
             )
+            # Distinct composite "types": each species_hash identifies one
+            # multiset of member species, so the unique count is the size of
+            # the chemical zoo currently alive. np.unique on ~3k uint32s is
+            # microseconds — safe to call every frame.
+            self._stats_n_unique = int(np.unique(comp_species_hash[comp_alive]).size)
         else:
             self._stats_hist = np.zeros(config.max_composite_size, dtype=np.int32)
+            self._stats_n_unique = 0
 
         # ── Event detection ───────────────────────────────────────────────────
         current_sim_time  = self._stats_sim_time
@@ -806,6 +815,7 @@ class Renderer:
         # Sparklines
         self._spark_free.append(self._stats_free)
         self._spark_comp.append(self._stats_n_comp)
+        self._spark_unique.append(self._stats_n_unique)
         self._spark_energy.append(self._stats_energy)
         self._spark_fusion.append(self._fusion_rate)
         self._spark_decay.append(self._decay_rate)
@@ -932,9 +942,9 @@ class Renderer:
         # ── Stats panel ───────────────────────────────────────────────────────
         if self._show_stats:
             config = self.config
-            # panel_h: 4 static rows (16px) + 5 spark-stat rows (15+18px) +
+            # panel_h: 4 static rows (16px) + 6 spark-stat rows (15+18px) +
             #          gap + header (18px) + chart (64px) + ticks (20px) + bottom (10px)
-            panel_h = (4 * 16 + 5 * 33 + 4 + 18 + 64 + 20 + 10)
+            panel_h = (4 * 16 + 6 * 33 + 4 + 18 + 64 + 20 + 10)
             panel_w = 215
             panel_x = config.window_width - panel_w - 8
             panel_y = self._stats_btn_rect.bottom + 4
@@ -961,8 +971,9 @@ class Renderer:
             spark_h = 14
             spark_x = panel_x + 8
             for label, spark_data, color in [
-                (f"Free:       {self._stats_free:,}",   self._spark_free,   (80, 180, 255)),
-                (f"Composites: {self._stats_n_comp:,}", self._spark_comp,   (120, 220, 120)),
+                (f"Free:       {self._stats_free:,}",     self._spark_free,   (80, 180, 255)),
+                (f"Composites: {self._stats_n_comp:,}",   self._spark_comp,   (120, 220, 120)),
+                (f"Unique:     {self._stats_n_unique:,}", self._spark_unique, (200, 140, 220)),
                 (f"Energy:     {self._stats_energy:.0f}", self._spark_energy, (220, 180, 80)),
             ]:
                 txt = font.render(label, True, (190, 215, 255))
