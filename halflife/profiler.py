@@ -55,7 +55,6 @@ class CompositeInfo:
     member_count: int
     binding_energy: float
     species_hash: int
-    net_polarity: float
 
 
 @dataclass
