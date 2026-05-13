@@ -84,6 +84,16 @@ class SimConfig:
     # ── Composite Stability ───────────────────────────────────────────────────
     composite_size_decay_scale: float = 0.05   # size penalty on composite half-life (larger → shorter hl)
 
+    # ── Saturation / Valence (hash-encoded per-species capacity caps) ─────────
+    # When enabled, every multiset hash also rolls a per-species capacity vector.
+    # A would-be merged composite is permitted only if no species count exceeds
+    # its own cap. At fission time, products that violate their own caps shatter
+    # into free particles rather than forming a composite.
+    # Scales to any num_species via a per-species independent hash re-mix, so
+    # there is no bit-budget tied to the underlying 32-bit hash width.
+    use_capacity_caps: bool = True
+    capacity_max: int = 128   # cap values per species are drawn from [1, capacity_max]
+
     # ── Performance Caps ─────────────────────────────────────────────────────
     # Fusion scan length — set to num_particles to ensure all candidates are processed
     max_fusions_per_step: int = 200  # = num_particles

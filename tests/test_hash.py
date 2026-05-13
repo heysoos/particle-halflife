@@ -215,6 +215,61 @@ def test_partition_distribution_varies_with_hash():
     assert len(pivots_seen) >= 4, f"too few pivot values across 20 hashes: {pivots_seen}"
 
 
+# ── Tests for _hash_to_capacity (Option 5) ───────────────────────────────────
+
+def test_capacity_deterministic():
+    """Same hash must yield the same cap vector every call."""
+    from halflife.chemistry import _hash_to_capacity
+    config = SimConfig(use_capacity_caps=True)
+    h = jnp.uint32(0xDEADBEEF)
+    c1 = _hash_to_capacity(h, config)
+    c2 = _hash_to_capacity(h, config)
+    assert jnp.all(c1 == c2), f"non-deterministic: {c1} vs {c2}"
+
+
+def test_capacity_in_range():
+    """For any hash, every cap is in [1, capacity_max] and shape is (num_species,)."""
+    from halflife.chemistry import _hash_to_capacity
+    config = SimConfig(use_capacity_caps=True, capacity_max=16, num_species=12)
+    for h_val in [0, 1, 7, 99, 999_983, 2_147_483_647, 0xFFFFFFFF]:
+        caps = jnp.asarray(_hash_to_capacity(jnp.uint32(h_val), config))
+        assert caps.shape == (config.num_species,), f"bad shape: {caps.shape}"
+        assert int(caps.min()) >= 1, f"cap below 1: {caps.tolist()}"
+        assert int(caps.max()) <= config.capacity_max, (
+            f"cap above {config.capacity_max}: {caps.tolist()}"
+        )
+
+
+def test_capacity_varies_with_hash():
+    """Different hashes should produce visibly different cap vectors."""
+    from halflife.chemistry import _hash_to_capacity
+    config = SimConfig(use_capacity_caps=True, num_species=12)
+    vectors = set()
+    for h_val in range(30):
+        caps = _hash_to_capacity(jnp.uint32(h_val * 1_000_003), config)
+        vectors.add(tuple(jnp.asarray(caps).tolist()))
+    # 30 random-ish hashes should yield many distinct cap vectors —
+    # if we got <10, the mixer is collapsing the bit space.
+    assert len(vectors) >= 10, (
+        f"too few distinct cap vectors across 30 hashes: {len(vectors)}"
+    )
+
+
+def test_capacity_scales_to_many_species():
+    """The function must work with num_species > 32 (i.e., past the 32-bit width)."""
+    from halflife.chemistry import _hash_to_capacity
+    config = SimConfig(use_capacity_caps=True, num_species=64)
+    caps = jnp.asarray(_hash_to_capacity(jnp.uint32(12345), config))
+    assert caps.shape == (64,), f"bad shape: {caps.shape}"
+    assert int(caps.min()) >= 1
+    assert int(caps.max()) <= config.capacity_max
+    # Caps shouldn't all be identical — that would mean we're reading the same
+    # bits for every species (bit-budget failure).
+    assert len(set(caps.tolist())) >= 4, (
+        f"caps for 64 species collapsed to {len(set(caps.tolist()))} values"
+    )
+
+
 if __name__ == '__main__':
     passed = failed = 0
     for name, fn in [(n, v) for n, v in sorted(globals().items()) if n.startswith('test_')]:

@@ -420,6 +420,136 @@ def test_observability_distinct_composite_types():
     assert len(types_ever_seen) > 0, "no composite types ever observed"
 
 
+# ── Tests for capacity caps (Option 5) ───────────────────────────────────────
+
+def test_capacity_caps_off_unchanged():
+    """
+    With use_capacity_caps=False, the simulator behaves exactly as it did before:
+    same number of composites alive after 200 steps, regardless of capacity_max.
+    """
+    base = SimConfig(num_particles=500, use_capacity_caps=False)
+    state_a = _run_steps(200, config=base, seed=11)
+    state_b = _run_steps(200, config=SimConfig(num_particles=500, use_capacity_caps=False, capacity_max=4),
+                         seed=11)
+    n_a = int(jnp.sum(state_a.composites.alive.astype(jnp.int32)))
+    n_b = int(jnp.sum(state_b.composites.alive.astype(jnp.int32)))
+    assert n_a == n_b, (
+        f"capacity_max should not affect dynamics when use_capacity_caps=False: "
+        f"got {n_a} vs {n_b}"
+    )
+
+
+def test_capacity_caps_on_conserves_particles_and_species():
+    """
+    With caps on (including aggressive fission shattering), particle count and
+    per-species counts must still be exactly conserved.
+    """
+    config = SimConfig(
+        num_particles=500,
+        half_life_min=5.0,
+        half_life_max=20.0,
+        use_capacity_caps=True,
+        capacity_max=8,
+    )
+    state = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=42)
+    physics = initialize_physics_params(config)
+    step_fn = jax.jit(simulation_step, static_argnums=(2,))
+    state = step_fn(state, params, config, physics)  # warm-up
+
+    initial_species = jnp.asarray(state.particles.species)
+    initial_per_species = jnp.bincount(initial_species, length=config.num_species)
+
+    for _ in range(800):
+        state = step_fn(state, params, config, physics)
+
+    final_species = jnp.asarray(state.particles.species)
+    final_per_species = jnp.bincount(final_species, length=config.num_species)
+
+    assert state.particles.position.shape[0] == config.num_particles
+    assert jnp.all(initial_species == final_species), (
+        "particle species changed under caps — fission must not transmute"
+    )
+    assert jnp.all(initial_per_species == final_per_species), (
+        f"per-species counts changed under caps:\n"
+        f"  initial={initial_per_species}\n  final={final_per_species}"
+    )
+
+
+def test_capacity_caps_respected_at_fusion():
+    """
+    With caps on, no alive composite should have any species count exceeding
+    its hash-rolled cap. Verifying at the population level: if any composite
+    violates its own caps, the gate is broken.
+    """
+    from halflife.chemistry import _hash_to_capacity
+    config = SimConfig(
+        num_particles=500,
+        half_life_min=50.0,
+        half_life_max=200.0,
+        use_capacity_caps=True,
+        capacity_max=6,
+    )
+    state = _run_steps(400, config=config, seed=7)
+
+    alive = jnp.asarray(state.composites.alive)
+    members = jnp.asarray(state.composites.members)
+    mc = jnp.asarray(state.composites.member_count)
+    hashes = jnp.asarray(state.composites.species_hash)
+    species = jnp.asarray(state.particles.species)
+
+    violators = 0
+    n_checked = 0
+    for c_idx in jnp.where(alive)[0].tolist():
+        n_checked += 1
+        n = int(mc[c_idx])
+        mids = [int(x) for x in members[c_idx, :n].tolist() if x >= 0]
+        sp_counts = np.bincount(
+            [int(species[m]) for m in mids], minlength=config.num_species
+        )
+        caps = np.asarray(_hash_to_capacity(jnp.uint32(int(hashes[c_idx])), config))
+        if np.any(sp_counts > caps):
+            violators += 1
+
+    print(f"\nChecked {n_checked} alive composites; cap violators: {violators}")
+    assert violators == 0, (
+        f"{violators}/{n_checked} alive composites violate their own caps"
+    )
+
+
+def test_capacity_caps_limit_growth():
+    """
+    With caps on at a small capacity_max, composites should not reach the
+    JAX buffer size (max_composite_size). Without caps, they regularly do
+    when fusion_threshold is low.
+    """
+    base = dict(
+        num_particles=500,
+        half_life_min=50.0,
+        half_life_max=200.0,
+        fusion_threshold=0.3,  # permissive so growth happens
+        max_composite_size=64,
+    )
+
+    state_off = _run_steps(400, config=SimConfig(**base, use_capacity_caps=False), seed=3)
+    state_on  = _run_steps(400, config=SimConfig(**base, use_capacity_caps=True, capacity_max=6), seed=3)
+
+    max_off = int(jnp.max(jnp.where(state_off.composites.alive,
+                                      state_off.composites.member_count, 0)))
+    max_on  = int(jnp.max(jnp.where(state_on.composites.alive,
+                                      state_on.composites.member_count, 0)))
+
+    print(f"\nMax composite size: caps off={max_off}, caps on={max_on}")
+    # caps_on should bound size well below the buffer ceiling; we expect a
+    # clear gap even though specific values depend on seed.
+    assert max_on < max_off, (
+        f"caps did not reduce max composite size: off={max_off} vs on={max_on}"
+    )
+    assert max_on <= 6 * 12, (  # 6 caps_max × 12 species absolute ceiling
+        f"max size {max_on} exceeds sum of all caps (would imply broken gate)"
+    )
+
+
 # ── Standalone runner ─────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
