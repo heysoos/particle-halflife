@@ -17,7 +17,7 @@ Decay:
   Only composites decay; particles are conserved. Each composite has
   P(decay in dt) = 1 - exp(-dt*ln2/half_life). The half-life is derived
   from the composite's binding energy (high BE → long life), with a size
-  penalty and a polarity-stability bonus applied in fusion_scan_body.
+  penalty applied in fusion_scan_body (larger composites are less stable).
 
 Fission:
   Composite decay releases its member particles back to free state with

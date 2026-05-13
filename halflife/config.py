@@ -29,7 +29,7 @@ class SimConfig:
 
     # ── Particles ────────────────────────────────────────────────────────────
     num_particles: int = 5_000      # total particle count (fixed, all always alive)
-    num_species: int = 64           # number of distinct particle types
+    num_species: int = 12           # number of distinct particle types
     state_dim: int = 8              # internal state vector size (NCA-style, future use)
 
     # ── Composites ───────────────────────────────────────────────────────────
