@@ -242,7 +242,7 @@ def initialize_physics_params(config: SimConfig) -> PhysicsParams:
         binding_energy_scale=jnp.float32(config.binding_energy_scale),
         repulsion_radius=jnp.float32(config.repulsion_radius),
         r_cutoff_scale=jnp.float32(1.0),
-        spring_k=jnp.float32(50.0),
+        spring_k=jnp.float32(config.spring_k),
         attraction_scale=jnp.float32(1.0),
         dt=jnp.float32(config.dt),
     )

@@ -57,7 +57,7 @@ class SimConfig:
     # Fusion occurs when two free particles are within fusion_radius AND
     # the hash-derived binding energy exceeds fusion_threshold
     fusion_radius: float = 4.0        # must be < interaction_radius
-    fusion_threshold: float = 0.2     # minimum binding energy to trigger fusion [0,1]
+    fusion_threshold: float = 0.6     # minimum binding energy to trigger fusion [0,1]
 
     # ── Decay / Half-life ────────────────────────────────────────────────────
     # Composite half-lives are derived from their species hash using this range
@@ -89,6 +89,9 @@ class SimConfig:
     max_fusions_per_step: int = 200  # = num_particles
     # Enable spring bond forces between composite members (expensive; off by default)
     use_bond_forces: bool = True
+    # Stiffness of the composite-member spring (used by step.py when
+    # use_bond_forces is True). Runtime-tunable via the Params panel.
+    spring_k: float = 50.0
 
     # ── Profiling / Instrumentation ──────────────────────────────────────────
     enable_profiling: bool = False
