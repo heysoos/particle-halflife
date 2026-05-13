@@ -1014,14 +1014,20 @@ class Renderer:
             chart_h = 64
             chart_x = panel_x + 8
             chart_y = y_off
-            # X-axis is fixed at [1, max_composite_size] — the layout is stable
-            # across runs and parameter sweeps. To keep things readable when
-            # max_composite_size is large, bins are *widened* (each bar covers
-            # `bin_width` consecutive integer sizes) rather than the axis being
-            # truncated. Bin count is capped at MAX_BINS_HIST so 1px bars +
-            # 1px gaps always fit inside chart_w.
+            # X-axis auto-zooms to the largest live composite so the chart
+            # always uses the full chart_w (rather than reserving space for a
+            # max-size composite that may never form again after a reroll).
+            # Bounded below by a 2-size floor (so empty/early states aren't
+            # a single bar) and above by config.max_composite_size (the
+            # absolute physical cap). When size_max is large, bins are
+            # *widened* (bin_width > 1) so we never exceed MAX_BINS_HIST
+            # bars — 1px bars + 1px gaps always fit inside chart_w.
             MAX_BINS_HIST = 100
-            size_max  = config.max_composite_size
+            # hist[i] = count of composites with member_count == i+1, so the
+            # largest live size = (highest non-zero index) + 1.
+            nz = np.flatnonzero(self._stats_hist) if len(self._stats_hist) else np.array([], dtype=np.int32)
+            largest_live = int(nz.max()) + 1 if len(nz) > 0 else 2
+            size_max  = max(2, min(largest_live, config.max_composite_size))
             bin_width = max(1, -(-size_max // MAX_BINS_HIST))   # ceil(size_max / MAX_BINS_HIST)
             n_bins    = -(-size_max // bin_width)               # ceil(size_max / bin_width)
             bar_w     = max(1, (chart_w - n_bins) // max(1, n_bins))
