@@ -137,11 +137,7 @@ def test_composite_half_life_valid():
         print("\nNo composites alive — skipping half-life range check (hash bug?)")
         return  # Can't test if no composites exist (hash bug prevents fusion)
 
-    max_expected_hl = (
-        _config.half_life_max
-        * (1 + _config.polarity_stability_scale)  # polarity bonus
-        * 2.0  # generous margin
-    )
+    max_expected_hl = _config.half_life_max * 2.0  # generous margin
 
     alive_hls = jnp.where(alive_mask, composites.half_life, jnp.inf)
     min_hl = float(jnp.min(jnp.where(alive_mask, composites.half_life, jnp.inf)))

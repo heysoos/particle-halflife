@@ -341,21 +341,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             merged_h = ((h_i.astype(jnp.int32) + all_entity_hash[j].astype(jnp.int32))
                         % config.hash_modulus).astype(jnp.uint32)
 
-            be = _hash_to_binding_energy(merged_h, config, physics)
-
-            # Polarity bonus
-            c_j = jnp.clip(particles.composite_id[j], 0, config.max_composites - 1)
-            pi = jnp.where(
-                particles.composite_id[i] < 0,
-                params.polarity[particles.species[i]],
-                composites.net_polarity[c_i]
-            )
-            pj = jnp.where(
-                particles.composite_id[j] < 0,
-                params.polarity[particles.species[j]],
-                composites.net_polarity[c_j]
-            )
-            be_eff = be + physics.polarity_fusion_scale * (-pi * pj)
+            be_eff = _hash_to_binding_energy(merged_h, config, physics)
 
             # Size cap: don't grow beyond buffer
             would_overflow = (cnt_i + cnt_j) > M
@@ -425,8 +411,8 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         valid_i = i < N
         safe_i  = jnp.minimum(i, N - 1)
 
-        j  = jnp.where(valid_i, all_partners[safe_i],      jnp.int32(-1))
-        be = jnp.where(valid_i, all_be[safe_i],            jnp.float32(0.0))
+        j      = jnp.where(valid_i, all_partners[safe_i],      jnp.int32(-1))
+        be_eff = jnp.where(valid_i, all_be[safe_i],            jnp.float32(0.0))
         h  = jnp.where(valid_i, all_hashes[safe_i],        jnp.uint32(0))
         mc = jnp.where(valid_i, all_merged_counts[safe_i], jnp.int32(0))
 
@@ -462,28 +448,14 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
 
         # Energy-based half-life: high binding energy → stable, low → unstable
         t = jnp.clip(
-            (be - physics.fusion_threshold) / (1.0 - physics.fusion_threshold + 1e-8),
+            (be_eff - physics.fusion_threshold) / (1.0 - physics.fusion_threshold + 1e-8),
             0.0, 1.0
         )
         hl_base = config.half_life_min + (config.half_life_max - config.half_life_min) * t
         size_penalty = 1.0 + config.composite_size_decay_scale * jnp.maximum(
             0.0, mc.astype(jnp.float32) - 2.0
         )
-        hl = hl_base / size_penalty
-
-        # Mean polarity of merged entity
-        pi = jnp.where(i_is_free,
-                        params.polarity[particles.species[safe_i]],
-                        composites_state.net_polarity[ci])
-        pj = jnp.where(j_is_free,
-                        params.polarity[particles.species[safe_j]],
-                        composites_state.net_polarity[cj])
-        cnt_i_scalar = jnp.where(i_is_free, jnp.int32(1), composites_state.member_count[ci])
-        cnt_j_scalar = jnp.where(j_is_free, jnp.int32(1), composites_state.member_count[cj])
-        net_pol = (pi * cnt_i_scalar.astype(jnp.float32) +
-                   pj * cnt_j_scalar.astype(jnp.float32)) / (mc.astype(jnp.float32) + 1e-8)
-        neutrality = 1.0 - jnp.abs(net_pol)
-        hl_eff = hl * (1.0 + physics.polarity_stability_scale * neutrality)
+        hl_eff = hl_base / size_penalty
 
         # Build the merged member list: gather all member particle indices
         # i-side members
@@ -526,7 +498,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             jnp.where(kill_absorbed, False, new_comp_alive[safe_absorbed])
         )
         new_comp_be = composites_state.binding_energy.at[safe_target].set(
-            jnp.where(can_fuse, be, composites_state.binding_energy[safe_target])
+            jnp.where(can_fuse, be_eff, composites_state.binding_energy[safe_target])
         )
         new_comp_hl = composites_state.half_life.at[safe_target].set(
             jnp.where(can_fuse, hl_eff, composites_state.half_life[safe_target])
@@ -537,10 +509,6 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         new_comp_hash = composites_state.species_hash.at[safe_target].set(
             jnp.where(can_fuse, h, composites_state.species_hash[safe_target])
         )
-        new_comp_net_pol = composites_state.net_polarity.at[safe_target].set(
-            jnp.where(can_fuse, net_pol, composites_state.net_polarity[safe_target])
-        )
-
         new_composites = composites_state._replace(
             members=new_members,
             alive=new_comp_alive,
@@ -548,7 +516,6 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             half_life=new_comp_hl,
             member_count=new_comp_count_arr,
             species_hash=new_comp_hash,
-            net_polarity=new_comp_net_pol,
         )
 
         # Update composite_id for all merged members
