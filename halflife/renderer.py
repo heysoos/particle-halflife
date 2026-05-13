@@ -937,13 +937,15 @@ class Renderer:
             if action == 'pause':
                 display_label = "Resume" if self._paused else "Pause"
             elif action == 'toggle_bonds':
-                # Label shows the mode the next click will switch TO.
-                next_label = {
-                    self.MODE_BONDS:  "Merged",
-                    self.MODE_MERGED: "None",
-                    self.MODE_NONE:   "Bonds",
+                # Label shows the CURRENT composite-view mode (not the next
+                # one the click will switch to — that "next-click" wording
+                # made the button read as opposite to what was on screen).
+                current_label = {
+                    self.MODE_BONDS:  "Bonds",
+                    self.MODE_MERGED: "Merged",
+                    self.MODE_NONE:   "None",
                 }
-                display_label = next_label.get(self.composite_mode, "Bonds")
+                display_label = current_label.get(self.composite_mode, "Bonds")
             elif action == 'toggle_events':
                 display_label = "Events ON" if self._show_events else "Events"
             elif action == 'toggle_params':
