@@ -168,7 +168,6 @@ class InteractionParams(NamedTuple):
     attraction:        jnp.ndarray  # signed strength in [-1, 1]
     peak_fraction:     jnp.ndarray  # peak-attraction radius / interaction_radius
     cutoff_fraction:   jnp.ndarray  # zero-force radius / interaction_radius
-    polarity:          jnp.ndarray  # (num_species,) float32 — species charge ∈ [-1, 1]
 
 
 def initialize_interaction_params(config: SimConfig,
@@ -194,7 +193,7 @@ def initialize_interaction_params(config: SimConfig,
     """
     key = jax.random.PRNGKey(seed)
     S = config.num_species
-    key, k1, k2, k3, k4 = jax.random.split(key, 5)
+    key, k1, k2, k3 = jax.random.split(key, 4)
 
     # Random signed attraction: uniform in [-1, 1]
     attraction = jax.random.uniform(k1, (S, S), minval=-1.0, maxval=1.0)
@@ -210,14 +209,10 @@ def initialize_interaction_params(config: SimConfig,
     cutoff_fraction = jnp.maximum(a, b)
     cutoff_fraction = jnp.minimum(jnp.maximum(cutoff_fraction, peak_fraction + 0.1), 1.0)
 
-    # Per-species polarity charge: uniform in [-1, 1]
-    polarity = jax.random.uniform(k4, (S,), minval=-1.0, maxval=1.0)
-
     return InteractionParams(
         attraction=attraction,
         peak_fraction=peak_fraction,
         cutoff_fraction=cutoff_fraction,
-        polarity=polarity,
     )
 
 
