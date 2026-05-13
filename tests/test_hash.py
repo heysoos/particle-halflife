@@ -195,6 +195,68 @@ def test_hash_commutative():
 
 # ── Standalone runner ─────────────────────────────────────────────────────────
 
+# ── Tests for _hash_to_partition ─────────────────────────────────────────────
+
+def test_partition_deterministic():
+    """Same (h, n_members) must produce the same assignment every call."""
+    from halflife.chemistry import _hash_to_partition
+    config = SimConfig()
+    h = jnp.uint32(123_456_789)
+    n = jnp.int32(5)
+    a1 = _hash_to_partition(h, n, config)
+    a2 = _hash_to_partition(h, n, config)
+    assert jnp.all(a1 == a2), f"non-deterministic: {a1} vs {a2}"
+
+
+def test_partition_assignments_in_valid_range():
+    """For valid slots i < n_members, assignment[i] in {0, 1}; else -1."""
+    from halflife.chemistry import _hash_to_partition
+    config = SimConfig()
+    M = config.max_composite_size
+    for h_val in [1, 100, 10_000, 999_999, 2**31 - 1]:
+        for n_val in [2, 3, 5, 8, 16]:
+            h = jnp.uint32(h_val)
+            n = jnp.int32(n_val)
+            a = jnp.asarray(_hash_to_partition(h, n, config))
+            assert a.shape == (M,)
+            for i in range(M):
+                if i < n_val:
+                    assert a[i] in (0, 1), f"slot {i} of n={n_val}, h={h_val}: got {a[i]}"
+                else:
+                    assert a[i] == -1, f"padding slot {i}: got {a[i]}"
+
+
+def test_partition_both_products_nonempty():
+    """For any (h, n>=2), both products must have >=1 member assigned."""
+    from halflife.chemistry import _hash_to_partition
+    config = SimConfig()
+    for h_val in [0, 1, 100, 99_999, 2_654_435_761]:
+        for n_val in [2, 3, 4, 5, 8, 16, 32]:
+            h = jnp.uint32(h_val)
+            n = jnp.int32(n_val)
+            a = jnp.asarray(_hash_to_partition(h, n, config))
+            valid = a[:n_val]
+            count_0 = int(jnp.sum(valid == 0))
+            count_1 = int(jnp.sum(valid == 1))
+            assert count_0 + count_1 == n_val, f"missing members for n={n_val}, h={h_val}"
+            assert count_0 >= 1, f"product 0 empty for n={n_val}, h={h_val}"
+            assert count_1 >= 1, f"product 1 empty for n={n_val}, h={h_val}"
+
+
+def test_partition_distribution_varies_with_hash():
+    """Different hash values must produce different partition shapes (sometimes)."""
+    from halflife.chemistry import _hash_to_partition
+    config = SimConfig()
+    n = jnp.int32(8)
+    pivots_seen = set()
+    for h_val in range(20):
+        a = jnp.asarray(_hash_to_partition(jnp.uint32(h_val * 1_000_003), n, config))
+        valid = a[:8]
+        pivot = int(jnp.sum(valid == 0))
+        pivots_seen.add(pivot)
+    assert len(pivots_seen) >= 4, f"too few pivot values across 20 hashes: {pivots_seen}"
+
+
 if __name__ == '__main__':
     passed = failed = 0
     for name, fn in [(n, v) for n, v in sorted(globals().items()) if n.startswith('test_')]:

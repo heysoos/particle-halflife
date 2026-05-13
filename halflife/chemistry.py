@@ -140,6 +140,65 @@ def _hash_to_binding_energy(h: jnp.ndarray, config: SimConfig,
 #     return product_species, n_prods
 
 
+def _hash_to_partition(h: jnp.ndarray, n_members: jnp.ndarray,
+                       config: SimConfig) -> jnp.ndarray:
+    """
+    Determine a binary partition of composite members for fission.
+
+    For each member slot i ∈ [0, n_members), compute a sort key from
+    hash_mix(h, i) and rank slots by that key. The first `pivot` slots
+    in sorted order go to product 0, the rest to product 1. Both products
+    are guaranteed non-empty because pivot ∈ [1, n_members - 1].
+
+    Args:
+        h:          scalar uint32 — composite's species hash
+        n_members:  scalar int32 — number of valid members (>= 2)
+        config:     SimConfig (static)
+
+    Returns:
+        assignment: (max_composite_size,) int32 — values in {0, 1} for slots
+                    i < n_members, else -1.
+    """
+    M = config.max_composite_size
+
+    # Per-slot sort key: mix h with slot index using Fibonacci-style hash.
+    slot_idx = jnp.arange(M, dtype=jnp.uint32)
+    sort_keys = (h.astype(jnp.uint32) * jnp.uint32(2_654_435_761)
+                 + slot_idx * jnp.uint32(1_000_003))
+    # Mark padding slots (i >= n_members) with max key so they sort last.
+    sort_keys = jnp.where(
+        jnp.arange(M, dtype=jnp.int32) < n_members,
+        sort_keys,
+        jnp.uint32(0xFFFFFFFF),
+    )
+
+    # Argsort: order[k] = slot whose sort_key is k-th smallest.
+    order = jnp.argsort(sort_keys)  # (M,)
+
+    # Pivot in [1, n_members - 1] from a different region of the hash.
+    # n_members >= 2 guarantees this range is non-empty.
+    pivot = jnp.int32(1) + (
+        ((h >> jnp.uint32(12)).astype(jnp.int32)) % jnp.maximum(n_members - 1, jnp.int32(1))
+    )
+
+    # In sorted order, assign first `pivot` to product 0, rest to product 1.
+    sorted_assignment = jnp.where(
+        jnp.arange(M, dtype=jnp.int32) < pivot,
+        jnp.int32(0),
+        jnp.int32(1),
+    )
+    # Mark padding slots (rank >= n_members in sorted order) with -1.
+    sorted_assignment = jnp.where(
+        jnp.arange(M, dtype=jnp.int32) < n_members,
+        sorted_assignment,
+        jnp.int32(-1),
+    )
+
+    # Scatter back to original slot order: assignment[order[k]] = sorted_assignment[k].
+    assignment = jnp.full(M, -1, dtype=jnp.int32).at[order].set(sorted_assignment)
+    return assignment
+
+
 # ── Composite Decay / Fission ─────────────────────────────────────────────────
 
 def apply_composite_decay(state: WorldState, config: SimConfig,
