@@ -39,6 +39,11 @@ from halflife.profiler import ProfileMetrics
 # performance win on big composites.
 MAX_BONDS_PER_PARTICLE = 3
 
+# Composite-size histogram refresh cadence. The chart only updates every
+# this many frames (and only while the stats panel is open). Lower = more
+# responsive, higher = cheaper.
+HIST_COMPUTE_INTERVAL = 10
+
 
 # ── GLSL Shaders ──────────────────────────────────────────────────────────────
 
@@ -517,6 +522,12 @@ class Renderer:
 
     def toggle_stats(self):
         self._show_stats = not self._show_stats
+        # When the panel opens, force the histogram to recompute on the very
+        # next update() so the chart shows live data instead of a snapshot
+        # from before it was hidden. (The throttle counter would otherwise
+        # wait up to HIST_COMPUTE_INTERVAL-1 frames.)
+        if self._show_stats:
+            self._hist_compute_age = HIST_COMPUTE_INTERVAL
         self._hud_dirty = True
 
     def toggle_events(self):
@@ -766,22 +777,23 @@ class Renderer:
         else:
             self._stats_n_unique = 0
 
-        # Composite-size histogram is heavier and only feeds the bar chart,
-        # which the eye can't track at 60-120 Hz anyway. Recompute every
-        # HIST_COMPUTE_INTERVAL frames; in between, the chart shows the
-        # last-computed snapshot.
-        HIST_COMPUTE_INTERVAL = 10
-        self._hist_compute_age += 1
-        if self._hist_compute_age >= HIST_COMPUTE_INTERVAL:
-            self._hist_compute_age = 0
-            if self._stats_n_comp > 0:
-                alive_counts = comp_count[comp_alive]
-                self._stats_hist, _ = np.histogram(
-                    alive_counts,
-                    bins=np.arange(1, config.max_composite_size + 2)
-                )
-            else:
-                self._stats_hist = np.zeros(config.max_composite_size, dtype=np.int32)
+        # Composite-size histogram is heavier and only feeds the bar chart.
+        # Skip entirely when the stats panel is hidden — no one's looking at
+        # it — and otherwise recompute every HIST_COMPUTE_INTERVAL frames so
+        # the chart still feels live without paying for a refresh the eye
+        # can't track at 60-120 Hz.
+        if self._show_stats:
+            self._hist_compute_age += 1
+            if self._hist_compute_age >= HIST_COMPUTE_INTERVAL:
+                self._hist_compute_age = 0
+                if self._stats_n_comp > 0:
+                    alive_counts = comp_count[comp_alive]
+                    self._stats_hist, _ = np.histogram(
+                        alive_counts,
+                        bins=np.arange(1, config.max_composite_size + 2)
+                    )
+                else:
+                    self._stats_hist = np.zeros(config.max_composite_size, dtype=np.int32)
 
         # ── Event detection ───────────────────────────────────────────────────
         current_sim_time  = self._stats_sim_time
