@@ -26,7 +26,7 @@ import moderngl
 import jax
 
 from halflife.config import SimConfig
-from halflife.state import WorldState, get_species_colors
+from halflife.state import WorldState, get_species_colors, initialize_physics_params
 from halflife.profiler import ProfileMetrics
 
 
@@ -407,22 +407,32 @@ class Renderer:
         slider_row_h = 38
         # Slider specs grouped by relevance. None entries mark group breaks
         # and add an extra gap between groups (no slider drawn for None).
+        #
+        # Slider defaults are sourced from the PhysicsParams struct the sim
+        # actually starts with \u2014 initialize_physics_params(config) reads
+        # SimConfig where applicable and falls back to hardcoded values for
+        # the few fields not yet in config. This keeps the slider knob (and
+        # log-scale 1\u00d7 pivot) aligned with the running simulation: change a
+        # SimConfig value, restart, and the slider reflects it.
+        physics_defaults = initialize_physics_params(config)
+        def _phys(field: str) -> float:
+            return float(getattr(physics_defaults, field))
         slider_specs = [
             # \u2500\u2500 Force kernel shape \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
             # (field, label, default, fmt, linear_range or None)
-            ("repulsion_strength",       "repulsion",   2.0,   "{:.2f}", None),
-            ("repulsion_radius",         "repulse r",   0.8,   "{:.2f}", None),
-            ("attraction_scale",         "attract",     1.0,   "{:.2f}", None),
-            ("r_cutoff_scale",           "attract r",   1.0,   "{:.2f}", None),
+            ("repulsion_strength",       "repulsion",   _phys("repulsion_strength"),   "{:.2f}", None),
+            ("repulsion_radius",         "repulse r",   _phys("repulsion_radius"),     "{:.2f}", None),
+            ("attraction_scale",         "attract",     _phys("attraction_scale"),     "{:.2f}", None),
+            ("r_cutoff_scale",           "attract r",   _phys("r_cutoff_scale"),       "{:.2f}", None),
             None,
             # \u2500\u2500 Fusion chemistry \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-            ("fusion_threshold",         "fuse thresh", 0.2,   "{:.3f}", None),
-            ("binding_energy_scale",     "bind energy", 1.0,   "{:.3f}", None),
+            ("fusion_threshold",         "fuse thresh", _phys("fusion_threshold"),     "{:.3f}", None),
+            ("binding_energy_scale",     "bind energy", _phys("binding_energy_scale"), "{:.3f}", None),
             None,
             # \u2500\u2500 Particle dynamics \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-            ("dt",                       "dt",          0.02,  "{:.4f}", (0.001, 0.1)),
-            ("damping",                  "damping",     0.995, "{:.4f}", (0.0, 1.0)),
-            ("spring_k",                 "spring k",    50.0,  "{:.1f}", None),
+            ("dt",                       "dt",          _phys("dt"),                   "{:.4f}", (0.001, 0.1)),
+            ("damping",                  "damping",     _phys("damping"),              "{:.4f}", (0.0, 1.0)),
+            ("spring_k",                 "spring k",    _phys("spring_k"),             "{:.1f}", None),
         ]
         group_gap = 14  # extra pixels inserted at each None sentinel
         self._sliders = []
