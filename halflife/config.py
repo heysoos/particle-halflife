@@ -101,7 +101,7 @@ class SimConfig:
     use_bond_forces: bool = True
     # Stiffness of the composite-member spring (used by step.py when
     # use_bond_forces is True). Runtime-tunable via the Params panel.
-    spring_k: float = 50.0
+    spring_k: float = 5.0
 
     # ── Profiling / Instrumentation ──────────────────────────────────────────
     enable_profiling: bool = False
