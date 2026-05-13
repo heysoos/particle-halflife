@@ -694,7 +694,23 @@ class Renderer:
             g_mass = mass[safe_m] * vm_f                             # (n_comps, max_n)
             g_col  = self.species_colors[species[safe_m]]            # (n_comps, max_n, 3)
             sum_vm = vm_f.sum(1, keepdims=True) + 1e-8
-            com    = (g_pos * vm_f[:, :, None]).sum(1) / sum_vm      # (n_comps, 2)
+            # Periodic-aware center of mass. A naive average breaks when a
+            # composite straddles a wrap boundary (mean of x=0.1 and x=199.9
+            # lands at 100 — middle of the world). Fix: take member slot 0 as
+            # an anchor, express every other member position as its
+            # minimum-image displacement from the anchor, average, then wrap
+            # back into the world. Slot 0 is always populated for alive
+            # composites (fusion packs members densely from index 0).
+            ref_pos = g_pos[:, 0, :]                                 # (n_comps, 2)
+            rel     = g_pos - ref_pos[:, None, :]                    # (n_comps, max_n, 2)
+            if config.boundary_mode == "periodic":
+                rel[..., 0] -= config.world_width  * np.round(rel[..., 0] / config.world_width)
+                rel[..., 1] -= config.world_height * np.round(rel[..., 1] / config.world_height)
+            com_rel = (rel * vm_f[:, :, None]).sum(1) / sum_vm
+            com     = ref_pos + com_rel                              # (n_comps, 2)
+            if config.boundary_mode == "periodic":
+                com[:, 0] = np.mod(com[:, 0], config.world_width)
+                com[:, 1] = np.mod(com[:, 1], config.world_height)
             tmass  = g_mass.sum(1)
             acolor = (g_col * vm_f[:, :, None]).sum(1) / sum_vm      # (n_comps, 3)
             sz = np.clip(
