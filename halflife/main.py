@@ -24,6 +24,7 @@ Keyboard controls:
   + / =       — increase simulation steps per render frame
   - / _       — decrease simulation steps per render frame
   B           — toggle composite visualization (bonds ↔ merged)
+  M           — toggle bond mode (edges ↔ star_spring ↔ off)
   R           — reset to initial state
   S           — save screenshot (PNG)
   Q / Escape  — quit
@@ -124,7 +125,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
     # Screenshot counter
     screenshot_dir = "screenshots"
 
-    print("Running. Controls: Space=pause, +/-=speed, B=composite mode, R=reset, Q=quit")
+    print("Running. Controls: Space=pause, +/-=speed, B=composite mode, M=bond mode, R=reset, Q=quit")
 
     # Async pipeline: pre-dispatch first batch so GPU starts immediately
     pending_state = state
@@ -251,6 +252,28 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                 elif event.key == pygame.K_b:
                     renderer.toggle_composite_mode()
                     print(f"Composite mode: {renderer.composite_mode}")
+
+                elif event.key == pygame.K_m:
+                    # Cycle bond_mode: edges → star_spring → off → edges
+                    from halflife.chemistry import initialize_edges_for_existing_composites
+                    cycle = {"edges": "star_spring", "star_spring": "off", "off": "edges"}
+                    new_mode = cycle[config.bond_mode]
+                    print(f"Bond mode: {config.bond_mode} → {new_mode}")
+                    # If toggling INTO 'edges', seed a spanning tree per alive composite
+                    # so existing composites don't dissolve when the edge force kicks in.
+                    if new_mode == "edges":
+                        pending_state = pending_state._replace(
+                            composites=initialize_edges_for_existing_composites(
+                                pending_state.composites, config
+                            )
+                        )
+                    # Rebuild config (frozen dataclass) with new bond_mode. This
+                    # triggers a JAX retrace on the next run_n call, but JAX caches
+                    # per static-arg hash so subsequent toggles to the same mode
+                    # reuse the cached compile.
+                    import dataclasses
+                    config = dataclasses.replace(config, bond_mode=new_mode)
+                    run_n = make_run_n_steps(config)
 
                 elif event.key == pygame.K_r:
                     reset_requested = True
