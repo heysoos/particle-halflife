@@ -56,13 +56,15 @@ in float in_size;
 
 out vec4 v_color;
 
-uniform vec2 u_world_size;
+uniform vec2  u_world_size;
+uniform float u_size_mult;
+uniform float u_alpha_mult;
 
 void main() {
     vec2 ndc = (in_position / u_world_size) * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
-    gl_PointSize = in_size;
-    v_color = in_color;
+    gl_PointSize = in_size * u_size_mult;
+    v_color = vec4(in_color.rgb, in_color.a * u_alpha_mult);
 }
 """
 
@@ -180,6 +182,35 @@ void main() {
     vec3 hdr    = texture(scene_tex, v_uv).rgb;
     vec3 mapped = aces(hdr);
     fragColor   = vec4(linear_to_srgb(mapped), 1.0);
+}
+"""
+
+# Trail decay: full-screen pass that reads the previous trail texture and
+# writes texel × u_decay into the current trail FBO. Acts as both "clear"
+# and "fade." u_decay = 0 ⇒ full clear; u_decay = 0.95 ⇒ short tails;
+# u_decay → 1.0 ⇒ near-infinite trails (will saturate eventually).
+TRAIL_DECAY_VERTEX_SHADER = """
+#version 330
+
+in vec2 in_pos;
+out vec2 v_uv;
+
+void main() {
+    gl_Position = vec4(in_pos, 0.0, 1.0);
+    v_uv = in_pos * 0.5 + 0.5;
+}
+"""
+
+TRAIL_DECAY_FRAGMENT_SHADER = """
+#version 330
+
+in  vec2 v_uv;
+uniform sampler2D src_tex;
+uniform float u_decay;
+out vec4 fragColor;
+
+void main() {
+    fragColor = texture(src_tex, v_uv) * u_decay;
 }
 """
 
@@ -416,12 +447,6 @@ class Renderer:
         # this texture, applies an ACES filmic curve, and writes sRGB-gamma
         # output to the default framebuffer. The HUD is drawn on top of the
         # tonemapped output in LDR space.
-        self._scene_tex = self.ctx.texture(
-            (config.window_width, config.window_height), 4, dtype='f2'
-        )
-        self._scene_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self._scene_fbo = self.ctx.framebuffer(color_attachments=[self._scene_tex])
-
         self.tonemap_prog = self.ctx.program(
             vertex_shader=TONEMAP_VERTEX_SHADER,
             fragment_shader=TONEMAP_FRAGMENT_SHADER,
@@ -431,6 +456,43 @@ class Renderer:
             self.tonemap_prog,
             [(self._hud_quad_vbo, '2f', 'in_pos')],
         )
+
+        # ── Trail accumulation (ping-pong RGBA16F FBOs) ──────────────────────
+        # Two half-float framebuffers swapped each frame. When trails are on,
+        # each frame's scene is composited on top of (decay × previous frame)
+        # to produce smooth exponentially-fading streaks. When trails are off,
+        # the FBO is cleared normally before the scene draws. The tonemap pass
+        # always reads from the current trail FBO regardless of trail state.
+        self._trail_texs = [
+            self.ctx.texture((config.window_width, config.window_height), 4, dtype='f2')
+            for _ in range(2)
+        ]
+        for tex in self._trail_texs:
+            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self._trail_fbos = [
+            self.ctx.framebuffer(color_attachments=[tex]) for tex in self._trail_texs
+        ]
+        self._trail_idx = 0
+
+        self.trail_decay_prog = self.ctx.program(
+            vertex_shader=TRAIL_DECAY_VERTEX_SHADER,
+            fragment_shader=TRAIL_DECAY_FRAGMENT_SHADER,
+        )
+        self._trail_decay_vao = self.ctx.vertex_array(
+            self.trail_decay_prog,
+            [(self._hud_quad_vbo, '2f', 'in_pos')],
+        )
+
+        # ── Render-settings dict ─────────────────────────────────────────────
+        # Trail-related state lives here, separate from PhysicsParams. Defaults
+        # match the slider defaults defined in Task 4. UI sliders write into
+        # this dict; the renderer reads from it each frame.
+        self._render_settings = {
+            'trails_on':            False,
+            'trail_decay':          0.95,
+            'trail_particle_size':  1.0,
+            'trail_particle_alpha': 1.0,
+        }
 
         # ── Event sprite shader ──────────────────────────────────────────────
         self.event_prog = self.ctx.program(
@@ -950,12 +1012,35 @@ class Renderer:
     # ── Rendering ─────────────────────────────────────────────────────────────
 
     def render(self, fps: float, step_count: int, n_alive: int):
-        """Clear screen, draw scene, draw HUD, flip buffers."""
-        bg = self.config.background_color
+        """Clear screen, draw scene, tonemap, draw HUD, flip buffers."""
+        bg     = self.config.background_color
+        rs     = self._render_settings
+        on     = bool(rs['trails_on'])
+        decay  = float(rs['trail_decay']) if on else 0.0
+        sz_m   = float(rs['trail_particle_size'])  if on else 1.0
+        al_m   = float(rs['trail_particle_alpha']) if on else 1.0
 
-        # ── Scene pass into HDR FBO ──────────────────────────────────────────
-        self._scene_fbo.use()
-        self.ctx.clear(*bg)
+        curr_fbo = self._trail_fbos[self._trail_idx]
+        prev_tex = self._trail_texs[1 - self._trail_idx]
+
+        # ── Decay / clear into the current trail FBO ─────────────────────────
+        curr_fbo.use()
+        if on:
+            # Read previous frame, write previous × decay. No clear before —
+            # the shader fully covers the framebuffer.
+            prev_tex.use(location=0)
+            self.trail_decay_prog['src_tex'].value = 0
+            self.trail_decay_prog['u_decay'].value = decay
+            self._trail_decay_vao.render(moderngl.TRIANGLES, vertices=6)
+        else:
+            # Trails off → reset the FBO each frame.
+            self.ctx.clear(*bg)
+
+        # ── Scene pass (into current trail FBO) ──────────────────────────────
+        # Particle size/alpha multipliers live on the particle program so the
+        # user can dial live particles down while accumulated trails dominate.
+        self.particle_prog['u_size_mult'].value  = sz_m
+        self.particle_prog['u_alpha_mult'].value = al_m
 
         # Particles
         if self._n_particles_to_draw > 0:
@@ -976,7 +1061,7 @@ class Renderer:
         # ── Tonemap composite to default framebuffer ─────────────────────────
         self.ctx.screen.use()
         self.ctx.clear(0.0, 0.0, 0.0, 1.0)
-        self._scene_tex.use(location=0)
+        self._trail_texs[self._trail_idx].use(location=0)
         self.tonemap_prog['scene_tex'].value = 0
         self._tonemap_vao.render(moderngl.TRIANGLES, vertices=6)
 
@@ -1000,6 +1085,9 @@ class Renderer:
         self._hud_quad_vao.render(moderngl.TRIANGLES, vertices=6)
 
         pygame.display.flip()
+
+        # Swap ping-pong index for next frame
+        self._trail_idx = 1 - self._trail_idx
 
     # ── HUD surface drawing ───────────────────────────────────────────────────
 
@@ -1273,8 +1361,12 @@ class Renderer:
         self._event_vbo.release()
         self._event_vao.release()
         self.event_prog.release()
-        self._scene_fbo.release()
-        self._scene_tex.release()
+        for fbo in self._trail_fbos:
+            fbo.release()
+        for tex in self._trail_texs:
+            tex.release()
+        self._trail_decay_vao.release()
+        self.trail_decay_prog.release()
         self._tonemap_vao.release()
         self.tonemap_prog.release()
         self.ctx.release()
