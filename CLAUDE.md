@@ -139,7 +139,8 @@ halflife-particle/
 │   ├── utils.py        ← hash_multiset(), find_free_slots(), boundary helpers
 │   ├── spatial.py      ← build_cell_list(), find_all_neighbors()
 │   ├── interactions.py ← InteractionParams, pairwise_force(), compute_all_forces()
-│   ├── chemistry.py    ← attempt_fusion(), apply_decay(), hash_to_products()
+│   ├── chemistry.py    ← attempt_fusion(), apply_composite_decay(), _hash_to_partition(),
+│   │                     _hash_to_binding_energy(), _hash_to_capacity()
 │   ├── energy.py       ← energy tracking and soft conservation
 │   ├── step.py         ← simulation_step() — single @jax.jit orchestrator
 │   ├── renderer.py     ← ModernGL + pygame visualization
@@ -162,13 +163,10 @@ WorldState
 │   ├── position   (N, 2) float32
 │   ├── velocity   (N, 2) float32
 │   ├── species    (N,)   int32    — type index [0, NUM_SPECIES)
-│   ├── alive      (N,)   bool     — active slot mask
 │   ├── energy     (N,)   float32
 │   ├── mass       (N,)   float32
-│   ├── half_life  (N,)   float32
 │   ├── age        (N,)   float32
-│   ├── composite_id (N,) int32    — -1 = free particle
-│   └── internal   (N, STATE_DIM) float32  — NCA-style hidden state
+│   └── composite_id (N,) int32    — -1 = free particle (all particles always alive)
 └── CompositeState (MAX_COMPOSITES,)
     ├── members      (C, MAX_COMPOSITE_SIZE) int32  — padded with -1
     ├── member_count (C,) int32
@@ -176,14 +174,16 @@ WorldState
     ├── binding_energy (C,) float32
     ├── half_life    (C,) float32
     ├── age          (C,) float32
-    ├── species_hash (C,) uint32   — hash of sorted member species multiset
-    └── net_polarity (C,) float32  — mean polarity of members at formation
+    └── species_hash (C,) uint32   — commutative additive hash over member species
 
 InteractionParams  (passed separately, not part of WorldState)
-    ├── attraction  (S, S) float32 — signed attraction matrix
-    ├── r_attract   (S, S) float32 — peak attraction radius
-    ├── r_cutoff    (S, S) float32 — zero-force cutoff
-    └── polarity    (S,)   float32 — per-species charge ∈ [-1, 1]
+    ├── attraction       (S, S) float32 — signed attraction matrix
+    ├── peak_fraction    (S, S) float32 — peak-attraction radius as fraction of interaction_radius
+    └── cutoff_fraction  (S, S) float32 — zero-force cutoff radius as fraction of interaction_radius
+
+PhysicsParams  (runtime-tunable scalars; passed as dynamic JAX arg, no recompile)
+    damping, repulsion_strength, fusion_threshold, binding_energy_scale,
+    repulsion_radius, r_cutoff_scale, spring_k, attraction_scale, dt
 ```
 
 ## JAX Conventions
@@ -202,29 +202,44 @@ The reaction rules are **implicit** — no lookup table. A polynomial rolling ha
 sorted multiset of member species determines all composite properties:
 
 ```python
-# h = hash of sorted [species_0, species_1, ..., species_k]
-h = (h * PRIME_A + species[i] + PRIME_B) % MODULUS  # in lax.fori_loop
+# Per-species value, mixed once:
+f(s) = (s+1)^2 * PRIME_A + (s+1) * PRIME_B   # in _entity_hash_val
 
-composite_half_life    = f(h)   # derived from hash bits
-composite_binding_energy = g(h) # derived from hash bits
-decay_products         = parse_products(h)  # number and species of products
+# Multiset hash is the *commutative sum* of per-species values:
+H(multiset) = sum(f(s) for s in members) % MODULUS
+# So H(i ∪ j) = (H(i) + H(j)) % MODULUS — no sort, no fori_loop needed.
+
+# Composite properties derived from H:
+binding_energy    = _hash_to_binding_energy(h)   # Fibonacci-mixed → [0, scale]
+half_life         = f(BE, size)                  # high BE + small size → long HL
+fission_partition = _hash_to_partition(h, n)     # binary split into two non-empty products
+capacity_caps     = _hash_to_capacity(h, config) # optional (Option 5) per-species cap vector
 ```
 
 Same species set → same hash → same properties every time. Different hash constants give
 different universes.
 
-## Polarity Chemistry
+## Hash Fission (binary partition)
 
-Each species has a fixed scalar **polarity charge** `p[s] ∈ [-1, 1]` stored in
-`params.polarity`. Three effects:
+Composite decay is **binary fission**: a decaying composite is partitioned by
+`_hash_to_partition(h, n)` into two non-empty products. Slot assignment is hash-determined
+(deterministic per multiset). Product 0 reuses the parent's composite slot; product 1
+claims a fresh free slot. Products of size 1 become free particles; products of size ≥ 2
+become new composites. Energy: `binding_energy * (1 - fission_cost)` is split equally
+between products as a momentum-conserving COM-axis kick. Species are conserved — fission
+never transmutes.
 
-1. **Fusion preference** (`chemistry.py`, `check_neighbor`): opposite-polarity pairs get a
-   binding energy bonus `be_eff = be + polarity_fusion_scale * (-pi*pj)`. Like ionic bonding.
-2. **Force scaling** (`step.py` → `interactions.py`): each particle's `attr_mod` = its
-   composite's `net_polarity` (1.0 for free particles). The attraction term is scaled by
-   `attr_mod_i * attr_mod_j`, making balanced composites inert and polarized ones active.
-3. **Half-life stability** (`chemistry.py`, `fusion_scan_body`): neutral composites
-   (`|net_polarity| ≈ 0`) get `hl_eff = hl * (1 + polarity_stability_scale * neutrality)`.
+## Capacity Caps (Option 5: hash-encoded saturation)
+
+Optional gate (`config.use_capacity_caps`). Every multiset hash also rolls a per-species
+capacity vector via `_hash_to_capacity` (Fibonacci remix with per-species salt — scales
+to any `num_species`, not bit-budget-limited). A would-be merged composite is rejected
+if any species count would exceed its cap. At fission time, a product whose own multiset
+violates its hash-rolled caps **shatters** — its members become free particles instead
+of forming a composite. The kick still fires. Particle conservation holds.
+
+Toggled via Python `if config.use_capacity_caps:` since config is `static_argnums`, so
+XLA traces only the live branch — zero runtime cost when off.
 
 ## Visualization
 
@@ -270,18 +285,19 @@ Key experiment knobs:
 
 ```python
 config = SimConfig(
-    num_species=12,          # more species → richer chemistry
-    max_particles=4_000,     # total particle pool
-    interaction_radius=4.0,  # force cutoff
-    fusion_radius=1.0,       # must be < interaction_radius
-    fusion_threshold=0.2,    # min binding energy to fuse [0,1]
-    half_life_min=50.0,
-    half_life_max=500.0,
-    hash_modulus=100_000_007, # changes the "universe" / chemistry
+    num_species=12,            # more species → richer chemistry / bigger hash bucket space
+    num_particles=5_000,       # total particle pool (fixed; all always alive)
+    interaction_radius=8.0,    # force cutoff
+    fusion_radius=4.0,         # must be < interaction_radius
+    fusion_threshold=0.6,      # min binding energy to fuse [0,1]
+    half_life_min=1.0,
+    half_life_max=15.0,
+    hash_modulus=100_000_007,  # changes the "universe" / chemistry
+    composite_size_decay_scale=0.05,  # bigger composites decay faster
 
-    # Polarity knobs
-    polarity_fusion_scale=0.3,    # bonus/penalty to binding energy
-    polarity_stability_scale=0.5, # neutrality boost to composite half-life
+    # Capacity caps (Option 5: hash-encoded saturation, off by default)
+    use_capacity_caps=False,
+    capacity_max=16,           # per-species cap drawn from [1, capacity_max]
 )
 ```
 
@@ -292,3 +308,9 @@ config = SimConfig(
 - **JIT warm-up**: first call compiles; subsequent calls are fast. Don't profile the first call.
 - **Cell list overflow**: if particles cluster too much, increase `cell_capacity` in spatial.py
 - **Energy conservation**: expect small drift (~1% per 1000 steps); the soft correction in energy.py keeps it bounded
+- **GPU contention with live sim**: integration tests in `test_chemistry.py` default to GPU. If
+  the user has the live sim running, force CPU with `JAX_PLATFORMS=cpu pytest ...` — otherwise
+  pytest can hang for an hour fighting for SM time.
+- **Diagnostic scripts**: live in `/tmp/` as throwaways. They need explicit
+  `sys.path.insert(0, "/mnt/.../halflife-particle")` (not `dirname(__file__)`) since they're
+  outside the project root.
