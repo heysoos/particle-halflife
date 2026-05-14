@@ -57,13 +57,19 @@ in float in_size;
 out vec4 v_color;
 
 uniform vec2  u_world_size;
+uniform vec2  u_view_center;   // world point at screen center
+uniform float u_view_scale;    // 1.0 = default; >1 zooms in
 uniform float u_size_mult;
 uniform float u_alpha_mult;
 
 void main() {
-    vec2 ndc = (in_position / u_world_size) * 2.0 - 1.0;
+    // Camera: (pos - center) * scale, then re-center on (world_size / 2) so
+    // the result still lives in [0, world_size] when scale=1 and center is
+    // the world midpoint — keeps the no-camera default visually identical.
+    vec2 view = (in_position - u_view_center) * u_view_scale + (u_world_size * 0.5);
+    vec2 ndc  = (view / u_world_size) * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
-    gl_PointSize = in_size * u_size_mult;
+    gl_PointSize = in_size * u_size_mult * u_view_scale;
     v_color = vec4(in_color.rgb, in_color.a * u_alpha_mult);
 }
 """
@@ -91,10 +97,13 @@ in vec4 in_color;
 
 out vec4 v_color;
 
-uniform vec2 u_world_size;
+uniform vec2  u_world_size;
+uniform vec2  u_view_center;
+uniform float u_view_scale;
 
 void main() {
-    vec2 ndc = (in_position / u_world_size) * 2.0 - 1.0;
+    vec2 view = (in_position - u_view_center) * u_view_scale + (u_world_size * 0.5);
+    vec2 ndc  = (view / u_world_size) * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_color = in_color;
 }
@@ -229,12 +238,15 @@ in float in_age;
 out vec3  v_color;
 out float v_age;
 
-uniform vec2 u_world_size;
+uniform vec2  u_world_size;
+uniform vec2  u_view_center;
+uniform float u_view_scale;
 
 void main() {
-    vec2 ndc = (in_position / u_world_size) * 2.0 - 1.0;
+    vec2 view = (in_position - u_view_center) * u_view_scale + (u_world_size * 0.5);
+    vec2 ndc  = (view / u_world_size) * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
-    gl_PointSize = mix(60.0, 20.0, in_age);
+    gl_PointSize = mix(60.0, 20.0, in_age) * u_view_scale;
     v_color = in_color;
     v_age   = in_age;
 }
@@ -511,11 +523,22 @@ class Renderer:
         # match the slider defaults defined in Task 4. UI sliders write into
         # this dict; the renderer reads from it each frame.
         self._render_settings = {
-            'trails_on':           False,
-            'trail_decay':         0.95,
-            'particle_size_mult':  1.0,
-            'particle_alpha_mult': 1.0,
+            'trails_on':           True,
+            'trail_decay':         0.75,
+            'particle_size_mult':  0.60,
+            'particle_alpha_mult': 0.20,
         }
+
+        # ── Camera (pan + zoom) ──────────────────────────────────────────────
+        # World point at the screen center, and how zoomed in we are.
+        # view_scale = 1.0 is the default (full world visible just like before
+        # the camera existed); > 1.0 zooms in. view_center defaults to the
+        # world midpoint so the initial frame is identical to the no-camera
+        # version of the renderer.
+        self._view_center = [config.world_width * 0.5, config.world_height * 0.5]
+        self._view_scale  = 1.0
+        self._view_scale_min = 0.25
+        self._view_scale_max = 40.0
 
         # ── Event sprite shader ──────────────────────────────────────────────
         self.event_prog = self.ctx.program(
@@ -1121,6 +1144,17 @@ class Renderer:
         # itself. Trail decay is the only trails-gated setting.
         sz_m   = float(rs['particle_size_mult'])
         al_m   = float(rs['particle_alpha_mult'])
+
+        # Push camera uniforms to every world-space program. Cheap; saves
+        # branching on whether the camera moved this frame.
+        vc = (float(self._view_center[0]), float(self._view_center[1]))
+        vs = float(self._view_scale)
+        self.particle_prog['u_view_center'].value = vc
+        self.particle_prog['u_view_scale'].value  = vs
+        self.bond_prog['u_view_center'].value     = vc
+        self.bond_prog['u_view_scale'].value      = vs
+        self.event_prog['u_view_center'].value    = vc
+        self.event_prog['u_view_scale'].value     = vs
 
         curr_fbo = self._trail_fbos[self._trail_idx]
         prev_tex = self._trail_texs[1 - self._trail_idx]
