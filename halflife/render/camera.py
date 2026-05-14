@@ -7,7 +7,7 @@ to:
   - apply a zoom factor around a screen point while pinning that point's
     underlying world-coord (zoom_at),
   - pan by a screen-pixel delta (pan_by),
-  - reset to the default view (reset_view),
+  - reset to the default view (reset),
   - push its current state onto a list of moderngl programs that read the
     u_view_center / u_view_scale uniforms (push_uniforms).
 

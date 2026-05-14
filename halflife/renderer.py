@@ -338,7 +338,7 @@ class Renderer:
 
     # Button background tints, keyed by an action substring or sentinel.
     # Pause shows the alternate tint when self._paused is True. Looked up by
-    # _button_bg_color() so the giant _render_hud_surface block stays tidy.
+    # HUDPainter._button_bg_color so HUDPainter.paint stays tidy.
     BUTTON_BG = {
         'default':      (40, 55, 80, 200),
         'reset':        (90, 40, 40, 200),
@@ -348,7 +348,7 @@ class Renderer:
     }
 
     # Total stats-panel height in pixels. Derived from the row layout inside
-    # _render_hud_surface:
+    # HUDPainter._paint_stats_panel:
     #   4 static rows (16px each)
     # + 6 spark-stat rows (15px label + 18px sparkline = 33px each)
     # + 4px gap
@@ -696,8 +696,8 @@ class Renderer:
         self._species_valence = None
 
         # Close-button rect on the inspector panel. Recomputed each frame
-        # inside _render_inspector_panel; gated by _selected_idx >= 0 so a
-        # stale (0,0,0,0)-area rect is harmless before the first panel draw.
+        # inside HUDPainter._paint_inspector; gated by _selected_idx >= 0 so
+        # a stale (0,0,0,0)-area rect is harmless before the first panel draw.
         self._inspector_close_rect = pygame.Rect(0, 0, 18, 18)
 
         # HUD dirty flag: when False, skip the full pygame redraw + texture
@@ -718,9 +718,10 @@ class Renderer:
         self._stats_sim_time = 0.0
         self._stats_hist     = np.zeros(config.max_composite_size, dtype=np.int32)
         # Histogram x-axis state — see the histogram block in
-        # _render_hud_surface. Expansion is instant (so data never overflows
-        # the chart) but shrinking only happens every HIST_AXIS_SHRINK_FRAMES
-        # frames to suppress jitter from churning small composites.
+        # HUDPainter._paint_stats_panel. Expansion is instant (so data never
+        # overflows the chart) but shrinking only happens every
+        # HIST_AXIS_SHRINK_FRAMES frames to suppress jitter from churning
+        # small composites.
         self._hist_size_max_cached = 2
         self._hist_axis_age        = 0
         # np.histogram on alive_counts runs once per N frames — the bar chart
@@ -935,9 +936,9 @@ class Renderer:
         ))
 
         # ── Cache for inspector panel / hit-test ──────────────────────────────
-        # Stashed for select_at() and _refresh_selected_snapshot(), both of
-        # which run after this method returns. All these arrays are already on
-        # CPU at this point — no extra transfer cost.
+        # Stashed for select_at() and HUDPainter.refresh_selected_snapshot(),
+        # both of which run after this method returns. All these arrays are
+        # already on CPU at this point — no extra transfer cost.
         self._cpu_state = CPUStateSnapshot(
             positions=pos, velocities=vel, species=species,
             mass=mass, energy=p_energy, age=p_age,
