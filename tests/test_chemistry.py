@@ -568,6 +568,22 @@ def test_valence_limit_growth_vs_off():
     )
 
 
+# ── Tests for sparse covalent bonds (bond_mode knobs) ─────────────────────────
+
+def test_config_has_bond_mode_fields():
+    """SimConfig exposes the new bond-mode knobs with safe defaults."""
+    config = SimConfig()
+    assert config.bond_mode in ("edges", "star_spring", "off")
+    assert config.bond_mode == "star_spring", "Default should preserve current behavior"
+    assert config.k_bond > 0
+    assert config.r_rest_min > 0
+    assert config.r_rest_max > config.r_rest_min
+    assert isinstance(config.allow_ring_closure, bool)
+    assert config.max_ring_closures_per_step > 0
+    # Derived: E_max = M * max_valence // 2
+    assert config.e_max == (config.max_composite_size * config.max_valence) // 2
+
+
 # ── Standalone runner ─────────────────────────────────────────────────────────
 
 if __name__ == '__main__':

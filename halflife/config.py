@@ -109,12 +109,39 @@ class SimConfig:
 
     # ── Performance Caps ─────────────────────────────────────────────────────
     # Fusion scan length — set to num_particles to ensure all candidates are processed
-    max_fusions_per_step: int = 200  # = num_particles
+    max_fusions_per_step: int = 400  # = num_particles
     # Enable spring bond forces between composite members (expensive; off by default)
     use_bond_forces: bool = True
     # Stiffness of the composite-member spring (used by step.py when
     # use_bond_forces is True). Runtime-tunable via the Params panel.
     spring_k: float = 5.0
+
+    # ── Sparse covalent bonds (new bond model) ───────────────────────────────
+    # bond_mode selects which kernel runs in Phase 3b:
+    #   "edges"       — sparse covalent bonds (new)
+    #   "star_spring" — current COM-spring (legacy; reads spring_k, use_bond_forces)
+    #   "off"         — no bond force; pure pairwise dynamics
+    # Static field — changes trigger one-time JAX retrace per mode.
+    bond_mode: str = "star_spring"
+
+    # Harmonic stiffness for edge-mode bonds. Much larger than spring_k because
+    # each edge is a local constraint, not an aggregate COM tie — so a bonded
+    # pair at displacement 1 from rest length should still feel a force well
+    # above the species-pair attraction (~1).
+    k_bond: float = 20.0
+
+    # Range for hash-derived per-species-pair rest lengths.
+    # r_rest_min: comfortably outside repulsion_radius so bonded pairs don't
+    #             sit inside the hard core.
+    # r_rest_max: comfortably inside fusion_radius so bonds don't auto-cleave
+    #             on small perturbations.
+    r_rest_min: float = 1.2
+    r_rest_max: float = 3.6
+
+    # Ring closure: allow intra-composite fusion when both members still have
+    # per-particle free bonds (degree[i] < v_{species[i]}).
+    allow_ring_closure: bool = True
+    max_ring_closures_per_step: int = 50
 
     # ── Profiling / Instrumentation ──────────────────────────────────────────
     enable_profiling: bool = False
@@ -146,3 +173,8 @@ class SimConfig:
     @property
     def num_cells(self) -> int:
         return self.num_cells_x * self.num_cells_y
+
+    @property
+    def e_max(self) -> int:
+        """Maximum edges per composite: enough for any all-bonds-used graph."""
+        return (self.max_composite_size * self.max_valence) // 2
