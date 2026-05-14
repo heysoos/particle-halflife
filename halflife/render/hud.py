@@ -564,8 +564,20 @@ class HUDPainter:
         self._paint_inspector(surface)
 
         # Bottom key hint
-        hint = "[Space] pause  [+/-] speed  [B] viz  [R] reset  [Q] quit"
+        hint = "[Space] pause  [+/-] speed  [B] viz  [M] bond mode  [R] reset  [Q] quit"
         hint_surf = font.render(hint, True, (120, 140, 160))
         surface.blit(hint_surf,
                      (r.config.window_width // 2 - hint_surf.get_width() // 2,
                       r.config.window_height - hint_surf.get_height() - 4))
+
+        # Bond-mode status — small badge above the hint so the user can see
+        # which kernel is live (edges / star_spring / off) at a glance.
+        mode_label = {
+            "edges":       "bond: edges (covalent)",
+            "star_spring": "bond: star spring (legacy)",
+            "off":         "bond: off",
+        }.get(r.config.bond_mode, f"bond: {r.config.bond_mode}")
+        mode_surf = font.render(mode_label, True, (140, 170, 200))
+        surface.blit(mode_surf,
+                     (r.config.window_width // 2 - mode_surf.get_width() // 2,
+                      r.config.window_height - hint_surf.get_height() - mode_surf.get_height() - 6))

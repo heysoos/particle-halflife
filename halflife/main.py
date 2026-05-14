@@ -183,6 +183,12 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                     reroll_kind = 'particles'
                 elif action == 'reroll_chemistry':
                     reroll_kind = 'chemistry'
+                elif action == 'clear_selection':
+                    # Inspector close button — already handled inside
+                    # handle_click. Must intercept here so the press doesn't
+                    # fall through into the empty-world branch and arm a
+                    # mouse_down_pos that re-selects on release.
+                    pass
                 elif renderer.handle_mousedown_slider(event.pos):
                     pass
                 else:
@@ -273,6 +279,11 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                     # reuse the cached compile.
                     import dataclasses
                     config = dataclasses.replace(config, bond_mode=new_mode)
+                    # Renderer holds its own config reference (read by the bond
+                    # emission branch and the HUD bond-mode badge). Rebind so
+                    # the visualization tracks the new mode without restart.
+                    renderer.config = config
+                    renderer._hud_dirty = True
                     run_n = make_run_n_steps(config)
 
                 elif event.key == pygame.K_r:

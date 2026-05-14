@@ -122,7 +122,7 @@ class SimConfig:
     #   "star_spring" — current COM-spring (legacy; reads spring_k, use_bond_forces)
     #   "off"         — no bond force; pure pairwise dynamics
     # Static field — changes trigger one-time JAX retrace per mode.
-    bond_mode: str = "star_spring"
+    bond_mode: str = "edges"
 
     # Harmonic stiffness for edge-mode bonds. Much larger than spring_k because
     # each edge is a local constraint, not an aggregate COM tie — so a bonded

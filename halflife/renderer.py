@@ -993,12 +993,17 @@ class Renderer:
         alive_comp_idx = np.where(comp_alive)[0]
 
         if self.composite_mode == self.MODE_BONDS and len(alive_comp_idx) > 0:
-            # Prefer the real edge list (sparse bonds) when bond_mode='edges' OR
-            # when ANY composite has edges populated. Otherwise fall back to the
-            # forward-slot heuristic (star_spring mode with no edges populated).
-            use_real_edges = (self.config.bond_mode == "edges") or bool(comp_edge_count.sum() > 0)
+            # Strictly bond_mode-driven so toggling 'off' actually clears the
+            # mesh. Previously this fell back to "draw whatever edges happen
+            # to be populated" which painted stale edges across the screen
+            # when the user toggled away from edges mode.
+            #   "edges"       — draw the real edges array
+            #   "star_spring" — draw the forward-slot heuristic (composites
+            #                   exist but have no edge structure in this mode)
+            #   "off"         — draw no bonds at all
+            mode = self.config.bond_mode
 
-            if use_real_edges:
+            if mode == "edges":
                 # Collect all valid edges across alive composites.
                 edge_pairs = []
                 for c in alive_comp_idx:
@@ -1031,11 +1036,11 @@ class Renderer:
                     self._n_bond_vertices = n_bytes // (self._bond_vertex_size * 4)
                 # else: zero edges → _n_bond_vertices stays 0
 
-            else:
+            elif mode == "star_spring":
                 # ── Legacy forward-slot heuristic ────────────────────────────
-                # Used when bond_mode != 'edges' and no composites have edges
-                # populated (star_spring mode). Draws bonds to the next K
-                # members in slot order as a visualization approximation.
+                # Composites exist (held by COM spring) but carry no edge
+                # structure in this mode. Draw bonds to the next K members in
+                # slot order as a visualization approximation.
                 C_idx = alive_comp_idx
                 max_n = int(comp_count[C_idx].max())
                 if max_n >= 2:

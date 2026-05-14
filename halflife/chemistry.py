@@ -1154,13 +1154,16 @@ def attempt_ring_closure(state: WorldState, neighbors: jnp.ndarray,
     Touches ONLY edges, edge_count, and degree — no member-list / composite_id
     changes.
 
-    Gated by config.allow_ring_closure (static); when False, returns the state
-    unchanged.
+    Gated by config.allow_ring_closure AND config.bond_mode == "edges". In
+    star_spring / off modes the edges array is physics-inert, so firing ring
+    closure there would silently consume free_bonds and starve subsequent
+    legitimate fusions — preserving the legacy mode's dynamics requires
+    skipping it entirely.
 
     Returns:
         (new_state, new_degree)
     """
-    if not config.allow_ring_closure:
+    if not config.allow_ring_closure or config.bond_mode != "edges":
         return state, degree
 
     particles = state.particles
