@@ -283,8 +283,24 @@ def simulation_step(state: WorldState, params: InteractionParams,
         particles=particles._replace(position=new_pos, velocity=new_vel)
     )
 
+    # ── Phase 5b: Per-particle degree cache ─────────────────────────────────────
+    # degree[i] counts edges incident to particle i across all alive composites.
+    # Used by the per-particle valence gate in Phase 6 and by Phase 6b ring
+    # closure. Cheap (O(C · E_max) scatter-add). Recomputed once per step from
+    # the pre-fusion edge state; phases 6 and 6b update it incrementally via
+    # their scan carries.
+    from halflife.chemistry import compute_degree, compute_composite_free_bonds, _species_valences
+    degree = compute_degree(state.composites, config)
+    species_valences = _species_valences(config)
+    composite_free_bonds = compute_composite_free_bonds(
+        state.particles, state.composites, degree, species_valences, config
+    )
+
     # ── Phase 6: Fusion ───────────────────────────────────────────────────────
-    state = attempt_fusion(state, neighbors, params, config, physics)
+    state, degree = attempt_fusion(
+        state, neighbors, params, config, physics,
+        degree=degree, species_valences=species_valences,
+    )
 
     # ── Phase 7: Decay ────────────────────────────────────────────────────────
     state = apply_composite_decay(state, config, physics)

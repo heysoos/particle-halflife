@@ -650,7 +650,9 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
 def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
                    params: InteractionParams, config: SimConfig,
                    physics: PhysicsParams,
-                   metrics=None) -> WorldState:
+                   degree: jnp.ndarray = None,
+                   species_valences: jnp.ndarray = None,
+                   metrics=None) -> tuple:
     """
     Unified entity-entity fusion: any entity (free particle or composite) can
     fuse with any neighboring entity.
@@ -671,6 +673,13 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
     Returns:
         Updated WorldState with new/grown composites
     """
+    # If callers didn't pass degree (legacy path), compute it locally so the
+    # function works standalone too. New step.py path always passes it.
+    if degree is None:
+        degree = compute_degree(state.composites, config)
+    if species_valences is None:
+        species_valences = _species_valences(config)
+
     particles = state.particles
     composites = state.composites
     key, subkey = jax.random.split(state.rng_key)
@@ -1012,4 +1021,4 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         particles=new_particles,
         composites=final_composites,
         rng_key=key,
-    )
+    ), degree
