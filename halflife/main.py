@@ -137,6 +137,14 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
     # original seed for reproducibility.
     reroll_counter = 0
 
+    # Mouse drag-vs-click state. A press becomes a drag once the cursor moves
+    # more than DRAG_PIXEL_THRESHOLD; a press-and-release without crossing the
+    # threshold is treated as a click (and will be dispatched to particle
+    # select in Task 4).
+    DRAG_PIXEL_THRESHOLD = 4
+    mouse_down_pos = None     # (x, y) at MOUSEBUTTONDOWN, or None
+    is_panning = False
+
     while running:
         t_frame_start = time.time()
 
@@ -174,8 +182,14 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                     reroll_kind = 'particles'
                 elif action == 'reroll_chemistry':
                     reroll_kind = 'chemistry'
+                elif renderer.handle_mousedown_slider(event.pos):
+                    pass
                 else:
-                    renderer.handle_mousedown_slider(event.pos)
+                    # Press landed on empty world — start a pan-or-click. Pan
+                    # mode commits once the cursor moves past DRAG_PIXEL_THRESHOLD;
+                    # otherwise the release will be treated as a click.
+                    mouse_down_pos = event.pos
+                    is_panning = False
 
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
                 # Right-click: snap back to the default framing (world
@@ -192,6 +206,24 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
 
             elif event.type == pygame.MOUSEMOTION:
                 renderer.handle_mousemotion(event.pos)
+                # Pan handling — only when the user has a left-press alive on
+                # empty world space (HUD button / slider hits don't set
+                # mouse_down_pos, so they can't trigger a pan).
+                if mouse_down_pos is not None:
+                    dx = event.pos[0] - mouse_down_pos[0]
+                    dy = event.pos[1] - mouse_down_pos[1]
+                    if not is_panning and (abs(dx) + abs(dy)) > DRAG_PIXEL_THRESHOLD:
+                        is_panning = True
+                    if is_panning:
+                        renderer.pan_by(event.rel[0], event.rel[1])
+
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                renderer.handle_mouseup()
+                # Press-and-release without crossing the drag threshold = click;
+                # particle-select dispatch lands here in Task 4. For now we
+                # just drop the state.
+                mouse_down_pos = None
+                is_panning = False
 
             elif event.type == pygame.MOUSEBUTTONUP:
                 renderer.handle_mouseup()

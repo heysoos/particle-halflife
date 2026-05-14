@@ -873,6 +873,20 @@ class Renderer:
         self._view_center = [config.world_width * 0.5, config.world_height * 0.5]
         self._view_scale  = 1.0
 
+    def pan_by(self, dx_pixels: int, dy_pixels: int) -> None:
+        """Translate the view by (dx, dy) screen pixels.
+
+        Converts pixel deltas → world deltas via the current zoom and shifts
+        view_center in the opposite direction — dragging right scrolls world
+        content right, so view_center must move left.
+        """
+        config = self.config
+        world_dx = -dx_pixels * (config.world_width  / config.window_width)  / self._view_scale
+        world_dy =  dy_pixels * (config.world_height / config.window_height) / self._view_scale
+        # y inverted because pygame Y goes down while world Y goes up
+        self._view_center[0] += world_dx
+        self._view_center[1] += world_dy
+
     # ── Per-frame update ──────────────────────────────────────────────────────
 
     def update(self, state: WorldState):
