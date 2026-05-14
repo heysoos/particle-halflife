@@ -261,13 +261,17 @@ class Slider:
 
     def __init__(self, label: str, field: str, default_value: float,
                  track_rect: pygame.Rect, fmt: str = "{:.3f}",
-                 linear_range=None):
+                 linear_range=None, target_dict: dict = None):
         self._label = label
         self._field = field
         self._default = float(default_value)
         self._track_rect = track_rect
         self._fmt = fmt
         self._linear_range = linear_range
+        # When set, this slider writes into target_dict[field] instead of the
+        # renderer's generic _physics_updates dict. Used to keep render-only
+        # sliders out of the PhysicsParams update pipeline.
+        self._target_dict = target_dict
         self._reset_rect = pygame.Rect(track_rect.right + 4, track_rect.centery - 7, 14, 14)
         # Initialize exponent so that value == default
         if linear_range is not None:
@@ -280,6 +284,10 @@ class Slider:
     @property
     def field(self) -> str:
         return self._field
+
+    @property
+    def target_dict(self) -> dict:
+        return self._target_dict
 
     @property
     def value(self) -> float:
@@ -522,6 +530,7 @@ class Renderer:
             ("Pause",       "pause"),
             ("Bonds",       "toggle_bonds"),
             ("Events",      "toggle_events"),
+            ("Trails",      "toggle_trails"),
             ("Reset",       "reset"),
             ("Params",      "toggle_params"),
             ("Reroll All",  "reroll_all"),
@@ -571,17 +580,26 @@ class Renderer:
             ("dt",                       "dt",          _phys("dt"),                   "{:.4f}", (0.001, 0.1)),
             ("damping",                  "damping",     _phys("damping"),              "{:.4f}", (0.0, 1.0)),
             ("spring_k",                 "spring k",    _phys("spring_k"),             "{:.1f}", None),
+            None,
+            # ── Rendering / trails ──────────────────────────────────────────
+            ("trail_decay",          "trail decay", 0.95, "{:.3f}", (0.0, 0.999)),
+            ("trail_particle_size",  "trail size",  1.0,  "{:.2f}", (0.25, 2.0)),
+            ("trail_particle_alpha", "trail alpha", 1.0,  "{:.2f}", (0.1,  1.0)),
         ]
         group_gap = 14  # extra pixels inserted at each None sentinel
         self._sliders = []
         row_y = slider_start_y
+        RENDER_FIELDS = {'trail_decay', 'trail_particle_size', 'trail_particle_alpha'}
         for spec in slider_specs:
             if spec is None:
                 row_y += group_gap
                 continue
             field, label, default, fmt, lin = spec
             track = pygame.Rect(panel_x + 4, row_y + 18, slider_track_w, 8)
-            self._sliders.append(Slider(label, field, default, track, fmt, linear_range=lin))
+            target = self._render_settings if field in RENDER_FIELDS else None
+            self._sliders.append(
+                Slider(label, field, default, track, fmt, linear_range=lin, target_dict=target)
+            )
             row_y += slider_row_h
         # Total content height (last row's bottom relative to slider_start_y).
         self._slider_content_h = row_y - slider_start_y
@@ -666,6 +684,10 @@ class Renderer:
         self._show_events = not self._show_events
         self._hud_dirty = True
 
+    def toggle_trails(self):
+        self._render_settings['trails_on'] = not self._render_settings['trails_on']
+        self._hud_dirty = True
+
     def set_paused(self, paused: bool):
         """Keep the renderer in sync with the main loop's pause state."""
         if self._paused != paused:
@@ -692,20 +714,29 @@ class Renderer:
         if self._params_reset_rect.collidepoint(pos):
             for s in self._sliders:
                 s.reset()
-            self._physics_updates.update({s.field: s.value for s in self._sliders})
+                if s.target_dict is not None:
+                    s.target_dict[s.field] = s.value
+                else:
+                    self._physics_updates[s.field] = s.value
             self._hud_dirty = True
             return True
         for slider in self._sliders:
             if slider.hit_reset(pos):
                 slider.reset()
-                self._physics_updates[slider.field] = slider.value
+                if slider.target_dict is not None:
+                    slider.target_dict[slider.field] = slider.value
+                else:
+                    self._physics_updates[slider.field] = slider.value
                 self._hud_dirty = True
                 return True
         for slider in self._sliders:
             if slider.hit_handle(pos):
                 self._dragging_slider = slider
                 slider.handle_drag(pos)
-                self._physics_updates[slider.field] = slider.value
+                if slider.target_dict is not None:
+                    slider.target_dict[slider.field] = slider.value
+                else:
+                    self._physics_updates[slider.field] = slider.value
                 self._hud_dirty = True
                 return True
         return False
@@ -713,7 +744,10 @@ class Renderer:
     def handle_mousemotion(self, pos) -> None:
         if self._dragging_slider is not None:
             self._dragging_slider.handle_drag(pos)
-            self._physics_updates[self._dragging_slider.field] = self._dragging_slider.value
+            if self._dragging_slider.target_dict is not None:
+                self._dragging_slider.target_dict[self._dragging_slider.field] = self._dragging_slider.value
+            else:
+                self._physics_updates[self._dragging_slider.field] = self._dragging_slider.value
             self._hud_dirty = True
 
     def handle_mouseup(self) -> None:
@@ -1129,6 +1163,8 @@ class Renderer:
                 display_label = current_label.get(self.composite_mode, "Bonds")
             elif action == 'toggle_events':
                 display_label = "Events ON" if self._show_events else "Events"
+            elif action == 'toggle_trails':
+                display_label = "Trails ON" if self._render_settings['trails_on'] else "Trails"
             elif action == 'toggle_params':
                 display_label = "Params ON" if self._show_params else "Params"
 
