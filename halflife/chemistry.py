@@ -216,6 +216,45 @@ def compute_composite_free_bonds(particles, composites, degree: jnp.ndarray,
     return jax.vmap(per_composite)(jnp.arange(C, dtype=jnp.int32))
 
 
+
+def initialize_edges_for_existing_composites(composites: 'CompositeState',
+                                              config: SimConfig) -> 'CompositeState':
+    """
+    For every alive composite, replace its edge list with a fresh path-
+    spanning tree through its members in slot order. Used when toggling into
+    'edges' bond mode from a state that didn't have edges populated.
+
+    Free particles (composite_id == -1) are unaffected.
+
+    Returns: updated CompositeState (composites only).
+    """
+    C = config.max_composites
+    M = config.max_composite_size
+    E = config.e_max
+    e_idx = jnp.arange(E, dtype=jnp.int32)
+
+    def per_composite(c):
+        is_alive = composites.alive[c]
+        n = composites.member_count[c]
+        members = composites.members[c]
+        valid_edge = (e_idx < jnp.maximum(n - jnp.int32(1), jnp.int32(0)))
+        safe_k = jnp.minimum(e_idx, jnp.int32(M - 2))
+        a = members[safe_k]
+        b = members[safe_k + 1]
+        a_out = jnp.where(valid_edge & is_alive, a, jnp.int32(-1))
+        b_out = jnp.where(valid_edge & is_alive, b, jnp.int32(-1))
+        new_edges = jnp.stack([a_out, b_out], axis=-1)  # (E, 2)
+        new_count = jnp.where(
+            is_alive, jnp.maximum(n - jnp.int32(1), jnp.int32(0)), jnp.int32(0)
+        )
+        return new_edges, new_count
+
+    new_edges, new_edge_count = jax.vmap(per_composite)(
+        jnp.arange(C, dtype=jnp.int32)
+    )
+    return composites._replace(edges=new_edges, edge_count=new_edge_count)
+
+
 def _entity_free_bonds(pid: jnp.ndarray, particles, composites,
                         species_valences: jnp.ndarray,
                         config: SimConfig) -> jnp.ndarray:

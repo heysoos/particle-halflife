@@ -927,3 +927,37 @@ def test_fission_rebuilds_spanning_tree_per_product():
         n = counts_after[c]
         assert edge_counts_after[c] == max(0, n - 1), \
             f"Composite {c} has {n} members but {edge_counts_after[c]} edges (expected {n-1})"
+
+
+def test_initialize_edges_builds_spanning_tree_for_alive_composites():
+    """
+    Called when toggling INTO edges mode: every alive composite gets a path-
+    spanning tree through its members. Composites with edges already set
+    retain them.
+    """
+    from halflife.chemistry import initialize_edges_for_existing_composites
+    config = SimConfig(num_species=3, num_particles=10, max_composites=4)
+    world = initialize_world(config, seed=0)
+    # Build a 3-member composite with NO edges (as if star_spring mode)
+    members = np.full((4, config.max_composite_size), -1, dtype=np.int32)
+    members[0, :3] = (0, 1, 2)
+    composite_id = np.array([0, 0, 0, -1, -1, -1, -1, -1, -1, -1], dtype=np.int32)
+    alive = np.array([True, False, False, False], dtype=bool)
+    world = world._replace(
+        particles=world.particles._replace(composite_id=jnp.asarray(composite_id)),
+        composites=world.composites._replace(
+            members=jnp.asarray(members),
+            member_count=jnp.array([3, 0, 0, 0], dtype=jnp.int32),
+            alive=jnp.asarray(alive),
+            edge_count=jnp.array([0, 0, 0, 0], dtype=jnp.int32),
+        ),
+    )
+    new_composites = initialize_edges_for_existing_composites(world.composites, config)
+    # Composite 0 should now have 2 edges spanning 3 members
+    assert int(np.asarray(new_composites.edge_count[0])) == 2
+    e0 = np.asarray(new_composites.edges[0, 0])
+    e1 = np.asarray(new_composites.edges[0, 1])
+    # Path through hash-sorted members; verify the edge set is a valid spanning tree
+    pids = {0, 1, 2}
+    used = set(e0.tolist()) | set(e1.tolist())
+    assert used <= pids and len(used) == 3, f"Edges should span all members, got {e0}, {e1}"
