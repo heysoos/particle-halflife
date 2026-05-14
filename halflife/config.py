@@ -109,7 +109,7 @@ class SimConfig:
 
     # ── Performance Caps ─────────────────────────────────────────────────────
     # Fusion scan length — set to num_particles to ensure all candidates are processed
-    max_fusions_per_step: int = 400  # = num_particles
+    max_fusions_per_step: int = 200  # = num_particles
     # Enable spring bond forces between composite members (expensive; off by default)
     use_bond_forces: bool = True
     # Stiffness of the composite-member spring (used by step.py when

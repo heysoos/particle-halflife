@@ -795,6 +795,12 @@ class Renderer:
         """Return action string if a button was clicked, else None."""
         if self._stats_btn_rect.collidepoint(pos):
             return "toggle_stats"
+        # Inspector close button — only meaningful when a selection is active,
+        # so the (0,0,18,18) default rect is harmless before the first panel
+        # draw populates real coordinates.
+        if self._selected_idx >= 0 and self._inspector_close_rect.collidepoint(pos):
+            self.clear_selection()
+            return "clear_selection"
         # Gear nub overlays the right edge of the Trails button. Check it
         # before the buttons list so the gear region wins over the underlying
         # toggle_trails hit.
@@ -1370,8 +1376,9 @@ class Renderer:
         # texture when the HUD has actually changed. The fullscreen-quad GL
         # blit always runs (it's cheap; reads the cached texture).
         # Stats panel updates every frame (sparklines, FPS), so force dirty
-        # while it's shown.
-        if self._show_stats:
+        # while it's shown. Inspector panel likewise — position/velocity move
+        # every frame while a particle is selected.
+        if self._show_stats or self._selected_idx >= 0:
             self._hud_dirty = True
 
         if self._hud_dirty:
@@ -1456,6 +1463,154 @@ class Renderer:
                                    if config.use_valence else None),
             }
         self._selected_snapshot = snap
+
+    def _render_inspector_panel(self, surface: pygame.Surface) -> None:
+        """Top-right panel showing the selected particle's stats.
+
+        Returns early if nothing is selected. Layout follows the mockup at
+        notes/2026-05-14-particle-info-panel-mockup.html.
+        """
+        snap = self._selected_snapshot
+        if snap is None:
+            return
+
+        font = self._font
+
+        BG           = (15, 18, 35, 235)
+        BORDER       = (70, 100, 150, 220)
+        DIVIDER      = (70, 100, 150, 110)
+        LABEL_FG     = (160, 185, 230)
+        VALUE_FG     = (220, 230, 255)
+        MUTED_FG     = (120, 140, 165)
+        CLOSE_BG     = (80, 30, 30, 220)
+        CLOSE_BORDER = (150, 80, 80, 220)
+        CLOSE_FG     = (255, 160, 160)
+
+        comp = snap['composite']
+
+        # Height: header(22) + species(20) + 8 kv rows(15 each) + bottom pad,
+        # plus composite section if applicable.
+        base_h = 22 + 20 + 8 * 15 + 8
+        comp_h = 0
+        if comp is not None:
+            # divider(8) + section title(18) + 5 kv rows(15) + members
+            # label(15) + chip rows(~16 each, estimate 1-2 rows) + pad
+            est_chip_rows = max(1, (len(comp['members']) + 7) // 8)
+            comp_h = 8 + 18 + 5 * 15 + 15 + est_chip_rows * 18 + 8
+        panel_w = 235
+        panel_h = base_h + comp_h + 6
+
+        panel_x = self.config.window_width - panel_w - 8
+        panel_y = self._stats_btn_rect.bottom + 6
+        if self._show_stats:
+            # Slide below the open Stats panel — height matches the constant
+            # computed in the stats block of _render_hud_surface.
+            stats_panel_h = (4 * 16 + 6 * 33 + 4 + 18 + 64 + 20 + 10)
+            panel_y += stats_panel_h + 4
+
+        panel_rect = pygame.Rect(panel_x, panel_y, panel_w, panel_h)
+        pygame.draw.rect(surface, BG, panel_rect, border_radius=6)
+        pygame.draw.rect(surface, BORDER, panel_rect, 1, border_radius=6)
+
+        x_text = panel_x + 10
+        y      = panel_y + 6
+
+        # Header
+        title = font.render(f"Particle #{snap['idx']}", True, VALUE_FG)
+        surface.blit(title, (x_text, y))
+
+        # Close button — stash rect for click-handling
+        close_size = 18
+        self._inspector_close_rect = pygame.Rect(
+            panel_x + panel_w - close_size - 8, y - 1, close_size, close_size
+        )
+        pygame.draw.rect(surface, CLOSE_BG, self._inspector_close_rect, border_radius=3)
+        pygame.draw.rect(surface, CLOSE_BORDER, self._inspector_close_rect, 1, border_radius=3)
+        close_lbl = font.render("×", True, CLOSE_FG)
+        surface.blit(close_lbl,
+                     (self._inspector_close_rect.centerx - close_lbl.get_width() // 2,
+                      self._inspector_close_rect.centery - close_lbl.get_height() // 2 - 1))
+        y += 18
+        pygame.draw.line(surface, DIVIDER, (panel_x + 6, y),
+                         (panel_x + panel_w - 6, y), 1)
+        y += 4
+
+        # Species line with color swatch
+        sp = snap['species']
+        col_lin  = self.species_colors[sp]
+        # Linear sRGB → display sRGB for HUD (pygame surface is sRGB).
+        col_disp = np.clip(col_lin, 0.0, 1.0) ** (1.0 / 2.2)
+        col_rgb  = tuple(int(round(c * 255)) for c in col_disp)
+        sw_rect = pygame.Rect(x_text, y + 3, 14, 14)
+        pygame.draw.rect(surface, col_rgb, sw_rect, border_radius=2)
+        pygame.draw.rect(surface, (255, 255, 255, 50), sw_rect, 1, border_radius=2)
+        lbl = font.render(f"Species {sp}", True, VALUE_FG)
+        surface.blit(lbl, (x_text + 18, y))
+        if snap['valence'] is not None:
+            v_txt = font.render(f"valence {snap['valence']}", True, MUTED_FG)
+            surface.blit(v_txt, (panel_x + panel_w - v_txt.get_width() - 10, y))
+        y += 20
+
+        def kv(label: str, value: str, value_color=VALUE_FG):
+            nonlocal y
+            l = font.render(label, True, LABEL_FG)
+            v = font.render(value, True, value_color)
+            surface.blit(l, (x_text, y))
+            surface.blit(v, (panel_x + panel_w - v.get_width() - 10, y))
+            y += 15
+
+        px, py = snap['pos']
+        vx, vy = snap['vel']
+        kv("Position",  f"{px:.1f}, {py:.1f}")
+        kv("Velocity",  f"{vx:.2f}, {vy:.2f}")
+        kv("Speed",     f"{snap['speed']:.2f}")
+        kv("Mass",      f"{snap['mass']:.2f}")
+        kv("Energy",    f"{snap['energy']:.2f}")
+        kv("Age",       f"{snap['age']:.1f} s")
+        kv("Composite", "free" if comp is None else f"#{comp['id']}",
+           value_color=MUTED_FG if comp is None else VALUE_FG)
+
+        if comp is not None:
+            y += 4
+            pygame.draw.line(surface, DIVIDER, (panel_x + 6, y),
+                             (panel_x + panel_w - 6, y), 1)
+            y += 4
+            hdr = font.render(
+                f"Composite #{comp['id']} — {comp['size']} members",
+                True, VALUE_FG
+            )
+            surface.blit(hdr, (x_text, y))
+            y += 18
+
+            kv("Hash",      f"{comp['hash']:08x}"[:8])
+            kv("Binding E", f"{comp['binding_energy']:.2f}")
+            kv("Age",       f"{comp['age']:.1f} s")
+            kv("Half-life", f"{comp['half_life']:.1f} s")
+            if comp['free_bonds'] is not None:
+                total_v = sum(int(self._species_valence[s]) for s in comp['members'])
+                kv("Free bonds", f"{comp['free_bonds']} / {total_v}")
+
+            # Members chips — wrap onto multiple rows if needed.
+            ml = font.render("Members", True, LABEL_FG)
+            surface.blit(ml, (x_text, y))
+            y += 16
+            chip_x = x_text
+            chip_h = 16
+            for s in comp['members']:
+                cl = np.clip(self.species_colors[s], 0.0, 1.0) ** (1.0 / 2.2)
+                crgb = tuple(int(round(c * 255)) for c in cl)
+                txt = font.render(str(int(s)), True, VALUE_FG)
+                cw = txt.get_width() + 16
+                if chip_x + cw > panel_x + panel_w - 10:
+                    chip_x = x_text
+                    y += chip_h + 2
+                chip_rect = pygame.Rect(chip_x, y, cw, chip_h)
+                pygame.draw.rect(surface, (70, 100, 150, 46), chip_rect, border_radius=3)
+                pygame.draw.circle(surface, crgb,
+                                   (chip_rect.left + 6, chip_rect.centery), 4)
+                surface.blit(txt, (chip_rect.left + 12,
+                                   chip_rect.centery - txt.get_height() // 2))
+                chip_x += cw + 4
 
     def _screen_to_world(self, sx: int, sy: int) -> tuple:
         """Convert window-pixel coords → world coords using the current camera.
@@ -1779,6 +1934,9 @@ class Renderer:
                                      reset_rect.centery - reset_txt.get_height() // 2))
             for slider in self._render_sliders:
                 slider.draw(surface, font)
+
+        # ── Inspector panel (live stats for the selected particle) ────────────
+        self._render_inspector_panel(surface)
 
         # ── Bottom key hint ───────────────────────────────────────────────────
         hint = "[Space] pause  [+/-] speed  [B] viz  [R] reset  [Q] quit"
