@@ -45,6 +45,10 @@ class CompositeState(NamedTuple):
 
     members[c, :member_count[c]] are the particle indices belonging to composite c.
     slots beyond member_count are padded with -1.
+
+    edges[c, :edge_count[c]] are particle-id pairs (i, j) for each bond.
+    slots beyond edge_count are padded with -1. Bond force is a harmonic
+    spring per edge in edge-mode; ignored in star_spring / off mode.
     """
     members:        jnp.ndarray  # (C, M) int32   — particle indices per composite
     member_count:   jnp.ndarray  # (C,)   int32   — number of valid members
@@ -54,6 +58,8 @@ class CompositeState(NamedTuple):
     age:            jnp.ndarray  # (C,)   float32 — time since formation
     species_hash:   jnp.ndarray  # (C,)   uint32  — hash of sorted member species
     free_bonds:     jnp.ndarray  # (C,)   int32   — remaining bond capacity (Σ v_s − 2*(n−1))
+    edges:          jnp.ndarray  # (C, E_max, 2) int32 — bond particle-id pairs; -1 = unused
+    edge_count:     jnp.ndarray  # (C,)   int32   — number of valid edges
 
 
 class WorldState(NamedTuple):
@@ -125,6 +131,7 @@ def initialize_world(config: SimConfig, seed: int = 0) -> WorldState:
     )
 
     # ── Composites ───────────────────────────────────────────────────────────
+    E = config.e_max
     composites = CompositeState(
         members=jnp.full((C, M), -1, dtype=jnp.int32),
         member_count=jnp.zeros(C, dtype=jnp.int32),
@@ -134,6 +141,8 @@ def initialize_world(config: SimConfig, seed: int = 0) -> WorldState:
         age=jnp.zeros(C, dtype=jnp.float32),
         species_hash=jnp.zeros(C, dtype=jnp.uint32),
         free_bonds=jnp.zeros(C, dtype=jnp.int32),
+        edges=jnp.full((C, E, 2), -1, dtype=jnp.int32),
+        edge_count=jnp.zeros(C, dtype=jnp.int32),
     )
 
     # ── Global scalars ────────────────────────────────────────────────────────

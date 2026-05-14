@@ -622,3 +622,21 @@ def test_r_rest_is_deterministic_per_hash_modulus():
     p1 = initialize_interaction_params(c1, seed=42)
     p2 = initialize_interaction_params(c2, seed=99)  # seed ignored by r_rest
     np.testing.assert_array_almost_equal(np.asarray(p1.r_rest), np.asarray(p2.r_rest))
+
+
+def test_composite_state_has_edges_fields():
+    """CompositeState exposes edges and edge_count, initialized empty."""
+    config = SimConfig(num_species=3, num_particles=100)
+    world = initialize_world(config, seed=0)
+    C = config.max_composites
+    E = config.e_max
+    assert world.composites.edges.shape == (C, E, 2)
+    assert world.composites.edges.dtype == jnp.int32
+    assert world.composites.edge_count.shape == (C,)
+    assert world.composites.edge_count.dtype == jnp.int32
+    # Edges initialized to -1 (sentinel = unused slot)
+    edges_np = np.asarray(world.composites.edges)
+    assert (edges_np == -1).all()
+    # Edge count initialized to 0
+    counts_np = np.asarray(world.composites.edge_count)
+    assert (counts_np == 0).all()
