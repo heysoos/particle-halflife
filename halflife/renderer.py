@@ -743,21 +743,29 @@ class Renderer:
 
     def _rebuild_physics_sliders(self, bond_mode: str) -> None:
         """
-        (Re)build self._sliders for the active bond_mode. The bond-stiffness
-        slot is the only thing that changes:
-          edges       → k_bond (harmonic edge spring)
-          star_spring → spring_k (COM star spring)
-          off         → omit the slot entirely (no bond force)
+        (Re)build self._sliders for the active bond_mode. The bond-related
+        slots are the only thing that changes:
+          edges       → k_bond (harmonic stiffness) + r_rest_scale (length)
+          star_spring → spring_k (COM star spring) only
+          off         → no bond slots
         All other physics sliders (forces, fusion chemistry, dt, damping)
         are unchanged across modes.
         """
         _phys = self._slider_phys_default
         if bond_mode == "edges":
-            bond_slot = ("k_bond", "bond k",   _phys("k_bond"),   "{:.1f}", None)
+            bond_slots = [
+                ("k_bond",       "bond k",      _phys("k_bond"),       "{:.1f}", None),
+                # r_rest_scale = 1.0 is the hash-determined chemistry; the
+                # linear range lets the user tighten (<1) or loosen (>1) all
+                # bonds uniformly without changing the per-pair structure.
+                ("r_rest_scale", "bond length", _phys("r_rest_scale"), "{:.2f}", (0.3, 2.0)),
+            ]
         elif bond_mode == "star_spring":
-            bond_slot = ("spring_k", "spring k", _phys("spring_k"), "{:.1f}", None)
+            bond_slots = [
+                ("spring_k", "spring k", _phys("spring_k"), "{:.1f}", None),
+            ]
         else:  # "off"
-            bond_slot = None
+            bond_slots = []
 
         slider_specs = [
             # ── Force kernel shape ────────────────────────────────────────────
@@ -775,8 +783,7 @@ class Renderer:
             ("dt",                       "dt",          _phys("dt"),                   "{:.4f}", (0.001, 0.1)),
             ("damping",                  "damping",     _phys("damping"),              "{:.4f}", (0.0, 1.0)),
         ]
-        if bond_slot is not None:
-            slider_specs.append(bond_slot)
+        slider_specs.extend(bond_slots)
 
         panel_x        = self._slider_panel_x
         slider_track_w = self._slider_track_w

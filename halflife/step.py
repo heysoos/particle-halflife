@@ -163,7 +163,10 @@ def compute_edge_bond_forces(state: WorldState, params: InteractionParams,
             d = d - config.world_height * jnp.round(d[..., 1:2] / config.world_height) * jnp.array([0., 1.])
         r = jnp.linalg.norm(d, axis=-1) + 1e-10  # (E,)
         d_hat = d / r[:, None]                    # (E, 2)
-        r_rest = params.r_rest[sa, sb]            # (E,)
+        # Hash-derived per-species-pair rest length, uniformly scaled by the
+        # physics-knob multiplier (r_rest_scale slider). Default 1.0 leaves
+        # the hash-determined chemistry intact; <1 tightens, >1 loosens.
+        r_rest = params.r_rest[sa, sb] * physics.r_rest_scale  # (E,)
 
         # F_on_i = -k * (r - r_rest) * d_hat   ; d_hat = (pos_i - pos_j) / r
         # When r > r_rest (stretched), force pulls i toward j (along -d_hat in actual position space).

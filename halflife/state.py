@@ -252,6 +252,7 @@ class PhysicsParams(NamedTuple):
     r_cutoff_scale:           jnp.ndarray  # () float32 — multiplier on per-species r_cutoff
     spring_k:                 jnp.ndarray  # () float32 — COM-spring stiffness (star_spring mode)
     k_bond:                   jnp.ndarray  # () float32 — harmonic edge-spring stiffness (edges mode)
+    r_rest_scale:             jnp.ndarray  # () float32 — uniform multiplier on bond rest length (edges mode)
     attraction_scale:         jnp.ndarray  # () float32 — global attraction magnitude multiplier
     dt:                       jnp.ndarray  # () float32 — integration timestep
 
@@ -267,6 +268,7 @@ def initialize_physics_params(config: SimConfig) -> PhysicsParams:
         r_cutoff_scale=jnp.float32(1.0),
         spring_k=jnp.float32(config.spring_k),
         k_bond=jnp.float32(config.k_bond),
+        r_rest_scale=jnp.float32(1.0),
         attraction_scale=jnp.float32(1.0),
         dt=jnp.float32(config.dt),
     )
