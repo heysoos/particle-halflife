@@ -140,7 +140,7 @@ halflife-particle/
 │   ├── spatial.py      ← build_cell_list(), find_all_neighbors()
 │   ├── interactions.py ← InteractionParams, pairwise_force(), compute_all_forces()
 │   ├── chemistry.py    ← attempt_fusion(), apply_composite_decay(), _hash_to_partition(),
-│   │                     _hash_to_binding_energy(), _hash_to_capacity()
+│   │                     _hash_to_binding_energy(), _hash_to_valence()
 │   ├── energy.py       ← energy tracking and soft conservation
 │   ├── step.py         ← simulation_step() — single @jax.jit orchestrator
 │   ├── renderer.py     ← ModernGL + pygame visualization
@@ -213,7 +213,9 @@ H(multiset) = sum(f(s) for s in members) % MODULUS
 binding_energy    = _hash_to_binding_energy(h)   # Fibonacci-mixed → [0, scale]
 half_life         = f(BE, size)                  # high BE + small size → long HL
 fission_partition = _hash_to_partition(h, n)     # binary split into two non-empty products
-capacity_caps     = _hash_to_capacity(h, config) # optional (Option 5) per-species cap vector
+
+# Per-species (not per-multiset) valence — fixed once at config:
+v_s               = _hash_to_valence(s, config)  # in [1, max_valence]; saturation gate
 ```
 
 Same species set → same hash → same properties every time. Different hash constants give
@@ -229,17 +231,42 @@ become new composites. Energy: `binding_energy * (1 - fission_cost)` is split eq
 between products as a momentum-conserving COM-axis kick. Species are conserved — fission
 never transmutes.
 
-## Capacity Caps (Option 5: hash-encoded saturation)
+## Valence & Free Bonds (hash-encoded saturation)
 
-Optional gate (`config.use_capacity_caps`). Every multiset hash also rolls a per-species
-capacity vector via `_hash_to_capacity` (Fibonacci remix with per-species salt — scales
-to any `num_species`, not bit-budget-limited). A would-be merged composite is rejected
-if any species count would exceed its cap. At fission time, a product whose own multiset
-violates its hash-rolled caps **shatters** — its members become free particles instead
-of forming a composite. The kick still fires. Particle conservation holds.
+Optional gate (`config.use_valence`, default True). Each species `s` gets a fixed
+valence `v_s ∈ [1, max_valence]`, hashed from the species index via `_hash_to_valence`
+(Fibonacci remix, decorrelated from BE). Valence is the number of "hands" a particle
+of that species can use to hold neighbors — molecular-valence analog (H=1, O=2, C=4 …).
 
-Toggled via Python `if config.use_capacity_caps:` since config is `static_argnums`, so
-XLA traces only the live branch — zero runtime cost when off.
+Composites carry a `free_bonds: (C,) int32` field tracking remaining bond capacity
+under spanning-tree accounting:
+
+```
+free_bonds(free particle s) = v_s
+free_bonds(composite n)     = Σ v_s_i  −  2 × (n − 1)
+```
+
+(An n-member composite has n−1 internal edges; each consumes one bond on each endpoint.)
+
+Two gates:
+
+- **Fusion**: a pair fuses iff both entities have `free_bonds ≥ 1`. The merged
+  composite's bond count becomes `free_bonds(i) + free_bonds(j) − 2`.
+- **Fission**: a product whose own member multiset gives `free_bonds < 0` is
+  structurally unsound (more edges required than the members offer) and **shatters**
+  into free particles rather than forming a sub-composite. The fission kick still
+  fires; particle conservation holds.
+
+Toggled via Python `if config.use_valence:` since config is `static_argnums`, so XLA
+traces only the live branch — zero runtime cost when off. BE-threshold preference is
+unaffected; per-multiset specificity rides on the BE check, valence layers physical
+saturation on top.
+
+This *replaces* the earlier capacity-cap mechanic (commit `7ccad71`, since reverted):
+caps were a static per-multiset upper bound on each species count; valence is a
+dynamic free-bond counter on each composite. Caps had the unphysical property that
+a 2-particle composite could randomly roll a ceiling of [32, 32, 32]; valence makes
+small composites of low-v species *immediately* saturated, as in real molecules.
 
 ## Visualization
 
@@ -295,9 +322,9 @@ config = SimConfig(
     hash_modulus=100_000_007,  # changes the "universe" / chemistry
     composite_size_decay_scale=0.05,  # bigger composites decay faster
 
-    # Capacity caps (Option 5: hash-encoded saturation, off by default)
-    use_capacity_caps=False,
-    capacity_max=16,           # per-species cap drawn from [1, capacity_max]
+    # Valence saturation (per-species free-bond gate, on by default)
+    use_valence=True,
+    max_valence=4,             # per-species valence drawn from [1, max_valence]
 )
 ```
 
