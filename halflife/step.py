@@ -114,6 +114,84 @@ def compute_bond_forces(state: WorldState, config: SimConfig,
     return bond_forces
 
 
+def compute_edge_bond_forces(state: WorldState, params: InteractionParams,
+                              config: SimConfig, physics: PhysicsParams) -> jnp.ndarray:
+    """
+    Per-edge harmonic spring forces (sparse covalent bonds).
+
+    For each valid edge (i, j) in every alive composite:
+        F_on_i = -k_bond * (r - r_rest[s_i, s_j]) * (pos_i - pos_j) / r
+        F_on_j = -F_on_i
+    Forces are scatter-added into a (N, 2) buffer. Min-image displacement is
+    used so bonds across periodic boundaries don't snap.
+
+    Cost: O(C · E_max) vmap cells. Per-cell work is one min-image distance,
+    one species-pair gather (r_rest), one harmonic spring evaluation.
+
+    Returns: (N, 2) float32 — additional forces from bonds
+    """
+    particles = state.particles
+    composites = state.composites
+    N = config.num_particles
+    C = config.max_composites
+    E = config.e_max
+    k = jnp.float32(config.k_bond)
+
+    e_idx = jnp.arange(E, dtype=jnp.int32)
+
+    def per_composite(c):
+        is_alive = composites.alive[c]
+        count    = composites.edge_count[c]
+        valid_e  = is_alive & (e_idx < count)  # (E,)
+
+        pid_a = composites.edges[c, :, 0]  # (E,)
+        pid_b = composites.edges[c, :, 1]  # (E,)
+        safe_a = jnp.where(pid_a >= 0, pid_a, 0)
+        safe_b = jnp.where(pid_b >= 0, pid_b, 0)
+
+        pa = particles.position[safe_a]  # (E, 2)
+        pb = particles.position[safe_b]  # (E, 2)
+        sa = particles.species[safe_a]   # (E,)
+        sb = particles.species[safe_b]   # (E,)
+
+        d = pa - pb
+        if config.boundary_mode == "periodic":
+            d = d - config.world_width  * jnp.round(d[..., 0:1] / config.world_width)  * jnp.array([1., 0.])
+            d = d - config.world_height * jnp.round(d[..., 1:2] / config.world_height) * jnp.array([0., 1.])
+        r = jnp.linalg.norm(d, axis=-1) + 1e-10  # (E,)
+        d_hat = d / r[:, None]                    # (E, 2)
+        r_rest = params.r_rest[sa, sb]            # (E,)
+
+        # F_on_i = -k * (r - r_rest) * d_hat   ; d_hat = (pos_i - pos_j) / r
+        # When r > r_rest (stretched), force pulls i toward j (along -d_hat in actual position space).
+        f_on_a = -k * (r - r_rest)[:, None] * d_hat  # (E, 2)
+        f_on_b = -f_on_a                              # Newton's third law
+
+        # Mask out invalid edges
+        mask = valid_e[:, None].astype(jnp.float32)
+        f_on_a = f_on_a * mask
+        f_on_b = f_on_b * mask
+
+        # Route invalid pids to OOB index N → mode='drop' silently discards.
+        drop_a = jnp.where(valid_e, pid_a, N)
+        drop_b = jnp.where(valid_e, pid_b, N)
+        return drop_a, drop_b, f_on_a, f_on_b
+
+    pid_a_all, pid_b_all, f_a_all, f_b_all = jax.vmap(per_composite)(
+        jnp.arange(C, dtype=jnp.int32)
+    )  # (C, E), (C, E), (C, E, 2), (C, E, 2)
+
+    flat_pid_a = pid_a_all.reshape(-1)
+    flat_pid_b = pid_b_all.reshape(-1)
+    flat_f_a   = f_a_all.reshape(-1, 2)
+    flat_f_b   = f_b_all.reshape(-1, 2)
+
+    forces = jnp.zeros((N, 2), dtype=jnp.float32)
+    forces = forces.at[flat_pid_a].add(flat_f_a, mode='drop')
+    forces = forces.at[flat_pid_b].add(flat_f_b, mode='drop')
+    return forces
+
+
 # ── Composite Size Statistics ─────────────────────────────────────────────────
 
 def compute_composite_size_stats(composites, config: SimConfig) -> tuple:

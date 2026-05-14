@@ -240,6 +240,61 @@ def test_reset_deterministic():
     )
 
 
+def test_edge_bond_force_on_two_particle_composite():
+    """
+    Two particles bonded by a single edge feel equal-and-opposite forces
+    pointing along the connecting axis, with magnitude k_bond * (r - r_rest).
+    """
+    from halflife.step import compute_edge_bond_forces
+    from halflife.state import initialize_world, initialize_interaction_params, initialize_physics_params
+    config = SimConfig(num_species=3, num_particles=4, max_composites=2,
+                       boundary_mode="reflect", world_width=100.0, world_height=100.0,
+                       k_bond=10.0, r_rest_min=2.0, r_rest_max=2.0)
+    world = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=0)
+    physics = initialize_physics_params(config)
+
+    # Place particles 0 and 1 on the x-axis 5 units apart (r > r_rest=2 → attractive)
+    pos = np.array([[10.0, 10.0],   # particle 0
+                    [15.0, 10.0],   # particle 1
+                    [50.0, 50.0],   # particle 2 (free, no bond)
+                    [60.0, 60.0]],  # particle 3 (free, no bond)
+                   dtype=np.float32)
+    species = np.array([0, 0, 1, 1], dtype=np.int32)  # all species 0/1
+    composite_id = np.array([0, 0, -1, -1], dtype=np.int32)
+    members = np.full((2, config.max_composite_size), -1, dtype=np.int32)
+    members[0, :2] = (0, 1)
+    edges = np.full((2, config.e_max, 2), -1, dtype=np.int32)
+    edges[0, 0] = (0, 1)
+    edge_count = np.array([1, 0], dtype=np.int32)
+    alive = np.array([True, False], dtype=bool)
+
+    world = world._replace(
+        particles=world.particles._replace(
+            position=jnp.asarray(pos), species=jnp.asarray(species),
+            composite_id=jnp.asarray(composite_id),
+        ),
+        composites=world.composites._replace(
+            members=jnp.asarray(members), member_count=jnp.array([2, 0], dtype=jnp.int32),
+            alive=jnp.asarray(alive), edges=jnp.asarray(edges),
+            edge_count=jnp.asarray(edge_count),
+        ),
+    )
+
+    forces = compute_edge_bond_forces(world, params, config, physics)
+    f = np.asarray(forces)
+    # Expected: r = 5, r_rest = 2 → stretched by 3, restoring force pulls inward
+    # F on particle 0 = -k_bond * (r - r_rest) * (pos_0 - pos_1)/r
+    #                 = -10 * (5 - 2) * (-1, 0)/1 ... wait, (pos_0 - pos_1)/r = (-5, 0)/5 = (-1, 0)
+    # Hmm let me redo: harmonic spring force on i = -k * (r - r_rest) * r̂_ij where r̂_ij = (pos_i - pos_j)/r
+    # r̂ for particle 0 = (10-15, 0)/5 = (-1, 0). Stretch 3, k=10 → force on 0 = -10 * 3 * (-1, 0) = (30, 0).
+    # That points particle 0 toward particle 1 — correct (attractive when stretched).
+    np.testing.assert_allclose(f[0], [30.0, 0.0], atol=1e-4)
+    np.testing.assert_allclose(f[1], [-30.0, 0.0], atol=1e-4)
+    np.testing.assert_allclose(f[2], [0.0, 0.0], atol=1e-4)
+    np.testing.assert_allclose(f[3], [0.0, 0.0], atol=1e-4)
+
+
 # ── Standalone runner ─────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
