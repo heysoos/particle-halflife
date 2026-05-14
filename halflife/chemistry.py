@@ -141,6 +141,81 @@ def _species_valences(config: SimConfig) -> jnp.ndarray:
     return jax.vmap(lambda s: _hash_to_valence(s, config))(species_idx)
 
 
+def compute_degree(composites, config: SimConfig) -> jnp.ndarray:
+    """
+    Per-particle edge-incidence count, summed across all alive composites.
+
+    For each valid edge (i, j) in every alive composite, increment degree[i]
+    and degree[j] by 1. Returns (N,) int32. Used by the per-particle valence
+    gate in fusion and by the ring-closure scan.
+
+    Args:
+        composites: CompositeState
+        config:     SimConfig (static)
+
+    Returns:
+        (N,) int32 — degree[i] = number of edges incident to particle i
+    """
+    N = config.num_particles
+    C = config.max_composites
+    E = config.e_max
+
+    # Mask edges by alive composite AND valid slot index (<= edge_count[c]).
+    # Each edge slot contributes 2 scatter-adds (one per endpoint).
+    e_idx = jnp.arange(E, dtype=jnp.int32)  # (E,)
+    valid = composites.alive[:, None] & (e_idx[None, :] < composites.edge_count[:, None])  # (C, E)
+
+    pid_a = composites.edges[:, :, 0]  # (C, E)
+    pid_b = composites.edges[:, :, 1]  # (C, E)
+
+    # Route invalid entries to index N (OOB, dropped via mode='drop').
+    drop_a = jnp.where(valid, pid_a, N)
+    drop_b = jnp.where(valid, pid_b, N)
+
+    degree = jnp.zeros(N, dtype=jnp.int32)
+    degree = degree.at[drop_a.reshape(-1)].add(1, mode='drop')
+    degree = degree.at[drop_b.reshape(-1)].add(1, mode='drop')
+    return degree
+
+
+def compute_composite_free_bonds(particles, composites, degree: jnp.ndarray,
+                                  species_valences: jnp.ndarray,
+                                  config: SimConfig) -> jnp.ndarray:
+    """
+    Per-composite free-bond cache.
+
+    composite_free_bonds[c] = Σ (v_{species[m]} − degree[m]) over m in members[c]
+                            = Σ v_{species[m]} − 2 · edge_count[c]
+
+    (Equivalent because each edge contributes 1 to two endpoint degrees.)
+
+    Used as the cheap (C,) skip mask for the ring-closure scan: composites with
+    free_bonds < 2 contribute zero work because they can't add another edge.
+
+    Args:
+        particles, composites: state
+        degree:                (N,) int32 from compute_degree
+        species_valences:      (S,) int32 from _species_valences
+        config:                SimConfig (static)
+
+    Returns:
+        (C,) int32 — composite-level free bonds
+    """
+    M = config.max_composite_size
+    C = config.max_composites
+    m_idx = jnp.arange(M, dtype=jnp.int32)
+
+    def per_composite(c):
+        members = composites.members[c]  # (M,)
+        n = composites.member_count[c]
+        valid = composites.alive[c] & (members >= 0) & (m_idx < n)
+        safe_m = jnp.where(valid, members, 0)
+        per_particle_free = species_valences[particles.species[safe_m]] - degree[safe_m]
+        return jnp.sum(jnp.where(valid, per_particle_free, 0))
+
+    return jax.vmap(per_composite)(jnp.arange(C, dtype=jnp.int32))
+
+
 def _entity_free_bonds(pid: jnp.ndarray, particles, composites,
                         species_valences: jnp.ndarray,
                         config: SimConfig) -> jnp.ndarray:

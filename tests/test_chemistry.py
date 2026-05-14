@@ -16,7 +16,9 @@ import functools
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import jax
-jax.config.update('jax_platform_name', 'cpu')
+# CPU pin disabled for this session — GPU available, live sim not running.
+# Restore (uncomment) if integration tests start contending with the live sim.
+# jax.config.update('jax_platform_name', 'cpu')
 import jax.numpy as jnp
 import numpy as np
 
@@ -640,3 +642,73 @@ def test_composite_state_has_edges_fields():
     # Edge count initialized to 0
     counts_np = np.asarray(world.composites.edge_count)
     assert (counts_np == 0).all()
+
+
+def test_compute_degree_on_known_edges():
+    """degree[i] equals the count of edges incident to particle i."""
+    from halflife.chemistry import compute_degree
+    config = SimConfig(num_species=3, num_particles=10, max_composites=4)
+    world = initialize_world(config, seed=0)
+    # Hand-build two composites:
+    # composite 0: members [0, 1, 2], edges [(0,1), (1,2)]  → degrees: 0→1, 1→2, 2→1
+    # composite 1: members [3, 4], edges [(3,4)]            → degrees: 3→1, 4→1
+    C = config.max_composites
+    E = config.e_max
+    edges = np.full((C, E, 2), -1, dtype=np.int32)
+    edge_count = np.zeros(C, dtype=np.int32)
+    alive = np.zeros(C, dtype=bool)
+    edges[0, 0] = (0, 1); edges[0, 1] = (1, 2); edge_count[0] = 2; alive[0] = True
+    edges[1, 0] = (3, 4);                       edge_count[1] = 1; alive[1] = True
+    composites = world.composites._replace(
+        edges=jnp.asarray(edges),
+        edge_count=jnp.asarray(edge_count),
+        alive=jnp.asarray(alive),
+    )
+
+    degree = compute_degree(composites, config)
+    deg = np.asarray(degree)
+    assert deg[0] == 1
+    assert deg[1] == 2
+    assert deg[2] == 1
+    assert deg[3] == 1
+    assert deg[4] == 1
+    assert (deg[5:] == 0).all()  # particles 5-9 are free, degree 0
+
+
+def test_compute_composite_free_bonds_matches_per_particle():
+    """composite_free_bonds[c] = Σ (v_s[species[m]] - degree[m]) over members."""
+    from halflife.chemistry import compute_degree, compute_composite_free_bonds, _species_valences
+    config = SimConfig(num_species=3, num_particles=10, max_composites=4, max_valence=4)
+    world = initialize_world(config, seed=0)
+    # Same setup as above
+    C = config.max_composites
+    E = config.e_max
+    edges = np.full((C, E, 2), -1, dtype=np.int32)
+    edge_count = np.zeros(C, dtype=np.int32)
+    alive = np.zeros(C, dtype=bool)
+    members = np.full((C, config.max_composite_size), -1, dtype=np.int32)
+    member_count = np.zeros(C, dtype=np.int32)
+    edges[0, 0] = (0, 1); edges[0, 1] = (1, 2); edge_count[0] = 2; alive[0] = True
+    members[0, :3] = (0, 1, 2); member_count[0] = 3
+    edges[1, 0] = (3, 4);                       edge_count[1] = 1; alive[1] = True
+    members[1, :2] = (3, 4); member_count[1] = 2
+    composites = world.composites._replace(
+        edges=jnp.asarray(edges),
+        edge_count=jnp.asarray(edge_count),
+        alive=jnp.asarray(alive),
+        members=jnp.asarray(members),
+        member_count=jnp.asarray(member_count),
+    )
+
+    sv = _species_valences(config)  # (S,)
+    degree = compute_degree(composites, config)
+    cfb = compute_composite_free_bonds(world.particles, composites, degree, sv, config)
+    cfb_np = np.asarray(cfb)
+    sp = np.asarray(world.particles.species)
+    sv_np = np.asarray(sv)
+    # Expected per-composite free bonds
+    expected_0 = (sv_np[sp[0]] - 1) + (sv_np[sp[1]] - 2) + (sv_np[sp[2]] - 1)
+    expected_1 = (sv_np[sp[3]] - 1) + (sv_np[sp[4]] - 1)
+    assert cfb_np[0] == expected_0
+    assert cfb_np[1] == expected_1
+    assert (cfb_np[2:] == 0).all()
