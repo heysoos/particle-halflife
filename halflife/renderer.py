@@ -1049,10 +1049,10 @@ class Renderer:
                 mems    = comp_members[c, :n]
                 valid_m = mems[mems >= 0]
                 if len(valid_m) > 0:
-                    ex = float(np.mean(pos[valid_m, 0]))
-                    ey = float(np.mean(pos[valid_m, 1]))
+                    com = self._periodic_com(pos[valid_m])
                     self._events.append(
-                        (ex, ey, 1.0, 0.85, 0.0, current_sim_time, comp_lifetime_secs)
+                        (float(com[0]), float(com[1]),
+                         1.0, 0.85, 0.0, current_sim_time, comp_lifetime_secs)
                     )
 
             # Fission events (cyan)
@@ -1061,10 +1061,10 @@ class Renderer:
                 mems    = comp_members[c, :n]
                 valid_m = mems[mems >= 0]
                 if len(valid_m) > 0:
-                    ex = float(np.mean(pos[valid_m, 0]))
-                    ey = float(np.mean(pos[valid_m, 1]))
+                    com = self._periodic_com(pos[valid_m])
                     self._events.append(
-                        (ex, ey, 0.0, 1.0, 1.0, current_sim_time, comp_lifetime_secs)
+                        (float(com[0]), float(com[1]),
+                         0.0, 1.0, 1.0, current_sim_time, comp_lifetime_secs)
                     )
 
             # Hard cap
@@ -1219,6 +1219,31 @@ class Renderer:
 
         # Swap ping-pong index for next frame
         self._trail_idx = 1 - self._trail_idx
+
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _periodic_com(self, positions_2d: np.ndarray) -> np.ndarray:
+        """Periodic-aware center of mass for an (n, 2) array of positions.
+
+        Anchor on positions_2d[0]; compute each member's min-image displacement
+        relative to that anchor; average the displacements; add back to the
+        anchor; wrap into the world. Naive np.mean breaks when the composite
+        straddles a wrap boundary (members at x=0.1 and x=199.9 average to
+        x=100, planting the marker in the middle of an empty region).
+        """
+        config = self.config
+        ref = positions_2d[0]
+        rel = positions_2d - ref
+        if config.boundary_mode == "periodic":
+            rel[:, 0] -= config.world_width  * np.round(rel[:, 0] / config.world_width)
+            rel[:, 1] -= config.world_height * np.round(rel[:, 1] / config.world_height)
+        com = ref + rel.mean(axis=0)
+        if config.boundary_mode == "periodic":
+            com = np.array([
+                com[0] % config.world_width,
+                com[1] % config.world_height,
+            ])
+        return com
 
     # ── HUD surface drawing ───────────────────────────────────────────────────
 
