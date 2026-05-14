@@ -179,9 +179,13 @@ vec3 linear_to_srgb(vec3 x) {
 }
 
 void main() {
-    vec3 hdr    = texture(scene_tex, v_uv).rgb;
-    vec3 mapped = aces(hdr);
-    fragColor   = vec4(linear_to_srgb(mapped), 1.0);
+    vec4 src    = texture(scene_tex, v_uv);
+    vec3 mapped = aces(src.rgb);
+    // Pass-through alpha so the same shader works for the opaque trail pass
+    // (caller disables blending; alpha doesn't matter) and the alpha-blended
+    // fresh-overlay pass (caller enables SRC_ALPHA blending and source alpha
+    // becomes the coverage of bonds + event sprites over the trail layer).
+    fragColor   = vec4(linear_to_srgb(mapped), src.a);
 }
 """
 
@@ -490,6 +494,17 @@ class Renderer:
             self.trail_decay_prog,
             [(self._hud_quad_vbo, '2f', 'in_pos')],
         )
+
+        # ── Fresh-scene FBO (non-trailing elements) ──────────────────────────
+        # Bond lines and event sprites are drawn into this FBO and cleared
+        # every frame. It's tonemapped on top of the trail layer with alpha
+        # blending so bonds don't smear into colored ribbons when trails are
+        # on and event rings don't leave ghost trails after they expire.
+        self._fresh_tex = self.ctx.texture(
+            (config.window_width, config.window_height), 4, dtype='f2'
+        )
+        self._fresh_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self._fresh_fbo = self.ctx.framebuffer(color_attachments=[self._fresh_tex])
 
         # ── Render-settings dict ─────────────────────────────────────────────
         # Trail-related state lives here, separate from PhysicsParams. Defaults
@@ -1107,7 +1122,12 @@ class Renderer:
         curr_fbo = self._trail_fbos[self._trail_idx]
         prev_tex = self._trail_texs[1 - self._trail_idx]
 
-        # ── Decay / clear into the current trail FBO ─────────────────────────
+        # ── Particle trail pass (into the current trail FBO) ─────────────────
+        # Trails apply ONLY to particles — bonds connect *current* composite
+        # positions and event rings have their own age-based fade, so they're
+        # drawn fresh into a separate FBO below. This keeps bond lines from
+        # smearing into colored scribbles and stops event rings from leaving
+        # ghost halos in the trail buffer.
         curr_fbo.use()
         if on:
             # Read previous frame, write previous × decay. No clear before —
@@ -1120,15 +1140,17 @@ class Renderer:
             # Trails off → reset the FBO each frame.
             self.ctx.clear(*bg)
 
-        # ── Scene pass (into current trail FBO) ──────────────────────────────
         # Particle size/alpha multipliers live on the particle program so the
         # user can dial live particles down while accumulated trails dominate.
         self.particle_prog['u_size_mult'].value  = sz_m
         self.particle_prog['u_alpha_mult'].value = al_m
 
-        # Particles
         if self._n_particles_to_draw > 0:
             self.particle_vao.render(moderngl.POINTS, vertices=self._n_particles_to_draw)
+
+        # ── Fresh overlay pass (bonds + events, no trail) ────────────────────
+        self._fresh_fbo.use()
+        self.ctx.clear(0.0, 0.0, 0.0, 0.0)   # fully transparent
 
         # Bonds
         if self.composite_mode == self.MODE_BONDS and self._n_bond_vertices > 0:
@@ -1143,9 +1165,24 @@ class Renderer:
             self._event_vao.render(moderngl.POINTS, vertices=self._n_event_vertices)
 
         # ── Tonemap composite to default framebuffer ─────────────────────────
+        # Two passes through the same tonemap shader:
+        #   1) Trail layer — written opaquely (blending disabled). Trail-FBO
+        #      alpha may have drifted toward 0 under repeated decay, so we
+        #      can't trust it for compositing; instead we just write fully.
+        #   2) Fresh layer — alpha-blended on top so transparent areas keep
+        #      the underlying trail visible and bond/event coverage maps to
+        #      source.alpha emitted by the tonemap shader.
         self.ctx.screen.use()
         self.ctx.clear(0.0, 0.0, 0.0, 1.0)
+
+        self.ctx.disable(moderngl.BLEND)
         self._trail_texs[self._trail_idx].use(location=0)
+        self.tonemap_prog['scene_tex'].value = 0
+        self._tonemap_vao.render(moderngl.TRIANGLES, vertices=6)
+
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+        self._fresh_tex.use(location=0)
         self.tonemap_prog['scene_tex'].value = 0
         self._tonemap_vao.render(moderngl.TRIANGLES, vertices=6)
 
@@ -1492,6 +1529,8 @@ class Renderer:
             tex.release()
         self._trail_decay_vao.release()
         self.trail_decay_prog.release()
+        self._fresh_fbo.release()
+        self._fresh_tex.release()
         self._tonemap_vao.release()
         self.tonemap_prog.release()
         self.ctx.release()
