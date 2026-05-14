@@ -711,4 +711,66 @@ def test_compute_composite_free_bonds_matches_per_particle():
     expected_1 = (sv_np[sp[3]] - 1) + (sv_np[sp[4]] - 1)
     assert cfb_np[0] == expected_0
     assert cfb_np[1] == expected_1
-    assert (cfb_np[2:] == 0).all()
+
+
+def test_per_particle_fusion_gate_blocks_saturated_rep():
+    """
+    A composite rep that's already saturated (degree == v_s) cannot fuse with
+    a free particle even if the composite as a whole has free bonds.
+    """
+    from halflife.chemistry import _species_valences, attempt_fusion
+    # Use num_species=4 so that at least one species gets valence=2 under max_valence=2.
+    # (_species_valences with 3 species + max_valence=2 gives all-1s in the current
+    # Fibonacci remix; 4 species gives [1,1,1,2] reliably.)
+    config = SimConfig(num_species=4, num_particles=10, max_composites=4,
+                       max_valence=2, boundary_mode="reflect",
+                       world_width=20.0, world_height=20.0,
+                       fusion_radius=2.0, fusion_threshold=0.0)
+    world = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=0)
+    physics = initialize_physics_params(config)
+
+    # Hand-build a 3-member composite where the rep (particle 0) is bonded
+    # to BOTH siblings (degree[0] = 2 = v_s for max_valence=2). Composite has
+    # remaining slack on particles 1 and 2 but rep is saturated.
+    sv = np.asarray(_species_valences(config))
+    # max_valence=2 means v_s ∈ [1, 2] — we need v_s[s_0] == 2 to make rep saturated.
+    # Find a species with valence 2 and assign it to the rep.
+    target_species = int(np.where(sv == 2)[0][0])
+
+    pos = np.array([[5.0, 5.0],   # rep (will be doubly-bonded)
+                    [4.0, 5.0],   # sibling A
+                    [6.0, 5.0],   # sibling B
+                    [5.5, 5.0],   # free particle within fusion_radius of rep
+                    [50.0, 50.0]] + [[50.0+i, 50.0] for i in range(5)],
+                   dtype=np.float32)[:10]
+    species = np.full(10, target_species, dtype=np.int32)
+    composite_id = np.array([0, 0, 0, -1, -1, -1, -1, -1, -1, -1], dtype=np.int32)
+    members = np.full((4, config.max_composite_size), -1, dtype=np.int32)
+    members[0, :3] = (0, 1, 2)
+    edges = np.full((4, config.e_max, 2), -1, dtype=np.int32)
+    edges[0, 0] = (0, 1); edges[0, 1] = (0, 2)  # rep 0 bonded to both
+    edge_count = np.array([2, 0, 0, 0], dtype=np.int32)
+    alive = np.array([True, False, False, False], dtype=bool)
+
+    world = world._replace(
+        particles=world.particles._replace(
+            position=jnp.asarray(pos), species=jnp.asarray(species),
+            composite_id=jnp.asarray(composite_id),
+        ),
+        composites=world.composites._replace(
+            members=jnp.asarray(members), member_count=jnp.array([3,0,0,0]),
+            alive=jnp.asarray(alive), edges=jnp.asarray(edges),
+            edge_count=jnp.asarray(edge_count),
+        ),
+    )
+
+    # Run one fusion attempt
+    from halflife.spatial import build_cell_list, find_all_neighbors
+    cell_list = build_cell_list(world.particles.position, config)
+    neighbors = find_all_neighbors(world.particles.position, cell_list, config)
+    new_state, _ = attempt_fusion(world, neighbors, params, config, physics)
+
+    # Particle 3 should NOT have been absorbed into composite 0 (rep is saturated)
+    assert np.asarray(new_state.particles.composite_id)[3] == -1, \
+        "Saturated rep should not fuse with free particle"

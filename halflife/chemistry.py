@@ -718,6 +718,13 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         # Unused stub. Same shape so closure types are stable across toggle.
         all_entity_free_bonds = jnp.zeros(N, dtype=jnp.int32)
 
+    # ── Pre-cache per-particle free bonds ─────────────────────────────────────
+    # Per-particle: free_bond[i] = v_{species[i]} − degree[i].
+    # For free particles degree[i] = 0 so free_bond[i] = v_{species[i]}.
+    # For composite members this is stricter than the previous composite-level
+    # check: requires the specific rep doing the fusion to have unused valence.
+    all_particle_free_bonds = species_valences[particles.species] - degree  # (N,) int32
+
     # ── Step 2: For each representative, find its best fusion partner ──────────
     def find_entity_partner(i):
         """
@@ -759,14 +766,13 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             # Size cap: don't grow beyond buffer
             would_overflow = (cnt_i + cnt_j) > M
 
-            # Valence gate: each entity must have at least one free bond, since
-            # the new edge consumes one bond on each side. The merged composite's
-            # free_bonds = free_bonds(i) + free_bonds(j) − 2, which is ≥ 0 whenever
-            # both sides have ≥ 1. Gated by use_valence (zero-cost when off).
+            # Valence gate: each particle (NOT each composite) must have at
+            # least one free bond. The new edge consumes one bond on each
+            # endpoint, so both reps must individually have free_bond ≥ 1.
             if config.use_valence:
                 has_free_bonds = (
-                    (all_entity_free_bonds[i] >= 1)
-                    & (all_entity_free_bonds[j] >= 1)
+                    (all_particle_free_bonds[i] >= 1)
+                    & (all_particle_free_bonds[j] >= 1)
                 )
             else:
                 has_free_bonds = jnp.bool_(True)
