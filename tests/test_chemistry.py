@@ -420,36 +420,41 @@ def test_observability_distinct_composite_types():
     assert len(types_ever_seen) > 0, "no composite types ever observed"
 
 
-# ── Tests for capacity caps (Option 5) ───────────────────────────────────────
+# ── Tests for valence / free-bond saturation gate ────────────────────────────
 
-def test_capacity_caps_off_unchanged():
+def test_valence_off_unchanged():
     """
-    With use_capacity_caps=False, the simulator behaves exactly as it did before:
-    same number of composites alive after 200 steps, regardless of capacity_max.
+    With use_valence=False, max_valence should not affect dynamics — both
+    configs run the same number of steps with identical seed, no valence
+    gate engaged.
     """
-    base = SimConfig(num_particles=500, use_capacity_caps=False)
+    base = SimConfig(num_particles=500, use_valence=False)
     state_a = _run_steps(200, config=base, seed=11)
-    state_b = _run_steps(200, config=SimConfig(num_particles=500, use_capacity_caps=False, capacity_max=4),
-                         seed=11)
+    state_b = _run_steps(
+        200,
+        config=SimConfig(num_particles=500, use_valence=False, max_valence=2),
+        seed=11,
+    )
     n_a = int(jnp.sum(state_a.composites.alive.astype(jnp.int32)))
     n_b = int(jnp.sum(state_b.composites.alive.astype(jnp.int32)))
     assert n_a == n_b, (
-        f"capacity_max should not affect dynamics when use_capacity_caps=False: "
+        f"max_valence should not affect dynamics when use_valence=False: "
         f"got {n_a} vs {n_b}"
     )
 
 
-def test_capacity_caps_on_conserves_particles_and_species():
+def test_valence_on_conserves_particles_and_species():
     """
-    With caps on (including aggressive fission shattering), particle count and
-    per-species counts must still be exactly conserved.
+    With valence on (including fission shattering of structurally unsound
+    products), particle count and per-species counts must still be exactly
+    conserved.
     """
     config = SimConfig(
         num_particles=500,
         half_life_min=5.0,
         half_life_max=20.0,
-        use_capacity_caps=True,
-        capacity_max=8,
+        use_valence=True,
+        max_valence=4,
     )
     state = initialize_world(config, seed=0)
     params = initialize_interaction_params(config, seed=42)
@@ -468,85 +473,98 @@ def test_capacity_caps_on_conserves_particles_and_species():
 
     assert state.particles.position.shape[0] == config.num_particles
     assert jnp.all(initial_species == final_species), (
-        "particle species changed under caps — fission must not transmute"
+        "particle species changed under valence — fission must not transmute"
     )
     assert jnp.all(initial_per_species == final_per_species), (
-        f"per-species counts changed under caps:\n"
+        f"per-species counts changed under valence:\n"
         f"  initial={initial_per_species}\n  final={final_per_species}"
     )
 
 
-def test_capacity_caps_respected_at_fusion():
+def test_valence_free_bonds_nonnegative():
     """
-    With caps on, no alive composite should have any species count exceeding
-    its hash-rolled cap. Verifying at the population level: if any composite
-    violates its own caps, the gate is broken.
+    Invariant: every alive composite must have free_bonds >= 0. Negative
+    free_bonds is a structurally unsound molecule (more bonds required by
+    the tree than the members offer), and the fission shatter path should
+    prevent any such composite from being alive.
     """
-    from halflife.chemistry import _hash_to_capacity
     config = SimConfig(
         num_particles=500,
         half_life_min=50.0,
         half_life_max=200.0,
-        use_capacity_caps=True,
-        capacity_max=6,
+        use_valence=True,
+        max_valence=4,
     )
     state = _run_steps(400, config=config, seed=7)
 
     alive = jnp.asarray(state.composites.alive)
-    members = jnp.asarray(state.composites.members)
-    mc = jnp.asarray(state.composites.member_count)
-    hashes = jnp.asarray(state.composites.species_hash)
-    species = jnp.asarray(state.particles.species)
+    fb = jnp.asarray(state.composites.free_bonds)
+    n_alive = int(alive.sum())
+    if n_alive == 0:
+        print("\nno composites alive — test inconclusive")
+        return
 
-    violators = 0
-    n_checked = 0
-    for c_idx in jnp.where(alive)[0].tolist():
-        n_checked += 1
-        n = int(mc[c_idx])
-        mids = [int(x) for x in members[c_idx, :n].tolist() if x >= 0]
-        sp_counts = np.bincount(
-            [int(species[m]) for m in mids], minlength=config.num_species
-        )
-        caps = np.asarray(_hash_to_capacity(jnp.uint32(int(hashes[c_idx])), config))
-        if np.any(sp_counts > caps):
-            violators += 1
-
-    print(f"\nChecked {n_checked} alive composites; cap violators: {violators}")
-    assert violators == 0, (
-        f"{violators}/{n_checked} alive composites violate their own caps"
+    alive_fb = fb[alive]
+    n_bad = int(jnp.sum(alive_fb < 0))
+    print(f"\nChecked {n_alive} alive composites; free_bonds<0 count: {n_bad}")
+    assert n_bad == 0, (
+        f"{n_bad}/{n_alive} alive composites have free_bonds<0 "
+        f"(structurally unsound — fission shatter path failed)"
     )
 
 
-def test_capacity_caps_limit_growth():
+def test_valence_saturation_caps_size_at_max_valence_1():
     """
-    With caps on at a small capacity_max, composites should not reach the
-    JAX buffer size (max_composite_size). Without caps, they regularly do
-    when fusion_threshold is low.
+    With max_valence=1 every species has v_s=1. A 2-particle composite has
+    free_bonds = 2 − 2 = 0, so it's immediately saturated and cannot grow.
+    No composite of size >= 3 should ever form.
+
+    This is the strongest possible saturation test: deterministic ceiling
+    that depends only on the valence gate working.
+    """
+    config = SimConfig(
+        num_particles=500,
+        half_life_min=50.0,
+        half_life_max=200.0,
+        fusion_threshold=0.3,    # permissive so growth would happen if allowed
+        use_valence=True,
+        max_valence=1,
+    )
+    state = _run_steps(400, config=config, seed=3)
+    alive = state.composites.alive
+    mc = state.composites.member_count
+    max_size = int(jnp.max(jnp.where(alive, mc, 0)))
+    print(f"\nmax_valence=1 max composite size observed: {max_size}")
+    assert max_size <= 2, (
+        f"max_valence=1 should cap size at 2 (every species has v=1, so size-2 "
+        f"is immediately saturated); got max_size={max_size}"
+    )
+
+
+def test_valence_limit_growth_vs_off():
+    """
+    With valence on at small max_valence, composites should not grow as large
+    as without valence. This is the population-level signature of saturation.
     """
     base = dict(
         num_particles=500,
         half_life_min=50.0,
         half_life_max=200.0,
-        fusion_threshold=0.3,  # permissive so growth happens
+        fusion_threshold=0.3,    # permissive so growth happens
         max_composite_size=64,
     )
 
-    state_off = _run_steps(400, config=SimConfig(**base, use_capacity_caps=False), seed=3)
-    state_on  = _run_steps(400, config=SimConfig(**base, use_capacity_caps=True, capacity_max=6), seed=3)
+    state_off = _run_steps(400, config=SimConfig(**base, use_valence=False), seed=3)
+    state_on  = _run_steps(400, config=SimConfig(**base, use_valence=True, max_valence=2), seed=3)
 
     max_off = int(jnp.max(jnp.where(state_off.composites.alive,
                                       state_off.composites.member_count, 0)))
     max_on  = int(jnp.max(jnp.where(state_on.composites.alive,
                                       state_on.composites.member_count, 0)))
 
-    print(f"\nMax composite size: caps off={max_off}, caps on={max_on}")
-    # caps_on should bound size well below the buffer ceiling; we expect a
-    # clear gap even though specific values depend on seed.
+    print(f"\nMax composite size: valence off={max_off}, valence on (v<=2)={max_on}")
     assert max_on < max_off, (
-        f"caps did not reduce max composite size: off={max_off} vs on={max_on}"
-    )
-    assert max_on <= 6 * 12, (  # 6 caps_max × 12 species absolute ceiling
-        f"max size {max_on} exceeds sum of all caps (would imply broken gate)"
+        f"valence did not reduce max composite size: off={max_off} vs on={max_on}"
     )
 
 

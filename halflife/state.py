@@ -53,6 +53,7 @@ class CompositeState(NamedTuple):
     half_life:      jnp.ndarray  # (C,)   float32 — composite decay half-life
     age:            jnp.ndarray  # (C,)   float32 — time since formation
     species_hash:   jnp.ndarray  # (C,)   uint32  — hash of sorted member species
+    free_bonds:     jnp.ndarray  # (C,)   int32   — remaining bond capacity (Σ v_s − 2*(n−1))
 
 
 class WorldState(NamedTuple):
@@ -132,6 +133,7 @@ def initialize_world(config: SimConfig, seed: int = 0) -> WorldState:
         half_life=jnp.zeros(C, dtype=jnp.float32),
         age=jnp.zeros(C, dtype=jnp.float32),
         species_hash=jnp.zeros(C, dtype=jnp.uint32),
+        free_bonds=jnp.zeros(C, dtype=jnp.int32),
     )
 
     # ── Global scalars ────────────────────────────────────────────────────────

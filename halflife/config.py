@@ -84,15 +84,18 @@ class SimConfig:
     # ── Composite Stability ───────────────────────────────────────────────────
     composite_size_decay_scale: float = 0.05   # size penalty on composite half-life (larger → shorter hl)
 
-    # ── Saturation / Valence (hash-encoded per-species capacity caps) ─────────
-    # When enabled, every multiset hash also rolls a per-species capacity vector.
-    # A would-be merged composite is permitted only if no species count exceeds
-    # its own cap. At fission time, products that violate their own caps shatter
-    # into free particles rather than forming a composite.
-    # Scales to any num_species via a per-species independent hash re-mix, so
-    # there is no bit-budget tied to the underlying 32-bit hash width.
-    use_capacity_caps: bool = True
-    capacity_max: int = 128   # cap values per species are drawn from [1, capacity_max]
+    # ── Valence / Free Bonds (hash-encoded per-species bond capacity) ─────────
+    # Each species has a fixed hash-derived valence v_s ∈ [1, max_valence] (the
+    # number of "hands" a particle of that species can use to hold neighbors).
+    # A composite of n members with total valence V has free_bonds = V - 2*(n-1)
+    # (spanning-tree accounting: every fusion consumes one bond on each side).
+    # Fusion is permitted iff both entities have free_bonds >= 1.
+    # Fission products with free_bonds < 0 are structurally unsound and shatter
+    # into free particles rather than forming a composite. Particle conservation
+    # holds regardless. BE-threshold preference is unchanged and still drives
+    # per-multiset specificity; valence layers physical saturation on top.
+    use_valence: bool = True
+    max_valence: int = 4   # per-species valence drawn from [1, max_valence]
 
     # ── Performance Caps ─────────────────────────────────────────────────────
     # Fusion scan length — set to num_particles to ensure all candidates are processed

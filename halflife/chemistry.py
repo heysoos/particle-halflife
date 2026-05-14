@@ -87,81 +87,84 @@ def _hash_to_binding_energy(h: jnp.ndarray, config: SimConfig,
     return frac * physics.binding_energy_scale
 
 
-def _hash_to_capacity(h: jnp.ndarray, config: SimConfig) -> jnp.ndarray:
+def _hash_to_valence(species: jnp.ndarray, config: SimConfig) -> jnp.ndarray:
     """
-    Per-species saturation cap derived from the multiset's hash (Option 5,
-    "hash-encoded valence"). Returns a (num_species,) int32 vector in
-    [1, config.capacity_max] — the maximum count of each species this
-    particular multiset is allowed to contain.
+    Per-species valence in [1, config.max_valence]. Deterministic per species
+    index, decorrelated from binding energy via a Fibonacci-style re-mix.
 
-    Implementation: a per-species independent Fibonacci-style remix of `h`
-    using a per-species "salt." This scales to arbitrarily many species
-    (no bit-budget tied to the 32-bit hash width) and decorrelates the
-    capacity vector from `_hash_to_binding_energy`, which mixes `h` with
-    a different multiplier/shift pair.
+    Valence represents the maximum number of "hands" a particle of this species
+    can use to hold neighbors — analogous to molecular valence (H=1, O=2, etc).
+    A composite's free bonds = Σ v_s − 2 × (n−1), tracked per composite.
 
     Args:
-        h:      scalar uint32 — multiset hash
-        config: SimConfig (static) — provides num_species and capacity_max
+        species: scalar int32 — species index in [0, num_species)
+        config:  SimConfig (static)
 
     Returns:
-        caps: (num_species,) int32 — values in [1, capacity_max]
+        v: scalar int32 in [1, max_valence]
     """
-    S = config.num_species
-    species_idx = jnp.arange(S, dtype=jnp.uint32)
-    # Per-species salt: (s+1) * 0x9E3779B1 (golden-ratio constant). The +1
-    # avoids salt=0 for species 0 which would collapse the multiply to identity.
-    salt = (species_idx + jnp.uint32(1)) * jnp.uint32(0x9E3779B1)
-    h_per = (h.astype(jnp.uint32) * salt) ^ (h.astype(jnp.uint32) >> jnp.uint32(11))
-    caps = (h_per % jnp.uint32(config.capacity_max)) + jnp.uint32(1)
-    return caps.astype(jnp.int32)
+    # Hash the species index via the same per-species mixer used elsewhere
+    # (_entity_hash_val), then re-mix to decorrelate from BE.
+    h = _entity_hash_val(species, config).astype(jnp.uint32)
+    h2 = (h * jnp.uint32(0x9E3779B1)) ^ (h >> jnp.uint32(13))
+    return (h2 % jnp.uint32(config.max_valence) + jnp.uint32(1)).astype(jnp.int32)
 
 
-def _entity_species_counts(pid: jnp.ndarray, particles, composites,
-                            config: SimConfig) -> jnp.ndarray:
+def _species_valences(config: SimConfig) -> jnp.ndarray:
+    """Pre-compute the (num_species,) valence vector. Fixed for a given config."""
+    species_idx = jnp.arange(config.num_species, dtype=jnp.int32)
+    return jax.vmap(lambda s: _hash_to_valence(s, config))(species_idx)
+
+
+def _entity_free_bonds(pid: jnp.ndarray, particles, composites,
+                        species_valences: jnp.ndarray,
+                        config: SimConfig) -> jnp.ndarray:
     """
-    Per-species member count for the entity (free particle or composite)
-    containing particle `pid`. Returns a (num_species,) int32 vector.
+    Remaining bond capacity for the entity (free particle or composite)
+    containing particle `pid`. Returns a scalar int32.
 
-    Used by the capacity-cap fusion gate so the merged composite's count
-    profile can be checked against its hash-rolled cap vector. Computed
-    once per particle per step (vmapped at the call site).
+      free_bonds(free particle s)         = v_s
+      free_bonds(composite of size n)     = Σ v_s_i  −  2 × (n − 1)
+
+    Spanning-tree accounting: every fusion adds one edge, consuming one bond
+    on each side, so an n-member tree uses 2*(n-1) bonds total. The remainder
+    is "free" — available for further mergers.
     """
     M = config.max_composite_size
-    S = config.num_species
     c = jnp.clip(particles.composite_id[pid], 0, config.max_composites - 1)
     is_free = particles.composite_id[pid] < 0
 
-    # Free particle: one-hot on its species.
-    free_counts = jax.nn.one_hot(particles.species[pid], S, dtype=jnp.int32)
+    # Free particle: v_s for its own species.
+    free_val = species_valences[particles.species[pid]]
 
-    # Composite: sum of one-hots over valid members.
+    # Composite: sum of member valences − 2 × (n − 1).
     safe_members = jnp.where(composites.members[c] >= 0, composites.members[c], 0)
     member_species = particles.species[safe_members]  # (M,)
     valid = (composites.members[c] >= 0) & (jnp.arange(M) < composites.member_count[c])
-    member_one_hots = jax.nn.one_hot(member_species, S, dtype=jnp.int32)  # (M, S)
-    comp_counts = jnp.sum(
-        jnp.where(valid[:, None], member_one_hots, jnp.int32(0)), axis=0
-    )  # (S,)
+    member_valences = species_valences[member_species]  # (M,)
+    total_v = jnp.sum(jnp.where(valid, member_valences, jnp.int32(0)))
+    n = composites.member_count[c]
+    comp_val = total_v - jnp.int32(2) * (n - jnp.int32(1))
 
-    return jnp.where(is_free, free_counts, comp_counts)
+    return jnp.where(is_free, free_val, comp_val)
 
 
-def _product_species_counts(member_ids: jnp.ndarray, count: jnp.ndarray,
-                             particles, config: SimConfig) -> jnp.ndarray:
+def _product_free_bonds(member_ids: jnp.ndarray, count: jnp.ndarray,
+                         particles, species_valences: jnp.ndarray,
+                         config: SimConfig) -> jnp.ndarray:
     """
-    Per-species count for a fission product's (already-compacted) member list.
-    Returns a (num_species,) int32 vector. Used by the fission cap-validation
-    path; identical math to the composite branch of _entity_species_counts
-    but takes the member list directly rather than dereferencing a slot id.
+    Free bonds for a fission product's (already-compacted) member list.
+    Identical math to the composite branch of _entity_free_bonds, but takes
+    the member list directly rather than dereferencing a composite slot.
+    Returns a scalar int32 (may be negative for structurally unsound partitions).
     """
     M = config.max_composite_size
-    S = config.num_species
     safe = jnp.where(member_ids >= 0, member_ids, 0)
     sp = particles.species[safe]
     valid = (member_ids >= 0) & (jnp.arange(M) < count)
-    one_hots = jax.nn.one_hot(sp, S, dtype=jnp.int32)  # (M, S)
-    return jnp.sum(jnp.where(valid[:, None], one_hots, jnp.int32(0)), axis=0)
+    vs = species_valences[sp]
+    total_v = jnp.sum(jnp.where(valid, vs, jnp.int32(0)))
+    return total_v - jnp.int32(2) * (count - jnp.int32(1))
 
 
 def _hash_to_partition(h: jnp.ndarray, n_members: jnp.ndarray,
@@ -349,19 +352,28 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
         jnp.arange(C, dtype=jnp.int32)
     )
 
-    # ── Per-product cap validity (Option 5: hash-encoded saturation) ─────────
-    # A product whose own multiset violates its hash-rolled cap recipe is
-    # "stillborn": rather than forming a composite, its members shatter into
-    # free particles (they still receive the fission kick). Physically: this
-    # composition is too unstable to even coalesce briefly. Gated by config
-    # so the toggle is zero-cost when off.
-    if config.use_capacity_caps:
-        def product_within_caps(members, count, h):
-            counts = _product_species_counts(members, count, particles, config)
-            caps = _hash_to_capacity(h, config)
-            return jnp.all(counts <= caps)
-        p0_valid = jax.vmap(product_within_caps)(p0_members, p0_count, p0_hash)
-        p1_valid = jax.vmap(product_within_caps)(p1_members, p1_count, p1_hash)
+    # ── Per-product free bonds and structural validity ──────────────────────
+    # free_bonds(product) = Σ v_s − 2 × (count − 1). A product with free_bonds
+    # < 0 is structurally unsound (a tree with that many nodes would require
+    # more bonds than the members collectively offer), so it cannot form a
+    # composite — its members shatter into free particles (the fission kick
+    # still fires). Gated by config.use_valence so the toggle is zero-cost
+    # when off. Size-1 products are handled by the count >= 2 gate downstream.
+    species_valences_decay = _species_valences(config)
+    p0_free_bonds = jax.vmap(
+        lambda members, count: _product_free_bonds(
+            members, count, particles, species_valences_decay, config
+        )
+    )(p0_members, p0_count)
+    p1_free_bonds = jax.vmap(
+        lambda members, count: _product_free_bonds(
+            members, count, particles, species_valences_decay, config
+        )
+    )(p1_members, p1_count)
+
+    if config.use_valence:
+        p0_valid = p0_free_bonds >= 0
+        p1_valid = p1_free_bonds >= 0
     else:
         p0_valid = jnp.ones(C, dtype=bool)
         p1_valid = jnp.ones(C, dtype=bool)
@@ -407,14 +419,15 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
             jnp.where(a == 1, -d_hat * v1, jnp.zeros(2)),
         )
 
-        # Composite-formation flags incorporate cap validity (Option 5). When
-        # caps are off, p0_valid/p1_valid are all-True, so behavior is unchanged.
+        # Composite-formation flags incorporate structural free-bond validity.
+        # When valence is off, p0_valid/p1_valid are all-True, so behavior is
+        # unchanged from the no-saturation baseline.
         forms_p0 = (n0 >= 2) & p0_valid[c]
         forms_p1 = (n1 >= 2) & p1_valid[c]
 
         # New composite_id:
         #   a==0 and forms_p0 → c (reuse parent slot)
-        #   a==0 and not forms_p0 → -1 (free particle — size-1 or cap-violating)
+        #   a==0 and not forms_p0 → -1 (free particle — size-1 or structurally unsound)
         #   a==1 and forms_p1 → target_p1
         #   a==1 and not forms_p1 → -1 (free)
         #   a==-1 (padding) → preserve original (the scatter is gated on `valid`,
@@ -454,8 +467,8 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
     )
 
     # ── Write product 0 into parent slot c (in place) ──
-    # AND with p0_valid so cap-violating products leave the parent slot dead
-    # (its members already got composite_id=-1 above), reclaiming the slot.
+    # AND with p0_valid so structurally unsound products leave the parent slot
+    # dead (its members already got composite_id=-1 above), reclaiming the slot.
     p0_alive = fissions & (p0_count >= 2) & p0_valid
 
     # Half-life from BE + size penalty. Same formula as fusion_scan_body.
@@ -478,12 +491,13 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
     new_species_hash = jnp.where(fissions, p0_hash, composites.species_hash)
     new_binding_energy = jnp.where(fissions, p0_be_all, composites.binding_energy)
     new_half_life = jnp.where(fissions, p0_hl_all, composites.half_life)
+    new_free_bonds = jnp.where(fissions, p0_free_bonds, composites.free_bonds)
     # Reset age on the parent slot (it's now a fresh product).
     new_age = jnp.where(fissions, jnp.float32(0.0), composites.age)
 
     # ── Write product 1 into all_target_p1[c] when fissions[c] AND p1_count[c] >= 2 ──
-    # AND with p1_valid so cap-violating products are not written to a fresh
-    # composite slot (the free slot is then naturally available next step).
+    # AND with p1_valid so structurally unsound products are not written to a
+    # fresh composite slot (the free slot remains available for next step).
     p1_writes = fissions & (p1_count >= 2) & p1_valid
 
     p1_be_all = jax.vmap(lambda h: _hash_to_binding_energy(h, config, physics))(p1_hash)
@@ -505,6 +519,7 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
     new_species_hash   = new_species_hash.at[drop_targets].set(p1_hash, mode='drop')
     new_binding_energy = new_binding_energy.at[drop_targets].set(p1_be_all, mode='drop')
     new_half_life      = new_half_life.at[drop_targets].set(p1_hl_all, mode='drop')
+    new_free_bonds     = new_free_bonds.at[drop_targets].set(p1_free_bonds, mode='drop')
     new_age            = new_age.at[drop_targets].set(jnp.float32(0.0), mode='drop')
 
     new_composites = composites._replace(
@@ -515,6 +530,7 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
         half_life=new_half_life,
         age=new_age,
         species_hash=new_species_hash,
+        free_bonds=new_free_bonds,
     )
 
     new_particles = particles._replace(
@@ -578,19 +594,20 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         lambda i: _compute_entity_hash(i, particles, composites, config)
     )(jnp.arange(N, dtype=jnp.int32))  # (N,) uint32, (N,) int32
 
-    # ── Pre-cache per-entity species counts (only when capacity caps active) ──
-    # Used by the cap gate to check whether (counts_i + counts_j) <= caps(h_merged).
+    # ── Pre-cache per-entity free bonds (only when valence gate is active) ───
+    # free_bonds(entity) = Σ v_s − 2 × (n − 1). Fusion requires both entities
+    # to have free_bonds ≥ 1 (one bond consumed on each side of the new edge).
     # Static-`if` on the config flag keeps this branch out of the trace when
     # the feature is off, so the toggle is genuinely zero-cost in that case.
-    if config.use_capacity_caps:
-        all_entity_species_counts = jax.vmap(
-            lambda i: _entity_species_counts(i, particles, composites, config)
-        )(jnp.arange(N, dtype=jnp.int32))  # (N, num_species) int32
+    species_valences = _species_valences(config)  # (S,) int32, cheap to recompute
+    if config.use_valence:
+        all_entity_free_bonds = jax.vmap(
+            lambda i: _entity_free_bonds(i, particles, composites,
+                                          species_valences, config)
+        )(jnp.arange(N, dtype=jnp.int32))  # (N,) int32
     else:
         # Unused stub. Same shape so closure types are stable across toggle.
-        all_entity_species_counts = jnp.zeros(
-            (N, config.num_species), dtype=jnp.int32
-        )
+        all_entity_free_bonds = jnp.zeros(N, dtype=jnp.int32)
 
     # ── Step 2: For each representative, find its best fusion partner ──────────
     def find_entity_partner(i):
@@ -633,22 +650,22 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             # Size cap: don't grow beyond buffer
             would_overflow = (cnt_i + cnt_j) > M
 
-            # Capacity cap (Option 5): the merged hash rolls a per-species cap
-            # vector; the would-be merged composite must satisfy it elementwise.
-            # Gated by config.use_capacity_caps so the toggle is zero-cost when off.
-            if config.use_capacity_caps:
-                merged_counts = (
-                    all_entity_species_counts[i] + all_entity_species_counts[j]
+            # Valence gate: each entity must have at least one free bond, since
+            # the new edge consumes one bond on each side. The merged composite's
+            # free_bonds = free_bonds(i) + free_bonds(j) − 2, which is ≥ 0 whenever
+            # both sides have ≥ 1. Gated by use_valence (zero-cost when off).
+            if config.use_valence:
+                has_free_bonds = (
+                    (all_entity_free_bonds[i] >= 1)
+                    & (all_entity_free_bonds[j] >= 1)
                 )
-                caps = _hash_to_capacity(merged_h, config)
-                within_capacity = jnp.all(merged_counts <= caps)
             else:
-                within_capacity = jnp.bool_(True)
+                has_free_bonds = jnp.bool_(True)
 
             can_fuse = (
                 valid & in_range
                 & (be_eff > physics.fusion_threshold)
-                & within_capacity
+                & has_free_bonds
                 & ~would_overflow
             )
             return (
@@ -761,6 +778,12 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         )
         hl_eff = hl_base / size_penalty
 
+        # New composite's free bonds: free_bonds(i) + free_bonds(j) − 2
+        # (one bond consumed on each side of the new joining edge).
+        merged_free_bonds = (
+            all_entity_free_bonds[safe_i] + all_entity_free_bonds[safe_j] - jnp.int32(2)
+        )
+
         # Build the merged member list: gather all member particle indices
         # i-side members
         i_members_comp = composites_state.members[ci]  # (M,)
@@ -813,6 +836,9 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         new_comp_hash = composites_state.species_hash.at[safe_target].set(
             jnp.where(can_fuse, h, composites_state.species_hash[safe_target])
         )
+        new_comp_free_bonds = composites_state.free_bonds.at[safe_target].set(
+            jnp.where(can_fuse, merged_free_bonds, composites_state.free_bonds[safe_target])
+        )
         new_composites = composites_state._replace(
             members=new_members,
             alive=new_comp_alive,
@@ -820,6 +846,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             half_life=new_comp_hl,
             member_count=new_comp_count_arr,
             species_hash=new_comp_hash,
+            free_bonds=new_comp_free_bonds,
         )
 
         # Update composite_id for all merged members
