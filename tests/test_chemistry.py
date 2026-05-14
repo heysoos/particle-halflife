@@ -599,3 +599,26 @@ if __name__ == '__main__':
             failed += 1
     print(f'\n{passed} passed, {failed} failed')
     sys.exit(failed)
+
+
+def test_r_rest_matrix_shape_and_symmetry():
+    """r_rest is (S, S), symmetric, and values fall in [r_rest_min, r_rest_max]."""
+    config = SimConfig(num_species=5, bond_mode="edges")
+    params = initialize_interaction_params(config, seed=42)
+    assert params.r_rest.shape == (5, 5)
+    # Symmetric: r_rest[i, j] == r_rest[j, i]
+    diff = np.asarray(params.r_rest - params.r_rest.T)
+    assert np.max(np.abs(diff)) < 1e-6, f"r_rest is not symmetric: max diff {np.max(np.abs(diff))}"
+    # In range
+    vals = np.asarray(params.r_rest)
+    assert vals.min() >= config.r_rest_min - 1e-6
+    assert vals.max() <= config.r_rest_max + 1e-6
+
+
+def test_r_rest_is_deterministic_per_hash_modulus():
+    """Same config + hash_modulus → same r_rest matrix (hash-determined)."""
+    c1 = SimConfig(num_species=5)
+    c2 = SimConfig(num_species=5)
+    p1 = initialize_interaction_params(c1, seed=42)
+    p2 = initialize_interaction_params(c2, seed=99)  # seed ignored by r_rest
+    np.testing.assert_array_almost_equal(np.asarray(p1.r_rest), np.asarray(p2.r_rest))

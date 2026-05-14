@@ -168,6 +168,7 @@ class InteractionParams(NamedTuple):
     attraction:        jnp.ndarray  # signed strength in [-1, 1]
     peak_fraction:     jnp.ndarray  # peak-attraction radius / interaction_radius
     cutoff_fraction:   jnp.ndarray  # zero-force radius / interaction_radius
+    r_rest:            jnp.ndarray  # hash-derived bond rest length per species pair
 
 
 def initialize_interaction_params(config: SimConfig,
@@ -209,10 +210,20 @@ def initialize_interaction_params(config: SimConfig,
     cutoff_fraction = jnp.maximum(a, b)
     cutoff_fraction = jnp.minimum(jnp.maximum(cutoff_fraction, peak_fraction + 0.1), 1.0)
 
+    # Hash-derived per-species-pair bond rest length. Symmetric by construction
+    # (uses the commutative species-pair hash). Independent of `seed` — this
+    # is part of the "universe" determined by config.hash_modulus, like valence.
+    from halflife.chemistry import _hash_to_rest_length  # local import: chemistry imports state
+    species_idx = jnp.arange(S, dtype=jnp.int32)
+    r_rest = jax.vmap(
+        lambda i: jax.vmap(lambda j: _hash_to_rest_length(i, j, config))(species_idx)
+    )(species_idx)  # (S, S)
+
     return InteractionParams(
         attraction=attraction,
         peak_fraction=peak_fraction,
         cutoff_fraction=cutoff_fraction,
+        r_rest=r_rest,
     )
 
 

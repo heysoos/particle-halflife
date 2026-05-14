@@ -110,6 +110,31 @@ def _hash_to_valence(species: jnp.ndarray, config: SimConfig) -> jnp.ndarray:
     return (h2 % jnp.uint32(config.max_valence) + jnp.uint32(1)).astype(jnp.int32)
 
 
+
+def _hash_to_rest_length(s_i: jnp.ndarray, s_j: jnp.ndarray,
+                         config: SimConfig) -> jnp.ndarray:
+    """
+    Hash-derived bond rest length for species pair (s_i, s_j).
+
+    Order-independent (uses the same commutative additive hash as composites)
+    so r_rest[i, j] == r_rest[j, i] without an explicit symmetry pass.
+    Re-mixed with a Fibonacci hash to decorrelate from binding energy and
+    valence so universes with the same num_species but different hash_modulus
+    get genuinely different bond chemistries.
+
+    Returns:
+        scalar float32 in [config.r_rest_min, config.r_rest_max]
+    """
+    h_i = _entity_hash_val(s_i, config).astype(jnp.uint32)
+    h_j = _entity_hash_val(s_j, config).astype(jnp.uint32)
+    h = (h_i + h_j) % jnp.uint32(config.hash_modulus)
+    # Fibonacci re-mix to decorrelate from BE / valence streams.
+    h_mix = (h * jnp.uint32(0x9E3779B1)) ^ (h >> jnp.uint32(11))
+    frac = (h_mix % jnp.uint32(1000)).astype(jnp.float32) / 999.0
+    return jnp.float32(config.r_rest_min) + frac * jnp.float32(
+        config.r_rest_max - config.r_rest_min
+    )
+
 def _species_valences(config: SimConfig) -> jnp.ndarray:
     """Pre-compute the (num_species,) valence vector. Fixed for a given config."""
     species_idx = jnp.arange(config.num_species, dtype=jnp.int32)
