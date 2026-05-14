@@ -81,6 +81,38 @@ class Camera:
         self.view_center[0] += wx_before - wx_after
         self.view_center[1] += wy_before - wy_after
 
+    def clamp_to_world(self) -> None:
+        """Clamp view_center so the visible window stays within world bounds.
+
+        Half-extent of the visible region is world_size / (2 * view_scale);
+        view_center is clamped so the window edges sit on or inside [0, world].
+        No-op when view_scale <= 1.0 — at default zoom the window already
+        covers the whole world, and below 1.0 the half-extent exceeds the
+        world, so the clamp range is empty.
+        """
+        if self.view_scale <= 1.0:
+            return
+        config = self.config
+        half_w = config.world_width  * 0.5 / self.view_scale
+        half_h = config.world_height * 0.5 / self.view_scale
+        self.view_center[0] = float(np.clip(self.view_center[0],
+                                            half_w, config.world_width  - half_w))
+        self.view_center[1] = float(np.clip(self.view_center[1],
+                                            half_h, config.world_height - half_h))
+
+    def follow(self, wx: float, wy: float) -> None:
+        """Center the view on world point (wx, wy), clamped to world bounds.
+
+        Called per-frame by Renderer.update() while a particle is selected
+        and the camera is zoomed in. Clamping keeps the view from drifting
+        outside [0, world_width] x [0, world_height] even when the tracked
+        particle hugs an edge — the particle then sits off-center inside
+        the window rather than the window scrolling into empty void.
+        """
+        self.view_center[0] = float(wx)
+        self.view_center[1] = float(wy)
+        self.clamp_to_world()
+
     def pan_by(self, dx_pixels: int, dy_pixels: int) -> None:
         """Translate the view by (dx, dy) screen pixels.
 

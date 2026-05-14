@@ -1007,6 +1007,15 @@ class Renderer:
             comp_free_bonds=comp_free_bonds,
         )
 
+        # ── Particle tracking ────────────────────────────────────────────────
+        # While a particle is selected AND the camera is zoomed in, recentre
+        # the view on it each frame. Gated on view_scale > 1 because at default
+        # zoom (or zoomed out) the whole world is visible and "tracking" would
+        # just be a no-op clamp back to the world midpoint.
+        if self._selected_idx >= 0 and self.camera.view_scale > 1.0:
+            sel_pos = pos[self._selected_idx]
+            self.camera.follow(float(sel_pos[0]), float(sel_pos[1]))
+
         # ── Particle vertex data ──────────────────────────────────────────────
         alive_idx = np.arange(len(pos))
         n_alive   = len(alive_idx)
