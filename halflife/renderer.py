@@ -511,10 +511,10 @@ class Renderer:
         # match the slider defaults defined in Task 4. UI sliders write into
         # this dict; the renderer reads from it each frame.
         self._render_settings = {
-            'trails_on':            False,
-            'trail_decay':          0.95,
-            'trail_particle_size':  1.0,
-            'trail_particle_alpha': 1.0,
+            'trails_on':           False,
+            'trail_decay':         0.95,
+            'particle_size_mult':  1.0,
+            'particle_alpha_mult': 1.0,
         }
 
         # ── Event sprite shader ──────────────────────────────────────────────
@@ -619,9 +619,9 @@ class Renderer:
         # at narrow window widths. Each slider writes into self._render_settings.
         self._show_render_params = False
         render_slider_specs = [
-            ("trail_decay",          "trail decay", 0.95, "{:.3f}", (0.0, 0.999)),
-            ("trail_particle_size",  "trail size",  1.0,  "{:.2f}", (0.25, 2.0)),
-            ("trail_particle_alpha", "trail alpha", 1.0,  "{:.2f}", (0.1,  1.0)),
+            ("trail_decay",         "trail decay",   0.95, "{:.3f}", (0.0, 0.999)),
+            ("particle_size_mult",  "particle size", 1.0,  "{:.2f}", (0.25, 2.0)),
+            ("particle_alpha_mult", "particle alpha", 1.0, "{:.2f}", (0.1,  1.0)),
         ]
         self._render_sliders = []
         r_row_y = slider_start_y
@@ -1116,8 +1116,11 @@ class Renderer:
         rs     = self._render_settings
         on     = bool(rs['trails_on'])
         decay  = float(rs['trail_decay']) if on else 0.0
-        sz_m   = float(rs['trail_particle_size'])  if on else 1.0
-        al_m   = float(rs['trail_particle_alpha']) if on else 1.0
+        # Particle size/alpha multipliers always apply, regardless of trail
+        # state — they modulate how the live particles render, not the trail
+        # itself. Trail decay is the only trails-gated setting.
+        sz_m   = float(rs['particle_size_mult'])
+        al_m   = float(rs['particle_alpha_mult'])
 
         curr_fbo = self._trail_fbos[self._trail_idx]
         prev_tex = self._trail_texs[1 - self._trail_idx]
@@ -1129,6 +1132,11 @@ class Renderer:
         # smearing into colored scribbles and stops event rings from leaving
         # ghost halos in the trail buffer.
         curr_fbo.use()
+        # Decay/clear writes are full overwrites — blending MUST be off here.
+        # If left on, the destination keeps stale data from two frames ago
+        # (we ping-pong, so curr_fbo currently holds frame N-2's content) and
+        # the trail buffer never fully fades, slowly filling with residue.
+        self.ctx.disable(moderngl.BLEND)
         if on:
             # Read previous frame, write previous × decay. No clear before —
             # the shader fully covers the framebuffer.
@@ -1140,8 +1148,10 @@ class Renderer:
             # Trails off → reset the FBO each frame.
             self.ctx.clear(*bg)
 
-        # Particle size/alpha multipliers live on the particle program so the
-        # user can dial live particles down while accumulated trails dominate.
+        # Re-enable alpha blending for the particle pass (particles have a
+        # smoothstep alpha falloff at the sprite edge).
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
         self.particle_prog['u_size_mult'].value  = sz_m
         self.particle_prog['u_alpha_mult'].value = al_m
 
