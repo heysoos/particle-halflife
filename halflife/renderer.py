@@ -923,6 +923,7 @@ class Renderer:
         (pos, vel, species, mass, p_energy, p_age, comp_id,
          comp_members, comp_count, comp_alive, comp_species_hash,
          comp_binding_energy, comp_half_life, comp_age, comp_free_bonds,
+         comp_edges, comp_edge_count,
          total_energy, step_count, sim_time) = jax.device_get((
             particles.position, particles.velocity,
             particles.species,
@@ -932,6 +933,7 @@ class Renderer:
             composites.species_hash,
             composites.binding_energy, composites.half_life, composites.age,
             composites.free_bonds,
+            composites.edges, composites.edge_count,
             state.total_energy, state.step_count, state.time,
         ))
 
@@ -991,51 +993,32 @@ class Renderer:
         alive_comp_idx = np.where(comp_alive)[0]
 
         if self.composite_mode == self.MODE_BONDS and len(alive_comp_idx) > 0:
-            C_idx = alive_comp_idx
-            max_n = int(comp_count[C_idx].max())
-            if max_n >= 2:
-                mb  = comp_members[C_idx, :max_n]   # (n_comps, max_n)
-                cnt = comp_count[C_idx]              # (n_comps,)
-                # Deterministic per-particle bond cap: for each member at slot
-                # i, emit bonds to slots (i+1, i+2, ..., i+K). Each particle
-                # ends up touched by at most ~2K bonds. Cost is O(K·N) per
-                # composite vs the old O(N²) — large composites no longer
-                # explode the bond count. Slot order is stable across frames
-                # (fusion preserves it), so bonds don't flicker.
-                K = max(1, int(MAX_BONDS_PER_PARTICLE))
-                ii_grid = np.arange(max_n)
-                offsets = np.arange(1, K + 1)
-                ii_full = np.broadcast_to(ii_grid[:, None], (max_n, K)).ravel()
-                jj_full = (ii_grid[:, None] + offsets[None, :]).ravel()
-                # Drop pairs where the j-slot is past the widest composite —
-                # those can't be valid for any composite this frame.
-                in_range = jj_full < max_n
-                ii = ii_full[in_range]
-                jj = jj_full[in_range]
-                # valid: both pair indices in-range and member slots non-negative
-                valid = (ii[None, :] < cnt[:, None]) & (jj[None, :] < cnt[:, None])
-                mem_a = mb[:, ii].ravel()
-                mem_b = mb[:, jj].ravel()
-                # per-pair member-count of owning composite (broadcast cnt across pairs)
-                cnt_per_pair = np.broadcast_to(cnt[:, None], (len(C_idx), len(ii))).ravel()
-                valid = valid.ravel() & (mem_a >= 0) & (mem_b >= 0)
-                mem_a = mem_a[valid]
-                mem_b = mem_b[valid]
-                cnt_per_pair = cnt_per_pair[valid]
+            # Prefer the real edge list (sparse bonds) when bond_mode='edges' OR
+            # when ANY composite has edges populated. Otherwise fall back to the
+            # forward-slot heuristic (star_spring mode with no edges populated).
+            use_real_edges = (self.config.bond_mode == "edges") or bool(comp_edge_count.sum() > 0)
 
-                if len(mem_a) > 0:
+            if use_real_edges:
+                # Collect all valid edges across alive composites.
+                edge_pairs = []
+                for c in alive_comp_idx:
+                    ec = int(comp_edge_count[c])
+                    if ec == 0:
+                        continue
+                    edge_pairs.append(comp_edges[c, :ec])
+                if edge_pairs:
+                    all_edges = np.concatenate(edge_pairs, axis=0)  # (E_total, 2)
+                    mem_a = all_edges[:, 0]
+                    mem_b = all_edges[:, 1]
                     pos_a = pos[mem_a]
                     dx    = pos[mem_b] - pos_a
                     self._wrap_min_image(dx)
                     pos_b = pos_a + dx
 
-                    # Alpha falls off with composite size (sqrt) so cliquey large
-                    # composites — n*(n-1)/2 bonds — don't dominate the view.
-                    # Dimers (n=2) keep the historic 0.5; n=16 ≈ 0.18.
-                    n_eff = np.maximum(cnt_per_pair.astype(np.float32), 2.0)
-                    alpha = 0.5 * np.sqrt(2.0 / n_eff)
+                    # Constant alpha for now — edges are by construction sparse.
+                    alpha = 0.7
 
-                    n_pairs = len(mem_a)
+                    n_pairs = len(all_edges)
                     bond_verts = np.empty((n_pairs * 2, 6), dtype=np.float32)
                     bond_verts[0::2, :2] = pos_a
                     bond_verts[1::2, :2] = pos_b
@@ -1046,6 +1029,68 @@ class Renderer:
                     n_bytes = min(bond_verts.nbytes, self._bond_buf_size)
                     self.bond_vbo.write(bond_verts.tobytes()[:n_bytes])
                     self._n_bond_vertices = n_bytes // (self._bond_vertex_size * 4)
+                # else: zero edges → _n_bond_vertices stays 0
+
+            else:
+                # ── Legacy forward-slot heuristic ────────────────────────────
+                # Used when bond_mode != 'edges' and no composites have edges
+                # populated (star_spring mode). Draws bonds to the next K
+                # members in slot order as a visualization approximation.
+                C_idx = alive_comp_idx
+                max_n = int(comp_count[C_idx].max())
+                if max_n >= 2:
+                    mb  = comp_members[C_idx, :max_n]   # (n_comps, max_n)
+                    cnt = comp_count[C_idx]              # (n_comps,)
+                    # Deterministic per-particle bond cap: for each member at slot
+                    # i, emit bonds to slots (i+1, i+2, ..., i+K). Each particle
+                    # ends up touched by at most ~2K bonds. Cost is O(K·N) per
+                    # composite vs the old O(N²) — large composites no longer
+                    # explode the bond count. Slot order is stable across frames
+                    # (fusion preserves it), so bonds don't flicker.
+                    K = max(1, int(MAX_BONDS_PER_PARTICLE))
+                    ii_grid = np.arange(max_n)
+                    offsets = np.arange(1, K + 1)
+                    ii_full = np.broadcast_to(ii_grid[:, None], (max_n, K)).ravel()
+                    jj_full = (ii_grid[:, None] + offsets[None, :]).ravel()
+                    # Drop pairs where the j-slot is past the widest composite —
+                    # those can't be valid for any composite this frame.
+                    in_range = jj_full < max_n
+                    ii = ii_full[in_range]
+                    jj = jj_full[in_range]
+                    # valid: both pair indices in-range and member slots non-negative
+                    valid = (ii[None, :] < cnt[:, None]) & (jj[None, :] < cnt[:, None])
+                    mem_a = mb[:, ii].ravel()
+                    mem_b = mb[:, jj].ravel()
+                    # per-pair member-count of owning composite (broadcast cnt across pairs)
+                    cnt_per_pair = np.broadcast_to(cnt[:, None], (len(C_idx), len(ii))).ravel()
+                    valid = valid.ravel() & (mem_a >= 0) & (mem_b >= 0)
+                    mem_a = mem_a[valid]
+                    mem_b = mem_b[valid]
+                    cnt_per_pair = cnt_per_pair[valid]
+
+                    if len(mem_a) > 0:
+                        pos_a = pos[mem_a]
+                        dx    = pos[mem_b] - pos_a
+                        self._wrap_min_image(dx)
+                        pos_b = pos_a + dx
+
+                        # Alpha falls off with composite size (sqrt) so cliquey large
+                        # composites — n*(n-1)/2 bonds — don't dominate the view.
+                        # Dimers (n=2) keep the historic 0.5; n=16 ≈ 0.18.
+                        n_eff = np.maximum(cnt_per_pair.astype(np.float32), 2.0)
+                        alpha = 0.5 * np.sqrt(2.0 / n_eff)
+
+                        n_pairs = len(mem_a)
+                        bond_verts = np.empty((n_pairs * 2, 6), dtype=np.float32)
+                        bond_verts[0::2, :2] = pos_a
+                        bond_verts[1::2, :2] = pos_b
+                        bond_verts[0::2, 2:5] = self.species_colors[species[mem_a]]
+                        bond_verts[1::2, 2:5] = self.species_colors[species[mem_b]]
+                        bond_verts[0::2, 5] = alpha
+                        bond_verts[1::2, 5] = alpha
+                        n_bytes = min(bond_verts.nbytes, self._bond_buf_size)
+                        self.bond_vbo.write(bond_verts.tobytes()[:n_bytes])
+                        self._n_bond_vertices = n_bytes // (self._bond_vertex_size * 4)
 
         elif self.composite_mode == self.MODE_MERGED and len(alive_comp_idx) > 0:
             C_idx = alive_comp_idx
