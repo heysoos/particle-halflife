@@ -678,6 +678,40 @@ class Renderer:
         self._show_events = True
         self._paused      = False   # mirror of main loop paused state
 
+        # ── Particle selection (click-to-inspect) ─────────────────────────────
+        # _selected_idx is the particle index of the current selection, or -1
+        # for none. The cached snapshot is rebuilt every frame from the
+        # CPU-side state arrays so the inspector panel reads stay live.
+        self._selected_idx = -1
+        self._selected_snapshot = None
+        # Pick radius in WORLD UNITS — independent of zoom, so clicks have the
+        # same feel at all zoom levels.
+        self._select_radius_world = 2.5
+        # Cached per-frame state arrays (populated at the top of update()).
+        # None until the first update() runs.
+        self._last_positions          = None
+        self._last_velocities         = None
+        self._last_species            = None
+        self._last_mass               = None
+        self._last_energy             = None
+        self._last_age                = None
+        self._last_comp_id            = None
+        self._last_comp_members       = None
+        self._last_comp_count         = None
+        self._last_comp_alive         = None
+        self._last_comp_species_hash  = None
+        self._last_comp_binding_energy = None
+        self._last_comp_half_life      = None
+        self._last_comp_age            = None
+        self._last_comp_free_bonds     = None
+        # Per-species valence cache — built lazily on first inspector access.
+        self._species_valence = None
+
+        # Close-button rect on the inspector panel. Recomputed each frame
+        # inside _render_inspector_panel; gated by _selected_idx >= 0 so a
+        # stale (0,0,0,0)-area rect is harmless before the first panel draw.
+        self._inspector_close_rect = pygame.Rect(0, 0, 18, 18)
+
         # HUD dirty flag: when False, skip the full pygame redraw + texture
         # upload and just blit the cached texture. The stats panel updates
         # every frame (sparklines, FPS), so it forces dirty=True while shown;
@@ -887,6 +921,40 @@ class Renderer:
         self._view_center[0] += world_dx
         self._view_center[1] += world_dy
 
+    # ── Particle selection (click-to-inspect) ─────────────────────────────────
+
+    def select_at(self, sx: int, sy: int) -> None:
+        """Pick the nearest particle within a world-radius of screen (sx, sy).
+
+        Reads the cached positions stashed during the last update() so no
+        extra GPU sync is needed. A click further than _select_radius_world
+        from every particle clears the selection (out-of-radius dismiss).
+        """
+        if self._last_positions is None:
+            return
+        wx, wy = self._screen_to_world(sx, sy)
+        pos = self._last_positions
+        dx = pos[:, 0] - wx
+        dy = pos[:, 1] - wy
+        # Periodic min-image so a click near a wrap edge can still pick a
+        # particle that visually looks close but lives on the other side.
+        if self.config.boundary_mode == "periodic":
+            dx -= self.config.world_width  * np.round(dx / self.config.world_width)
+            dy -= self.config.world_height * np.round(dy / self.config.world_height)
+        d2 = dx * dx + dy * dy
+        best = int(np.argmin(d2))
+        if d2[best] <= self._select_radius_world ** 2:
+            self._selected_idx = best
+        else:
+            self._selected_idx = -1
+        self._hud_dirty = True
+
+    def clear_selection(self) -> None:
+        """Drop the current particle selection (used by the × close button)."""
+        self._selected_idx = -1
+        self._selected_snapshot = None
+        self._hud_dirty = True
+
     # ── Per-frame update ──────────────────────────────────────────────────────
 
     def update(self, state: WorldState):
@@ -899,17 +967,40 @@ class Renderer:
         composites = state.composites
 
         # Single batched GPU→CPU transfer — one CUDA sync + one DMA instead of 13
-        (pos, vel, species, mass, _energy, comp_id,
+        (pos, vel, species, mass, p_energy, p_age, comp_id,
          comp_members, comp_count, comp_alive, comp_species_hash,
+         comp_binding_energy, comp_half_life, comp_age, comp_free_bonds,
          total_energy, step_count, sim_time) = jax.device_get((
             particles.position, particles.velocity,
             particles.species,
-            particles.mass,     particles.energy,
+            particles.mass,     particles.energy, particles.age,
             particles.composite_id,
             composites.members, composites.member_count, composites.alive,
             composites.species_hash,
+            composites.binding_energy, composites.half_life, composites.age,
+            composites.free_bonds,
             state.total_energy, state.step_count, state.time,
         ))
+
+        # ── Cache for inspector panel / hit-test ──────────────────────────────
+        # Stashed for select_at() and _refresh_selected_snapshot(), both of
+        # which run after this method returns. All these arrays are already on
+        # CPU at this point — no extra transfer cost.
+        self._last_positions          = pos
+        self._last_velocities         = vel
+        self._last_species            = species
+        self._last_mass               = mass
+        self._last_energy             = p_energy
+        self._last_age                = p_age
+        self._last_comp_id            = comp_id
+        self._last_comp_members       = comp_members
+        self._last_comp_count         = comp_count
+        self._last_comp_alive         = comp_alive
+        self._last_comp_species_hash  = comp_species_hash
+        self._last_comp_binding_energy = comp_binding_energy
+        self._last_comp_half_life      = comp_half_life
+        self._last_comp_age            = comp_age
+        self._last_comp_free_bonds     = comp_free_bonds
 
         # ── Particle vertex data ──────────────────────────────────────────────
         alive_idx = np.arange(len(pos))
@@ -1171,6 +1262,10 @@ class Renderer:
             self._event_vbo.write(ev_arr.flatten().tobytes()[:n_bytes])
             self._n_event_vertices = len(ev_data)
 
+        # ── Inspector snapshot ────────────────────────────────────────────────
+        # Reads from the cached arrays stashed at the top of this method.
+        self._refresh_selected_snapshot()
+
     # ── Rendering ─────────────────────────────────────────────────────────────
 
     def render(self, fps: float, step_count: int, n_alive: int):
@@ -1295,6 +1390,72 @@ class Renderer:
         self._trail_idx = 1 - self._trail_idx
 
     # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _build_species_valence(self) -> None:
+        """Compute per-species valence using the same hash chemistry uses."""
+        from halflife.chemistry import _hash_to_valence
+        config = self.config
+        self._species_valence = np.zeros(config.num_species, dtype=np.int32)
+        for s in range(config.num_species):
+            self._species_valence[s] = int(_hash_to_valence(s, config))
+
+    def _refresh_selected_snapshot(self) -> None:
+        """Rebuild the dict of stats shown in the inspector panel.
+
+        Called once per frame from update(); cheap (touches a few scalars).
+        Stashes None when nothing is selected so the panel renderer can early-out.
+        """
+        i = self._selected_idx
+        if i < 0 or self._last_positions is None:
+            self._selected_snapshot = None
+            return
+
+        config = self.config
+        px, py = float(self._last_positions[i, 0]), float(self._last_positions[i, 1])
+        vx, vy = float(self._last_velocities[i, 0]), float(self._last_velocities[i, 1])
+        speed  = float(np.hypot(vx, vy))
+        species_i = int(self._last_species[i])
+        mass_i    = float(self._last_mass[i])
+        energy_i  = float(self._last_energy[i])
+        age_i     = float(self._last_age[i])
+        cid       = int(self._last_comp_id[i])
+
+        if config.use_valence:
+            if self._species_valence is None:
+                self._build_species_valence()
+            valence_i = int(self._species_valence[species_i])
+        else:
+            valence_i = None
+
+        snap = {
+            'idx':       i,
+            'pos':       (px, py),
+            'vel':       (vx, vy),
+            'speed':     speed,
+            'species':   species_i,
+            'valence':   valence_i,
+            'mass':      mass_i,
+            'energy':    energy_i,
+            'age':       age_i,
+            'composite': None,
+        }
+
+        if cid >= 0 and bool(self._last_comp_alive[cid]):
+            count = int(self._last_comp_count[cid])
+            member_species = [int(self._last_species[m])
+                              for m in self._last_comp_members[cid][:count] if m >= 0]
+            snap['composite'] = {
+                'id':             cid,
+                'size':           count,
+                'hash':           int(self._last_comp_species_hash[cid]),
+                'members':        member_species,
+                'binding_energy': float(self._last_comp_binding_energy[cid]),
+                'half_life':      float(self._last_comp_half_life[cid]),
+                'age':            float(self._last_comp_age[cid]),
+                'free_bonds':     (int(self._last_comp_free_bonds[cid])
+                                   if config.use_valence else None),
+            }
+        self._selected_snapshot = snap
 
     def _screen_to_world(self, sx: int, sy: int) -> tuple:
         """Convert window-pixel coords → world coords using the current camera.

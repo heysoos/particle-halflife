@@ -219,9 +219,12 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
 
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 renderer.handle_mouseup()
-                # Press-and-release without crossing the drag threshold = click;
-                # particle-select dispatch lands here in Task 4. For now we
-                # just drop the state.
+                # Press-and-release without crossing the drag threshold = click.
+                # Dispatch to the particle picker; clicks on empty space are
+                # cleared by select_at() itself when no particle falls inside
+                # the pick radius.
+                if mouse_down_pos is not None and not is_panning:
+                    renderer.select_at(*mouse_down_pos)
                 mouse_down_pos = None
                 is_panning = False
 
