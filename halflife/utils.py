@@ -129,21 +129,51 @@ def apply_boundary(position: jnp.ndarray, velocity: jnp.ndarray,
 
 # ── Color Palette ────────────────────────────────────────────────────────────
 
+def oklch_to_linear_srgb(L: float, C: float, h_deg: float) -> np.ndarray:
+    """
+    Convert OKLCh (L, C, hue°) → linear sRGB. Returns (3,) float32 in [0, 1]
+    after clamping; out-of-gamut OKLCh inputs are clipped (acceptable for the
+    moderate-chroma palette used here).
+
+    Math from Björn Ottosson (2020) https://bottosson.github.io/posts/oklab/
+    """
+    import math
+    h_rad = math.radians(h_deg)
+    a = C * math.cos(h_rad)
+    b = C * math.sin(h_rad)
+    # OKLab → cone-response basis (cubic root applied in inverse)
+    l_ = L + 0.3963377774 * a + 0.2158037573 * b
+    m_ = L - 0.1055613458 * a - 0.0638541728 * b
+    s_ = L - 0.0894841775 * a - 1.2914855480 * b
+    l3, m3, s3 = l_ ** 3, m_ ** 3, s_ ** 3
+    # Cone responses → linear sRGB
+    r =  4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3
+    g = -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3
+    b_ = -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3
+    out = np.array([r, g, b_], dtype=np.float32)
+    return np.clip(out, 0.0, 1.0)
+
+
 def make_species_colors(num_species: int) -> np.ndarray:
     """
-    Generate a visually distinct HSV color palette for num_species species.
-    Returns: (num_species, 3) float32 RGB array in [0,1].
+    Generate a perceptually-uniform palette for num_species species using OKLCh.
+    Returns: (num_species, 3) float32 *linear-sRGB* in [0, 1].
+
+    The renderer composites with ACES tonemap + sRGB OETF, so colors stay in
+    linear space all the way through the scene FBO. Adjacent species get
+    slightly different lightness and chroma so neighboring hues separate
+    visually as well as chromatically.
     """
-    import colorsys
-    colors = []
+    L_base = 0.72   # target lightness — bright against dark background
+    C_base = 0.13   # moderate chroma — pops without being neon
+    HUE_OFFSET = 20.0  # offsets the wheel so species 0 isn't pure-red
+    colors = np.zeros((num_species, 3), dtype=np.float32)
     for i in range(num_species):
-        hue = i / num_species
-        # Alternate saturation/value for visual separation
-        sat = 0.85 if (i % 2 == 0) else 0.65
-        val = 0.95 if (i % 3 != 2) else 0.75
-        r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
-        colors.append([r, g, b])
-    return np.array(colors, dtype=np.float32)
+        Li = L_base + (0.04 if (i % 2 == 0) else -0.04)
+        Ci = C_base + (0.02 if (i % 3 != 2) else -0.02)
+        h_deg = (i * 360.0 / num_species + HUE_OFFSET) % 360.0
+        colors[i] = oklch_to_linear_srgb(Li, Ci, h_deg)
+    return colors
 
 
 # ── Misc JAX Helpers ─────────────────────────────────────────────────────────
