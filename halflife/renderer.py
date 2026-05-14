@@ -847,6 +847,32 @@ class Renderer:
         self._physics_updates.clear()
         return updates
 
+    # ── Camera (pan + zoom) interface ─────────────────────────────────────────
+
+    def zoom_at(self, sx: int, sy: int, factor: float) -> None:
+        """Zoom by `factor` while keeping the world point under (sx, sy) fixed.
+
+        Pin the world-coord that lives under the cursor, change scale, then
+        recompute view_center so that same world-coord still maps to the same
+        screen coord. Result: cursor sits on the same molecule before and
+        after the zoom step.
+        """
+        wx_before, wy_before = self._screen_to_world(sx, sy)
+        new_scale = float(np.clip(self._view_scale * factor,
+                                   self._view_scale_min, self._view_scale_max))
+        if abs(new_scale - self._view_scale) < 1e-6:
+            return
+        self._view_scale = new_scale
+        wx_after, wy_after = self._screen_to_world(sx, sy)
+        self._view_center[0] += wx_before - wx_after
+        self._view_center[1] += wy_before - wy_after
+
+    def reset_view(self) -> None:
+        """Reset pan and zoom to defaults (world midpoint, scale 1.0)."""
+        config = self.config
+        self._view_center = [config.world_width * 0.5, config.world_height * 0.5]
+        self._view_scale  = 1.0
+
     # ── Per-frame update ──────────────────────────────────────────────────────
 
     def update(self, state: WorldState):
@@ -1255,6 +1281,22 @@ class Renderer:
         self._trail_idx = 1 - self._trail_idx
 
     # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _screen_to_world(self, sx: int, sy: int) -> tuple:
+        """Convert window-pixel coords → world coords using the current camera.
+
+        Inverse of the vertex-shader math:
+            view = (pos - center) * scale + world_size * 0.5
+            ndc  = view / world_size * 2 - 1
+        Solving for pos:
+            pos = ndc * world_size / 2 / scale + center
+        """
+        config = self.config
+        ndc_x = (sx / config.window_width)  * 2.0 - 1.0
+        ndc_y = 1.0 - (sy / config.window_height) * 2.0   # pygame Y is top-down
+        wx = ndc_x * config.world_width  * 0.5 / self._view_scale + self._view_center[0]
+        wy = ndc_y * config.world_height * 0.5 / self._view_scale + self._view_center[1]
+        return wx, wy
 
     def _periodic_com(self, positions_2d: np.ndarray) -> np.ndarray:
         """Periodic-aware center of mass for an (n, 2) array of positions.

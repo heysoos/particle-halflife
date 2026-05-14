@@ -147,7 +147,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
             if event.type == pygame.QUIT:
                 running = False
 
-            elif event.type == pygame.MOUSEBUTTONDOWN:
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 action = renderer.handle_click(event.pos)
                 if action == 'pause':
                     paused = not paused
@@ -176,6 +176,19 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                     reroll_kind = 'chemistry'
                 else:
                     renderer.handle_mousedown_slider(event.pos)
+
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+                # Right-click: snap back to the default framing (world
+                # midpoint, scale 1.0). Quick recovery after zoom/pan.
+                renderer.reset_view()
+
+            elif event.type == pygame.MOUSEWHEEL:
+                # Zoom toward the current mouse position. y > 0 = scroll up
+                # = zoom in. ~15% per notch feels good without overshooting.
+                if event.y != 0:
+                    mx, my = pygame.mouse.get_pos()
+                    factor = 1.15 ** event.y
+                    renderer.zoom_at(mx, my, factor)
 
             elif event.type == pygame.MOUSEMOTION:
                 renderer.handle_mousemotion(event.pos)
