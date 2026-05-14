@@ -806,3 +806,72 @@ def test_fusion_appends_edge_free_plus_free():
     assert np.asarray(new_state.composites.edge_count)[c] == 1
     e = np.asarray(new_state.composites.edges[c, 0])
     assert sorted(e.tolist()) == [0, 1]
+
+
+def test_ring_closure_adds_edge_between_same_composite_members():
+    """
+    Two members of the same composite within fusion_radius, both with per-
+    particle free bonds, close a ring (gain one new edge).
+    """
+    from halflife.chemistry import attempt_ring_closure, _species_valences
+    config = SimConfig(num_species=3, num_particles=10, max_composites=4,
+                       max_valence=4, allow_ring_closure=True,
+                       boundary_mode="reflect", world_width=20.0, world_height=20.0,
+                       fusion_radius=2.0, fusion_threshold=0.0)
+    world = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=0)
+    physics = initialize_physics_params(config)
+
+    # Build a chain composite 0—1—2—3 where 0 and 3 are within fusion_radius
+    # (chain has folded back on itself).
+    # Use species 1 (valence=3 with num_species=3, max_valence=4) so the
+    # 4-member chain (3 edges) still has composite_free_bonds = 4*3 - 2*3 = 6 >= 2,
+    # and each chain endpoint has per-particle free bonds = 3 - 1 = 2 >= 1.
+    # Species 0 has valence=1, which would make the 3-edge chain over-bonded
+    # (composite_free_bonds = -2), blocking ring closure.
+    pos = np.array([[5.0, 5.0],   # 0
+                    [6.5, 5.0],   # 1
+                    [7.5, 6.0],   # 2
+                    [6.0, 6.0]]   # 3 — within fusion_radius of 0
+                   + [[50.0+i, 50.0] for i in range(6)], dtype=np.float32)
+    species = np.ones(10, dtype=np.int32)  # species 1 has valence=3 (not 1)
+    composite_id = np.array([0, 0, 0, 0, -1, -1, -1, -1, -1, -1], dtype=np.int32)
+    members = np.full((4, config.max_composite_size), -1, dtype=np.int32)
+    members[0, :4] = (0, 1, 2, 3)
+    edges = np.full((4, config.e_max, 2), -1, dtype=np.int32)
+    edges[0, 0] = (0, 1); edges[0, 1] = (1, 2); edges[0, 2] = (2, 3)
+    edge_count = np.array([3, 0, 0, 0], dtype=np.int32)
+    alive = np.array([True, False, False, False], dtype=bool)
+
+    world = world._replace(
+        particles=world.particles._replace(
+            position=jnp.asarray(pos), species=jnp.asarray(species),
+            composite_id=jnp.asarray(composite_id),
+        ),
+        composites=world.composites._replace(
+            members=jnp.asarray(members), member_count=jnp.array([4,0,0,0]),
+            alive=jnp.asarray(alive), edges=jnp.asarray(edges),
+            edge_count=jnp.asarray(edge_count),
+        ),
+    )
+
+    # Compute pre-state degree
+    from halflife.chemistry import compute_degree
+    degree = compute_degree(world.composites, config)
+    sv = _species_valences(config)
+
+    from halflife.spatial import build_cell_list, find_all_neighbors
+    cell_list = build_cell_list(world.particles.position, config)
+    neighbors = find_all_neighbors(world.particles.position, cell_list, config)
+
+    new_state, _ = attempt_ring_closure(
+        world, neighbors, params, config, physics,
+        degree=degree, species_valences=sv,
+    )
+
+    # Composite 0 should now have 4 edges (the ring-closing one).
+    assert np.asarray(new_state.composites.edge_count)[0] == 4
+    # The new edge should connect 0 and 3.
+    edges_after = np.asarray(new_state.composites.edges[0])
+    found = any(sorted(edges_after[e].tolist()) == [0, 3] for e in range(4))
+    assert found, f"Expected (0, 3) edge after ring closure, got {edges_after[:4]}"

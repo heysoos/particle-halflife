@@ -1063,3 +1063,148 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         composites=final_composites,
         rng_key=key,
     ), final_degree
+
+
+# ── Ring Closure (Phase 6b) ───────────────────────────────────────────────────
+
+def attempt_ring_closure(state: WorldState, neighbors: jnp.ndarray,
+                          params: InteractionParams, config: SimConfig,
+                          physics: PhysicsParams,
+                          degree: jnp.ndarray,
+                          species_valences: jnp.ndarray) -> tuple:
+    """
+    Phase 6b: same-composite ring closure.
+
+    For each pair of same-composite members within fusion_radius where both
+    have per-particle free bonds (degree < v_s), add one new edge between them.
+    Touches ONLY edges, edge_count, and degree — no member-list / composite_id
+    changes.
+
+    Gated by config.allow_ring_closure (static); when False, returns the state
+    unchanged.
+
+    Returns:
+        (new_state, new_degree)
+    """
+    if not config.allow_ring_closure:
+        return state, degree
+
+    particles = state.particles
+    composites = state.composites
+    key, subkey = jax.random.split(state.rng_key)
+    N = config.num_particles
+    C = config.max_composites
+    E_max = config.e_max
+    fusion_r2 = config.fusion_radius ** 2
+
+    # ── Skip mask: only particles in composites with free_bonds ≥ 2 can host ─
+    # a new ring edge. Composite-level free bonds = Σ free_bond[m] over members.
+    composite_free_bonds = compute_composite_free_bonds(
+        particles, composites, degree, species_valences, config
+    )
+    # Per-particle: free_bond[i] = v_{species[i]} - degree[i]
+    particle_free_bonds = species_valences[particles.species] - degree  # (N,) int32
+    # Per-particle skip: must be in a composite with ≥2 free bonds AND have ≥1.
+    safe_cid = jnp.clip(particles.composite_id, 0, C - 1)
+    can_attempt = (particles.composite_id >= 0) & \
+                  (composite_free_bonds[safe_cid] >= 2) & \
+                  (particle_free_bonds >= 1)  # (N,)
+
+    # ── Find best ring partner per particle ─────────────────────────────────
+    def find_ring_partner(i):
+        nbrs = neighbors[i]
+        i_attempt = can_attempt[i]
+        cid_i = particles.composite_id[i]
+        pos_i = particles.position[i]
+
+        def check(j):
+            valid = (
+                (j >= 0) & (j != i) &
+                (j > i)  # consider each pair once
+                & can_attempt[j]
+                & (particles.composite_id[j] == cid_i)  # same composite
+            )
+            d = pos_i - particles.position[j]
+            if config.boundary_mode == "periodic":
+                d = d - config.world_width  * jnp.round(d[0] / config.world_width) * jnp.array([1., 0.])
+                d = d - config.world_height * jnp.round(d[1] / config.world_height) * jnp.array([0., 1.])
+            dist2 = jnp.dot(d, d)
+            in_range = dist2 < fusion_r2
+            ok = valid & in_range
+            return jnp.where(ok, j, jnp.int32(-1)), jnp.where(ok, dist2, jnp.float32(jnp.inf))
+
+        partners, dists = jax.vmap(check)(nbrs)
+        best_idx = jnp.argmin(dists)
+        return jnp.where(i_attempt, partners[best_idx], jnp.int32(-1))
+
+    all_partners = jax.vmap(find_ring_partner)(jnp.arange(N, dtype=jnp.int32))  # (N,)
+
+    # ── Conflict resolution: take up to max_ring_closures candidates ────────
+    has_partner = all_partners >= 0
+    perm = jax.random.permutation(subkey, N)
+    shuffled = has_partner[perm]
+    cum = jnp.cumsum(shuffled.astype(jnp.int32))
+    cand = jnp.where(shuffled & (cum <= config.max_ring_closures_per_step), perm, N)
+    scan_indices = jnp.sort(cand)[:config.max_ring_closures_per_step]
+
+    def ring_body(carry, i):
+        composites_state, degree_carry, claimed = carry
+        valid_i = i < N
+        safe_i = jnp.minimum(i, N - 1)
+        j = jnp.where(valid_i, all_partners[safe_i], jnp.int32(-1))
+        safe_j = jnp.where(j >= 0, j, 0)
+
+        # Recheck per-particle valence using the live degree.
+        free_i_now = species_valences[particles.species[safe_i]] - degree_carry[safe_i]
+        free_j_now = species_valences[particles.species[safe_j]] - degree_carry[safe_j]
+
+        # Dedup: is (safe_i, safe_j) already in edges[cid]?
+        cid = jnp.clip(particles.composite_id[safe_i], 0, C - 1)
+        c_edges = composites_state.edges[cid]  # (E_max, 2)
+        already = jnp.any(
+            ((c_edges[:, 0] == safe_i) & (c_edges[:, 1] == safe_j)) |
+            ((c_edges[:, 0] == safe_j) & (c_edges[:, 1] == safe_i))
+        )
+
+        can_close = (
+            (j >= 0)
+            & ~claimed[safe_i] & ~claimed[safe_j]
+            & (free_i_now >= 1) & (free_j_now >= 1)
+            & ~already
+        )
+
+        # Append (safe_i, safe_j) to edges[cid] at slot edge_count[cid].
+        slot = composites_state.edge_count[cid]
+        safe_slot = jnp.where(can_close, slot, jnp.int32(E_max))  # OOB → drop
+        new_edge = jnp.where(can_close, jnp.array([safe_i, safe_j], dtype=jnp.int32),
+                              jnp.array([-1, -1], dtype=jnp.int32))
+        c_edges_new = c_edges.at[safe_slot].set(new_edge, mode='drop')
+        composites_state = composites_state._replace(
+            edges=composites_state.edges.at[cid].set(c_edges_new),
+            edge_count=composites_state.edge_count.at[cid].set(
+                jnp.where(can_close, slot + 1, composites_state.edge_count[cid])
+            ),
+            free_bonds=composites_state.free_bonds.at[cid].set(
+                jnp.where(can_close, composites_state.free_bonds[cid] - 2,
+                           composites_state.free_bonds[cid])
+            ),
+        )
+
+        # Update degree
+        delta = can_close.astype(jnp.int32)
+        degree_carry = degree_carry.at[safe_i].add(delta)
+        degree_carry = degree_carry.at[safe_j].add(delta)
+
+        # Mark claimed
+        claimed = claimed.at[safe_i].set(claimed[safe_i] | can_close)
+        claimed = claimed.at[safe_j].set(claimed[safe_j] | can_close)
+
+        return (composites_state, degree_carry, claimed), None
+
+    (final_composites, final_degree, _), _ = jax.lax.scan(
+        ring_body,
+        (composites, degree, jnp.zeros(N, dtype=bool)),
+        scan_indices,
+    )
+
+    return state._replace(composites=final_composites, rng_key=key), final_degree

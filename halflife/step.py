@@ -302,6 +302,13 @@ def simulation_step(state: WorldState, params: InteractionParams,
         degree=degree, species_valences=species_valences,
     )
 
+    # ── Phase 6b: Ring closure (intra-composite fusion) ───────────────────────
+    from halflife.chemistry import attempt_ring_closure
+    state, degree = attempt_ring_closure(
+        state, neighbors, params, config, physics,
+        degree=degree, species_valences=species_valences,
+    )
+
     # ── Phase 7: Decay ────────────────────────────────────────────────────────
     state = apply_composite_decay(state, config, physics)
 
