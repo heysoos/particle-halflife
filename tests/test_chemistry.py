@@ -711,6 +711,7 @@ def test_compute_composite_free_bonds_matches_per_particle():
     expected_1 = (sv_np[sp[3]] - 1) + (sv_np[sp[4]] - 1)
     assert cfb_np[0] == expected_0
     assert cfb_np[1] == expected_1
+    assert (cfb_np[2:] == 0).all()
 
 
 def test_per_particle_fusion_gate_blocks_saturated_rep():
