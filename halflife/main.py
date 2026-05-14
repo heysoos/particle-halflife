@@ -279,11 +279,11 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                     # reuse the cached compile.
                     import dataclasses
                     config = dataclasses.replace(config, bond_mode=new_mode)
-                    # Renderer holds its own config reference (read by the bond
-                    # emission branch and the HUD bond-mode badge). Rebind so
-                    # the visualization tracks the new mode without restart.
-                    renderer.config = config
-                    renderer._hud_dirty = True
+                    # Renderer holds its own config reference and slider list.
+                    # set_bond_mode rebinds the config, rebuilds the physics
+                    # sliders so the right stiffness knob (k_bond or spring_k)
+                    # is exposed, and dirties the HUD so the badge repaints.
+                    renderer.set_bond_mode(new_mode, config)
                     run_n = make_run_n_steps(config)
 
                 elif event.key == pygame.K_r:

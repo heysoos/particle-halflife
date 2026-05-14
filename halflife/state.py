@@ -250,7 +250,8 @@ class PhysicsParams(NamedTuple):
     binding_energy_scale:     jnp.ndarray  # () float32 — energy released on fusion
     repulsion_radius:         jnp.ndarray  # () float32 — inner hard-core repulsion radius
     r_cutoff_scale:           jnp.ndarray  # () float32 — multiplier on per-species r_cutoff
-    spring_k:                 jnp.ndarray  # () float32 — composite COM-spring stiffness
+    spring_k:                 jnp.ndarray  # () float32 — COM-spring stiffness (star_spring mode)
+    k_bond:                   jnp.ndarray  # () float32 — harmonic edge-spring stiffness (edges mode)
     attraction_scale:         jnp.ndarray  # () float32 — global attraction magnitude multiplier
     dt:                       jnp.ndarray  # () float32 — integration timestep
 
@@ -265,6 +266,7 @@ def initialize_physics_params(config: SimConfig) -> PhysicsParams:
         repulsion_radius=jnp.float32(config.repulsion_radius),
         r_cutoff_scale=jnp.float32(1.0),
         spring_k=jnp.float32(config.spring_k),
+        k_bond=jnp.float32(config.k_bond),
         attraction_scale=jnp.float32(1.0),
         dt=jnp.float32(config.dt),
     )

@@ -135,7 +135,10 @@ def compute_edge_bond_forces(state: WorldState, params: InteractionParams,
     N = config.num_particles
     C = config.max_composites
     E = config.e_max
-    k = jnp.float32(config.k_bond)
+    # Read stiffness from PhysicsParams (runtime-tunable via slider) instead
+    # of the SimConfig default. config.k_bond is still used to seed the
+    # initial physics value in initialize_physics_params.
+    k = physics.k_bond
 
     e_idx = jnp.arange(E, dtype=jnp.int32)
 

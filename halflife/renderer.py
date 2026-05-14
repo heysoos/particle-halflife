@@ -601,38 +601,16 @@ class Renderer:
         physics_defaults = initialize_physics_params(config)
         def _phys(field: str) -> float:
             return float(getattr(physics_defaults, field))
-        slider_specs = [
-            # \u2500\u2500 Force kernel shape \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-            # (field, label, default, fmt, linear_range or None)
-            ("repulsion_strength",       "repulsion",   _phys("repulsion_strength"),   "{:.2f}", None),
-            ("repulsion_radius",         "repulse r",   _phys("repulsion_radius"),     "{:.2f}", None),
-            ("attraction_scale",         "attract",     _phys("attraction_scale"),     "{:.2f}", None),
-            ("r_cutoff_scale",           "attract r",   _phys("r_cutoff_scale"),       "{:.2f}", None),
-            None,
-            # \u2500\u2500 Fusion chemistry \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-            ("fusion_threshold",         "fuse thresh", _phys("fusion_threshold"),     "{:.3f}", None),
-            ("binding_energy_scale",     "bind energy", _phys("binding_energy_scale"), "{:.3f}", None),
-            None,
-            # \u2500\u2500 Particle dynamics \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-            ("dt",                       "dt",          _phys("dt"),                   "{:.4f}", (0.001, 0.1)),
-            ("damping",                  "damping",     _phys("damping"),              "{:.4f}", (0.0, 1.0)),
-            ("spring_k",                 "spring k",    _phys("spring_k"),             "{:.1f}", None),
-        ]
-        group_gap = 14  # extra pixels inserted at each None sentinel
-        self._sliders = []
-        row_y = slider_start_y
-        for spec in slider_specs:
-            if spec is None:
-                row_y += group_gap
-                continue
-            field, label, default, fmt, lin = spec
-            track = pygame.Rect(panel_x + 4, row_y + 18, slider_track_w, 8)
-            self._sliders.append(
-                Slider(label, field, default, track, fmt, linear_range=lin)
-            )
-            row_y += slider_row_h
-        # Total content height (last row's bottom relative to slider_start_y).
-        self._slider_content_h = row_y - slider_start_y
+        # Cache layout dims so set_bond_mode() can rebuild the physics slider
+        # list with the same geometry after a mode swap.
+        self._slider_panel_x      = panel_x
+        self._slider_track_w      = slider_track_w
+        self._slider_start_y      = slider_start_y
+        self._slider_row_h        = slider_row_h
+        self._slider_group_gap    = 14
+        self._slider_phys_default = _phys
+
+        self._rebuild_physics_sliders(config.bond_mode)
         self._params_reset_rect = pygame.Rect(panel_x + 4, slider_start_y - 26, 100, 20)
 
         # ── Render sliders (trail panel — toggled via gear nub on Trails) ────
@@ -761,6 +739,76 @@ class Renderer:
             self.MODE_NONE:   self.MODE_BONDS,
         }
         self.composite_mode = cycle.get(self.composite_mode, self.MODE_BONDS)
+        self._hud_dirty = True
+
+    def _rebuild_physics_sliders(self, bond_mode: str) -> None:
+        """
+        (Re)build self._sliders for the active bond_mode. The bond-stiffness
+        slot is the only thing that changes:
+          edges       → k_bond (harmonic edge spring)
+          star_spring → spring_k (COM star spring)
+          off         → omit the slot entirely (no bond force)
+        All other physics sliders (forces, fusion chemistry, dt, damping)
+        are unchanged across modes.
+        """
+        _phys = self._slider_phys_default
+        if bond_mode == "edges":
+            bond_slot = ("k_bond", "bond k",   _phys("k_bond"),   "{:.1f}", None)
+        elif bond_mode == "star_spring":
+            bond_slot = ("spring_k", "spring k", _phys("spring_k"), "{:.1f}", None)
+        else:  # "off"
+            bond_slot = None
+
+        slider_specs = [
+            # ── Force kernel shape ────────────────────────────────────────────
+            # (field, label, default, fmt, linear_range or None)
+            ("repulsion_strength",       "repulsion",   _phys("repulsion_strength"),   "{:.2f}", None),
+            ("repulsion_radius",         "repulse r",   _phys("repulsion_radius"),     "{:.2f}", None),
+            ("attraction_scale",         "attract",     _phys("attraction_scale"),     "{:.2f}", None),
+            ("r_cutoff_scale",           "attract r",   _phys("r_cutoff_scale"),       "{:.2f}", None),
+            None,
+            # ── Fusion chemistry ──────────────────────────────────────────────
+            ("fusion_threshold",         "fuse thresh", _phys("fusion_threshold"),     "{:.3f}", None),
+            ("binding_energy_scale",     "bind energy", _phys("binding_energy_scale"), "{:.3f}", None),
+            None,
+            # ── Particle dynamics ─────────────────────────────────────────────
+            ("dt",                       "dt",          _phys("dt"),                   "{:.4f}", (0.001, 0.1)),
+            ("damping",                  "damping",     _phys("damping"),              "{:.4f}", (0.0, 1.0)),
+        ]
+        if bond_slot is not None:
+            slider_specs.append(bond_slot)
+
+        panel_x        = self._slider_panel_x
+        slider_track_w = self._slider_track_w
+        slider_start_y = self._slider_start_y
+        slider_row_h   = self._slider_row_h
+        group_gap      = self._slider_group_gap
+
+        self._sliders = []
+        row_y = slider_start_y
+        for spec in slider_specs:
+            if spec is None:
+                row_y += group_gap
+                continue
+            field, label, default, fmt, lin = spec
+            track = pygame.Rect(panel_x + 4, row_y + 18, slider_track_w, 8)
+            self._sliders.append(
+                Slider(label, field, default, track, fmt, linear_range=lin)
+            )
+            row_y += slider_row_h
+        # Total content height (last row's bottom relative to slider_start_y).
+        self._slider_content_h = row_y - slider_start_y
+
+    def set_bond_mode(self, new_mode: str, new_config) -> None:
+        """
+        Reflect a runtime bond_mode change in renderer-owned state:
+          - update self.config so the bond-emission branch and HUD badge see it
+          - rebuild the physics sliders to expose the right stiffness knob
+          - mark the HUD dirty so the badge / sliders repaint
+        Called by main.py's M-key handler.
+        """
+        self.config = new_config
+        self._rebuild_physics_sliders(new_mode)
         self._hud_dirty = True
 
     def toggle_stats(self):
