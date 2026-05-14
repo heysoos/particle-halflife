@@ -146,6 +146,42 @@ void main() {
 }
 """
 
+# Selection highlight: a single point sprite stamped at the selected
+# particle's world position. Soft white ring drawn on top of bonds/events
+# in the fresh-overlay FBO so it's always visible regardless of zoom.
+HIGHLIGHT_VERTEX_SHADER = """
+#version 330
+
+in vec2 in_position;
+
+uniform vec2  u_world_size;
+uniform vec2  u_view_center;
+uniform float u_view_scale;
+uniform float u_size_px;     // ring outer diameter in screen pixels
+
+void main() {
+    vec2 view = (in_position - u_view_center) * u_view_scale + (u_world_size * 0.5);
+    vec2 ndc  = (view / u_world_size) * 2.0 - 1.0;
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    gl_PointSize = u_size_px;
+}
+"""
+
+HIGHLIGHT_FRAGMENT_SHADER = """
+#version 330
+
+out vec4 fragColor;
+
+void main() {
+    float r = length(gl_PointCoord - vec2(0.5)) * 2.0;
+    // Ring at r ≈ 0.85, ~0.08 thick, soft falloff
+    float ring = 1.0 - clamp(abs(r - 0.85) / 0.08, 0.0, 1.0);
+    if (ring < 0.02) discard;
+    fragColor = vec4(1.0, 1.0, 1.0, ring);
+}
+"""
+
+
 # Tonemap composite: sample HDR scene texture, apply ACES filmic curve,
 # convert linear → sRGB display gamma. Output replaces what would have been
 # the direct framebuffer write of the LDR pipeline. Bg/HUD compositing
@@ -517,6 +553,22 @@ class Renderer:
         )
         self._fresh_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self._fresh_fbo = self.ctx.framebuffer(color_attachments=[self._fresh_tex])
+
+        # ── Selection highlight ring ──────────────────────────────────────────
+        # Single-vertex point sprite stamped at the selected particle's world
+        # position. Rendered into the fresh-overlay FBO so it sits above
+        # bonds and events; ring size is fixed in screen pixels so the
+        # selection stays visible at any zoom.
+        self.highlight_prog = self.ctx.program(
+            vertex_shader=HIGHLIGHT_VERTEX_SHADER,
+            fragment_shader=HIGHLIGHT_FRAGMENT_SHADER,
+        )
+        self.highlight_prog['u_world_size'].value = (config.world_width, config.world_height)
+        self._highlight_vbo = self.ctx.buffer(reserve=2 * 4)   # one vec2 float32
+        self._highlight_vao = self.ctx.vertex_array(
+            self.highlight_prog,
+            [(self._highlight_vbo, '2f', 'in_position')],
+        )
 
         # ── Render-settings dict ─────────────────────────────────────────────
         # Trail-related state lives here, separate from PhysicsParams. Defaults
@@ -1349,6 +1401,17 @@ class Renderer:
             )
             self._event_vao.render(moderngl.POINTS, vertices=self._n_event_vertices)
 
+        # Selection highlight ring
+        if self._selected_idx >= 0 and self._last_positions is not None:
+            sel_pos = self._last_positions[self._selected_idx].astype(np.float32)
+            self._highlight_vbo.write(sel_pos.tobytes())
+            self.highlight_prog['u_view_center'].value = vc
+            self.highlight_prog['u_view_scale'].value  = vs
+            # Constant screen-pixel diameter so the ring stays visible even
+            # on tiny zoomed-out particles. ~26 px works at default windowing.
+            self.highlight_prog['u_size_px'].value = 26.0
+            self._highlight_vao.render(moderngl.POINTS, vertices=1)
+
         # ── Tonemap composite to default framebuffer ─────────────────────────
         # Two passes through the same tonemap shader:
         #   1) Trail layer — written opaquely (blending disabled). Trail-FBO
@@ -1975,6 +2038,9 @@ class Renderer:
         self.trail_decay_prog.release()
         self._fresh_fbo.release()
         self._fresh_tex.release()
+        self._highlight_vbo.release()
+        self._highlight_vao.release()
+        self.highlight_prog.release()
         self._tonemap_vao.release()
         self.tonemap_prog.release()
         self.ctx.release()
