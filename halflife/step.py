@@ -253,10 +253,17 @@ def simulation_step(state: WorldState, params: InteractionParams,
         particles.position, particles.species, neighbors, params, config, physics
     )
 
-    # Bond forces (optional — expensive; enable via config.use_bond_forces)
-    if config.use_bond_forces:
+    # Bond forces — dispatched on static config.bond_mode so XLA traces only
+    # the live branch. Existing use_bond_forces flag is honored for backward
+    # compat in star_spring mode (bond_mode='star_spring' + use_bond_forces=False
+    # is equivalent to bond_mode='off').
+    if config.bond_mode == "edges":
+        bond_forces = compute_edge_bond_forces(state, params, config, physics)
+        forces = forces + bond_forces
+    elif config.bond_mode == "star_spring" and config.use_bond_forces:
         bond_forces = compute_bond_forces(state, config, physics)
         forces = forces + bond_forces
+    # bond_mode == "off" → no bond force added
 
     # ── Phase 4: Integration (Euler) ──────────────────────────────────────────
     new_vel = particles.velocity + (forces / particles.mass[:, None]) * physics.dt

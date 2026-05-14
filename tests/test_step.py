@@ -295,6 +295,33 @@ def test_edge_bond_force_on_two_particle_composite():
     np.testing.assert_allclose(f[3], [0.0, 0.0], atol=1e-4)
 
 
+def test_simulation_step_runs_with_bond_mode_edges():
+    """Smoke: simulation_step accepts bond_mode='edges' and produces a valid state."""
+    from halflife.step import simulation_step
+    config = SimConfig(num_species=3, num_particles=50, max_composites=10,
+                       bond_mode="edges")
+    world = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=0)
+    physics = initialize_physics_params(config)
+    new_state = simulation_step(world, params, config, physics)
+    assert new_state.particles.position.shape == (50, 2)
+    # All particles still alive, no NaNs in position/velocity
+    assert not jnp.isnan(new_state.particles.position).any()
+    assert not jnp.isnan(new_state.particles.velocity).any()
+
+
+def test_simulation_step_runs_with_bond_mode_off():
+    """Smoke: bond_mode='off' produces a valid state with no bond forces."""
+    from halflife.step import simulation_step
+    config = SimConfig(num_species=3, num_particles=50, max_composites=10,
+                       bond_mode="off")
+    world = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=0)
+    physics = initialize_physics_params(config)
+    new_state = simulation_step(world, params, config, physics)
+    assert not jnp.isnan(new_state.particles.position).any()
+
+
 # ── Standalone runner ─────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
