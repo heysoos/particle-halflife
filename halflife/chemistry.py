@@ -452,6 +452,35 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
         jnp.arange(C, dtype=jnp.int32)
     )
 
+    # ── Build per-product spanning-tree edges ────────────────────────────────
+    # Each fission product gets a fresh path through its hash-sorted members:
+    # edges[k] = (members[k], members[k+1]) for k in [0, count-1).
+    # Parent edges are dropped — fission "rearranges chemistry."
+    M_size = config.max_composite_size
+    E_max = config.e_max
+
+    def _path_edges_from_members(members_arr, count_arr):
+        """
+        Build a path-spanning tree through members in slot order: edges are
+        (members[0], members[1]), (members[1], members[2]), ...
+        Returns (edges: (E_max, 2), edge_count: int32).
+        """
+        # Edge k = (members[k], members[k+1]) for k in [0, count-1)
+        k_idx = jnp.arange(E_max, dtype=jnp.int32)
+        valid_edge = k_idx < jnp.maximum(count_arr - jnp.int32(1), jnp.int32(0))
+        # Safe gather
+        safe_k = jnp.minimum(k_idx, jnp.int32(M_size - 2))
+        a = members_arr[safe_k]
+        b = members_arr[safe_k + 1]
+        a_out = jnp.where(valid_edge, a, jnp.int32(-1))
+        b_out = jnp.where(valid_edge, b, jnp.int32(-1))
+        new_edges = jnp.stack([a_out, b_out], axis=-1)  # (E_max, 2)
+        new_edge_count = jnp.maximum(count_arr - jnp.int32(1), jnp.int32(0))
+        return new_edges, new_edge_count
+
+    p0_edges, p0_edge_count_all = jax.vmap(_path_edges_from_members)(p0_members, p0_count)
+    p1_edges, p1_edge_count_all = jax.vmap(_path_edges_from_members)(p1_members, p1_count)
+
     # ── Per-product free bonds and structural validity ──────────────────────
     # free_bonds(product) = Σ v_s − 2 × (count − 1). A product with free_bonds
     # < 0 is structurally unsound (a tree with that many nodes would require
@@ -594,6 +623,8 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
     new_free_bonds = jnp.where(fissions, p0_free_bonds, composites.free_bonds)
     # Reset age on the parent slot (it's now a fresh product).
     new_age = jnp.where(fissions, jnp.float32(0.0), composites.age)
+    new_edges = jnp.where(fissions[:, None, None], p0_edges, composites.edges)
+    new_edge_count = jnp.where(fissions, p0_edge_count_all, composites.edge_count)
 
     # ── Write product 1 into all_target_p1[c] when fissions[c] AND p1_count[c] >= 2 ──
     # AND with p1_valid so structurally unsound products are not written to a
@@ -621,6 +652,8 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
     new_half_life      = new_half_life.at[drop_targets].set(p1_hl_all, mode='drop')
     new_free_bonds     = new_free_bonds.at[drop_targets].set(p1_free_bonds, mode='drop')
     new_age            = new_age.at[drop_targets].set(jnp.float32(0.0), mode='drop')
+    new_edges          = new_edges.at[drop_targets].set(p1_edges, mode='drop')
+    new_edge_count     = new_edge_count.at[drop_targets].set(p1_edge_count_all, mode='drop')
 
     new_composites = composites._replace(
         members=new_members,
@@ -631,6 +664,8 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
         age=new_age,
         species_hash=new_species_hash,
         free_bonds=new_free_bonds,
+        edges=new_edges,
+        edge_count=new_edge_count,
     )
 
     new_particles = particles._replace(

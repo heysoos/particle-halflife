@@ -29,6 +29,7 @@ from halflife.state import (
     initialize_physics_params,
 )
 from halflife.step import simulation_step
+from halflife.chemistry import apply_composite_decay
 
 # JIT-compiled step (compiled once per config, cached)
 _step_jit = jax.jit(simulation_step, static_argnums=(2,))
@@ -875,3 +876,54 @@ def test_ring_closure_adds_edge_between_same_composite_members():
     edges_after = np.asarray(new_state.composites.edges[0])
     found = any(sorted(edges_after[e].tolist()) == [0, 3] for e in range(4))
     assert found, f"Expected (0, 3) edge after ring closure, got {edges_after[:4]}"
+
+
+def test_fission_rebuilds_spanning_tree_per_product():
+    """
+    A 4-member composite that fissions into two 2-member products should
+    leave each product with exactly 1 edge (the spanning-tree edge).
+    """
+    config = SimConfig(num_species=3, num_particles=10, max_composites=4,
+                       boundary_mode="reflect", world_width=20.0, world_height=20.0,
+                       half_life_min=0.001, half_life_max=0.001,  # decay every step
+                       fission_cost=0.0)
+    world = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=0)
+    physics = initialize_physics_params(config)
+
+    pos = np.array([[5.0, 5.0], [5.5, 5.0], [6.0, 5.0], [6.5, 5.0]]
+                   + [[50.0+i, 50.0] for i in range(6)], dtype=np.float32)
+    species = np.zeros(10, dtype=np.int32)
+    composite_id = np.array([0, 0, 0, 0, -1, -1, -1, -1, -1, -1], dtype=np.int32)
+    members = np.full((4, config.max_composite_size), -1, dtype=np.int32)
+    members[0, :4] = (0, 1, 2, 3)
+    edges = np.full((4, config.e_max, 2), -1, dtype=np.int32)
+    edges[0, 0] = (0, 1); edges[0, 1] = (1, 2); edges[0, 2] = (2, 3)
+    edge_count = np.array([3, 0, 0, 0], dtype=np.int32)
+    alive = np.array([True, False, False, False], dtype=bool)
+    half_life = np.array([0.001, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    world = world._replace(
+        particles=world.particles._replace(
+            position=jnp.asarray(pos), species=jnp.asarray(species),
+            composite_id=jnp.asarray(composite_id),
+        ),
+        composites=world.composites._replace(
+            members=jnp.asarray(members), member_count=jnp.array([4,0,0,0]),
+            alive=jnp.asarray(alive), edges=jnp.asarray(edges),
+            edge_count=jnp.asarray(edge_count),
+            half_life=jnp.asarray(half_life),
+        ),
+    )
+
+    new_state = apply_composite_decay(world, config, physics)
+
+    # The original composite has fissioned. Both products should each have a
+    # spanning tree (n-1 edges). For a 2-member product, that's exactly 1.
+    alive_after = np.asarray(new_state.composites.alive)
+    counts_after = np.asarray(new_state.composites.member_count)
+    edge_counts_after = np.asarray(new_state.composites.edge_count)
+    for c in np.where(alive_after)[0]:
+        n = counts_after[c]
+        assert edge_counts_after[c] == max(0, n - 1), \
+            f"Composite {c} has {n} members but {edge_counts_after[c]} edges (expected {n-1})"
