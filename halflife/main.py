@@ -162,6 +162,8 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                     renderer.toggle_events()
                 elif action == 'toggle_trails':
                     renderer.toggle_trails()
+                elif action == 'toggle_render_params':
+                    renderer.toggle_render_params()
                 elif action == 'toggle_params':
                     renderer.toggle_params()
                 elif action == 'reset':

@@ -580,30 +580,55 @@ class Renderer:
             ("dt",                       "dt",          _phys("dt"),                   "{:.4f}", (0.001, 0.1)),
             ("damping",                  "damping",     _phys("damping"),              "{:.4f}", (0.0, 1.0)),
             ("spring_k",                 "spring k",    _phys("spring_k"),             "{:.1f}", None),
-            None,
-            # ── Rendering / trails ──────────────────────────────────────────
-            ("trail_decay",          "trail decay", 0.95, "{:.3f}", (0.0, 0.999)),
-            ("trail_particle_size",  "trail size",  1.0,  "{:.2f}", (0.25, 2.0)),
-            ("trail_particle_alpha", "trail alpha", 1.0,  "{:.2f}", (0.1,  1.0)),
         ]
         group_gap = 14  # extra pixels inserted at each None sentinel
         self._sliders = []
         row_y = slider_start_y
-        RENDER_FIELDS = {'trail_decay', 'trail_particle_size', 'trail_particle_alpha'}
         for spec in slider_specs:
             if spec is None:
                 row_y += group_gap
                 continue
             field, label, default, fmt, lin = spec
             track = pygame.Rect(panel_x + 4, row_y + 18, slider_track_w, 8)
-            target = self._render_settings if field in RENDER_FIELDS else None
             self._sliders.append(
-                Slider(label, field, default, track, fmt, linear_range=lin, target_dict=target)
+                Slider(label, field, default, track, fmt, linear_range=lin)
             )
             row_y += slider_row_h
         # Total content height (last row's bottom relative to slider_start_y).
         self._slider_content_h = row_y - slider_start_y
         self._params_reset_rect = pygame.Rect(panel_x + 4, slider_start_y - 26, 100, 20)
+
+        # ── Render sliders (trail panel — toggled via gear nub on Trails) ────
+        # Live in their own panel, mutually exclusive with the physics params
+        # panel. The trail panel reuses the same X column so it never overflows
+        # at narrow window widths. Each slider writes into self._render_settings.
+        self._show_render_params = False
+        render_slider_specs = [
+            ("trail_decay",          "trail decay", 0.95, "{:.3f}", (0.0, 0.999)),
+            ("trail_particle_size",  "trail size",  1.0,  "{:.2f}", (0.25, 2.0)),
+            ("trail_particle_alpha", "trail alpha", 1.0,  "{:.2f}", (0.1,  1.0)),
+        ]
+        self._render_sliders = []
+        r_row_y = slider_start_y
+        for field, label, default, fmt, lin in render_slider_specs:
+            track = pygame.Rect(panel_x + 4, r_row_y + 18, slider_track_w, 8)
+            self._render_sliders.append(
+                Slider(label, field, default, track, fmt,
+                       linear_range=lin, target_dict=self._render_settings)
+            )
+            r_row_y += slider_row_h
+        self._render_slider_content_h = r_row_y - slider_start_y
+        self._render_params_reset_rect = pygame.Rect(panel_x + 4, slider_start_y - 26, 100, 20)
+
+        # Gear nub on the Trails button — small region on its right edge that
+        # opens the render-settings panel separately from the Params button.
+        for _lbl, _rect, _act in self._buttons:
+            if _act == 'toggle_trails':
+                gear_w = 18
+                self._trails_gear_rect = pygame.Rect(
+                    _rect.right - gear_w, _rect.top, gear_w, _rect.height
+                )
+                break
 
         # ── Runtime state ─────────────────────────────────────────────────────
         self._n_particles_to_draw = 0
@@ -698,21 +723,46 @@ class Renderer:
         """Return action string if a button was clicked, else None."""
         if self._stats_btn_rect.collidepoint(pos):
             return "toggle_stats"
+        # Gear nub overlays the right edge of the Trails button. Check it
+        # before the buttons list so the gear region wins over the underlying
+        # toggle_trails hit.
+        if self._trails_gear_rect.collidepoint(pos):
+            return "toggle_render_params"
         for _label, rect, action in self._buttons:
             if rect.collidepoint(pos):
                 return action
         return None
 
     def toggle_params(self) -> None:
+        # Physics and render panels are mutually exclusive — opening one closes
+        # the other so they never overlap at narrow window widths.
         self._show_params = not self._show_params
+        if self._show_params:
+            self._show_render_params = False
+        self._hud_dirty = True
+
+    def toggle_render_params(self) -> None:
+        self._show_render_params = not self._show_render_params
+        if self._show_render_params:
+            self._show_params = False
         self._hud_dirty = True
 
     def handle_mousedown_slider(self, pos) -> bool:
         """Start dragging a slider if pos hits a handle, or reset if a reset button hit."""
-        if not self._show_params:
+        # Only one of the two panels can be open at a time (mutually exclusive).
+        # Iterate whichever panel is active; both panels share the same X column
+        # so we never need to consider both lists at once.
+        if self._show_params:
+            sliders = self._sliders
+            reset_rect = self._params_reset_rect
+        elif self._show_render_params:
+            sliders = self._render_sliders
+            reset_rect = self._render_params_reset_rect
+        else:
             return False
-        if self._params_reset_rect.collidepoint(pos):
-            for s in self._sliders:
+
+        if reset_rect.collidepoint(pos):
+            for s in sliders:
                 s.reset()
                 if s.target_dict is not None:
                     s.target_dict[s.field] = s.value
@@ -720,7 +770,7 @@ class Renderer:
                     self._physics_updates[s.field] = s.value
             self._hud_dirty = True
             return True
-        for slider in self._sliders:
+        for slider in sliders:
             if slider.hit_reset(pos):
                 slider.reset()
                 if slider.target_dict is not None:
@@ -729,7 +779,7 @@ class Renderer:
                     self._physics_updates[slider.field] = slider.value
                 self._hud_dirty = True
                 return True
-        for slider in self._sliders:
+        for slider in sliders:
             if slider.hit_handle(pos):
                 self._dragging_slider = slider
                 slider.handle_drag(pos)
@@ -1180,10 +1230,29 @@ class Renderer:
             pygame.draw.rect(surface, bg_col, rect, border_radius=4)
             pygame.draw.rect(surface, (100, 140, 200, 180), rect, 1, border_radius=4)
 
-            # Text
+            # Text — for the Trails button, the right ~18px belongs to the
+            # gear nub (separate click region opening the trails panel), so
+            # center the label in the remaining left portion.
             txt = font.render(display_label, True, (210, 230, 255))
-            surface.blit(txt, (rect.centerx - txt.get_width() // 2,
-                                rect.centery - txt.get_height() // 2))
+            if action == 'toggle_trails':
+                text_cx = rect.left + (rect.width - 18) // 2
+                surface.blit(txt, (text_cx - txt.get_width() // 2,
+                                    rect.centery - txt.get_height() // 2))
+            else:
+                surface.blit(txt, (rect.centerx - txt.get_width() // 2,
+                                    rect.centery - txt.get_height() // 2))
+
+            # Gear nub on the Trails button — opens the trails settings panel.
+            # Active state (panel currently open) uses a brighter background.
+            if action == 'toggle_trails':
+                gear_rect = self._trails_gear_rect
+                nub_col = (60, 80, 110, 220) if self._show_render_params else (30, 40, 60, 220)
+                pygame.draw.rect(surface, nub_col, gear_rect, border_radius=3)
+                pygame.draw.rect(surface, (100, 140, 200, 180), gear_rect, 1, border_radius=3)
+                gear_glyph = font.render("⚙", True, (200, 220, 240))
+                surface.blit(gear_glyph,
+                             (gear_rect.centerx - gear_glyph.get_width() // 2,
+                              gear_rect.centery - gear_glyph.get_height() // 2))
 
         # Stats button (top-right corner)
         stats_rect = self._stats_btn_rect
@@ -1366,6 +1435,26 @@ class Renderer:
             surface.blit(reset_txt, (reset_rect.centerx - reset_txt.get_width() // 2,
                                      reset_rect.centery - reset_txt.get_height() // 2))
             for slider in self._sliders:
+                slider.draw(surface, font)
+
+        # ── Render-params panel (trails) ──────────────────────────────────────
+        if self._show_render_params:
+            btn_w, btn_h, gap = 108, 26, 4
+            panel_x = 8 + btn_w + 8
+            slider_start_y = 8 + self._n_buttons * (btn_h + gap) + 8
+            panel_w = 244
+            panel_h = self._render_slider_content_h + 10 + 26
+            panel_rect = pygame.Rect(panel_x - 4, slider_start_y - 30, panel_w, panel_h)
+            pygame.draw.rect(surface, (15, 18, 35, 185), panel_rect, border_radius=6)
+            pygame.draw.rect(surface, (70, 100, 150, 180), panel_rect, 1, border_radius=6)
+            # Reset Trails button
+            reset_rect = self._render_params_reset_rect
+            pygame.draw.rect(surface, (80, 30, 30, 200), reset_rect, border_radius=4)
+            pygame.draw.rect(surface, (150, 80, 80, 180), reset_rect, 1, border_radius=4)
+            reset_txt = font.render("Reset Trails", True, (255, 160, 160))
+            surface.blit(reset_txt, (reset_rect.centerx - reset_txt.get_width() // 2,
+                                     reset_rect.centery - reset_txt.get_height() // 2))
+            for slider in self._render_sliders:
                 slider.draw(surface, font)
 
         # ── Bottom key hint ───────────────────────────────────────────────────

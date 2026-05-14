@@ -29,7 +29,7 @@ class SimConfig:
 
     # ── Particles ────────────────────────────────────────────────────────────
     num_particles: int = 5_000      # total particle count (fixed, all always alive)
-    num_species: int = 3           # number of distinct particle types
+    num_species: int = 12           # number of distinct particle types
     state_dim: int = 8              # internal state vector size (NCA-style, future use)
 
     # ── Composites ───────────────────────────────────────────────────────────
@@ -95,7 +95,17 @@ class SimConfig:
     # holds regardless. BE-threshold preference is unchanged and still drives
     # per-multiset specificity; valence layers physical saturation on top.
     use_valence: bool = True
-    max_valence: int = 4   # per-species valence drawn from [1, max_valence]
+    # Per-species valence drawn from [1, max_valence]. The choice of max_valence
+    # sets the "chemistry regime" — different values give qualitatively different
+    # reachable composite topologies:
+    #   1 = stub world — every species v=1, no composite past size 2 (dimers only).
+    #   2 = polymer world — species ∈ {1,2}, v=2 chains have free_bonds=2 at any N,
+    #       so polymers of arbitrary length are structurally valid.
+    #   3 = branching world — species ∈ {1,2,3}, v=3 scaffolds can host branches
+    #       (free_bonds grows linearly with N).
+    #   4 = carbon-like (default) — species ∈ {1..4}, full flexibility; v=4 acts
+    #       like carbon, supporting both long chains and dense branching.
+    max_valence: int = 4
 
     # ── Performance Caps ─────────────────────────────────────────────────────
     # Fusion scan length — set to num_particles to ensure all candidates are processed
@@ -116,7 +126,7 @@ class SimConfig:
     fps_target: int = 120
     point_size_min: float = 2.0       # minimum particle render size (pixels)
     point_size_max: float = 14.0      # maximum (scales with mass)
-    background_color: tuple = (0.05, 0.05, 0.08, 1.0)  # dark blue-black
+    background_color: tuple = (0.004, 0.004, 0.007, 1.0)  # dark blue-black, in LINEAR sRGB (post-tonemap displays ≈ 5% gray-blue)
 
     # ── Derived (computed from above) ────────────────────────────────────────
     # Not actual dataclass fields — computed as properties for convenience
