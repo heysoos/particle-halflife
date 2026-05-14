@@ -20,6 +20,8 @@ Data flow per frame:
 """
 
 import collections
+from typing import NamedTuple, Optional
+
 import numpy as np
 import pygame
 import moderngl
@@ -28,6 +30,36 @@ import jax
 from halflife.config import SimConfig
 from halflife.state import WorldState, get_species_colors, initialize_physics_params
 from halflife.profiler import ProfileMetrics
+from halflife.render.widgets import Slider
+from halflife.render.camera import Camera
+from halflife.render.hud import HUDPainter
+
+
+# ── CPU-side state snapshot ───────────────────────────────────────────────────
+# Per-frame CPU copy of the simulation arrays that the renderer needs for
+# things that run *after* update() but before the next step — selection
+# hit-testing, the inspector panel, the highlight ring. Built once at the top
+# of update() via a single batched jax.device_get(...) so we pay one CUDA
+# sync + one DMA per frame instead of fifteen.
+#
+# Field names drop the "_last_" prefix the individual instance attributes
+# used to carry — the tuple itself is the "last-frame" marker.
+class CPUStateSnapshot(NamedTuple):
+    positions:           np.ndarray
+    velocities:          np.ndarray
+    species:             np.ndarray
+    mass:                np.ndarray
+    energy:              np.ndarray
+    age:                 np.ndarray
+    comp_id:             np.ndarray
+    comp_members:        np.ndarray
+    comp_count:          np.ndarray
+    comp_alive:          np.ndarray
+    comp_species_hash:   np.ndarray
+    comp_binding_energy: np.ndarray
+    comp_half_life:      np.ndarray
+    comp_age:            np.ndarray
+    comp_free_bonds:     np.ndarray
 
 
 # ── Bond rendering cap ────────────────────────────────────────────────────────
@@ -120,8 +152,16 @@ void main() {
 }
 """
 
-# HUD: fullscreen quad with pygame surface as texture
-HUD_VERTEX_SHADER = """
+# Shared fullscreen-quad vertex shader: emit NDC pos straight through and
+# derive UVs from it. Reused by every fullscreen-quad pass (HUD, tonemap,
+# trail decay) — three separate copies used to exist and were byte-identical.
+#
+# No Y-flip in the shader. For the HUD pass this is intentional: the pygame
+# surface is uploaded with pygame.image.tostring(..., True) which pre-flips
+# the pixel data, so sampling with v_uv aligned to in_pos works. For tonemap
+# and trail-decay the texture is an OpenGL FBO attachment that is already in
+# OpenGL convention — also no flip needed.
+FULLSCREEN_QUAD_VS = """
 #version 330
 
 in vec2 in_pos;
@@ -130,10 +170,10 @@ out vec2 v_uv;
 void main() {
     gl_Position = vec4(in_pos, 0.0, 1.0);
     v_uv = in_pos * 0.5 + 0.5;
-    // No Y-flip needed: pygame surface is pre-flipped on upload
 }
 """
 
+# HUD: fullscreen quad with pygame surface as texture
 HUD_FRAGMENT_SHADER = """
 #version 330
 
@@ -185,19 +225,7 @@ void main() {
 # Tonemap composite: sample HDR scene texture, apply ACES filmic curve,
 # convert linear → sRGB display gamma. Output replaces what would have been
 # the direct framebuffer write of the LDR pipeline. Bg/HUD compositing
-# happens *after* this pass.
-TONEMAP_VERTEX_SHADER = """
-#version 330
-
-in vec2 in_pos;
-out vec2 v_uv;
-
-void main() {
-    gl_Position = vec4(in_pos, 0.0, 1.0);
-    v_uv = in_pos * 0.5 + 0.5;
-}
-"""
-
+# happens *after* this pass. Vertex shader is the shared FULLSCREEN_QUAD_VS.
 TONEMAP_FRAGMENT_SHADER = """
 #version 330
 
@@ -237,19 +265,8 @@ void main() {
 # Trail decay: full-screen pass that reads the previous trail texture and
 # writes texel × u_decay into the current trail FBO. Acts as both "clear"
 # and "fade." u_decay = 0 ⇒ full clear; u_decay = 0.95 ⇒ short tails;
-# u_decay → 1.0 ⇒ near-infinite trails (will saturate eventually).
-TRAIL_DECAY_VERTEX_SHADER = """
-#version 330
-
-in vec2 in_pos;
-out vec2 v_uv;
-
-void main() {
-    gl_Position = vec4(in_pos, 0.0, 1.0);
-    v_uv = in_pos * 0.5 + 0.5;
-}
-"""
-
+# u_decay → 1.0 ⇒ near-infinite trails (will saturate eventually). Vertex
+# shader is the shared FULLSCREEN_QUAD_VS.
 TRAIL_DECAY_FRAGMENT_SHADER = """
 #version 330
 
@@ -304,109 +321,6 @@ void main() {
 """
 
 
-# ── Slider ────────────────────────────────────────────────────────────────────
-
-class Slider:
-    """Horizontal slider widget — log-scale multiplier (0.1×–10×) or optional linear range."""
-
-    EXPO_MIN, EXPO_MAX = -1.0, 1.0   # 0.1× to 10× the default value
-
-    def __init__(self, label: str, field: str, default_value: float,
-                 track_rect: pygame.Rect, fmt: str = "{:.3f}",
-                 linear_range=None, target_dict: dict = None):
-        self._label = label
-        self._field = field
-        self._default = float(default_value)
-        self._track_rect = track_rect
-        self._fmt = fmt
-        self._linear_range = linear_range
-        # When set, this slider writes into target_dict[field] instead of the
-        # renderer's generic _physics_updates dict. Used to keep render-only
-        # sliders out of the PhysicsParams update pipeline.
-        self._target_dict = target_dict
-        self._reset_rect = pygame.Rect(track_rect.right + 4, track_rect.centery - 7, 14, 14)
-        # Initialize exponent so that value == default
-        if linear_range is not None:
-            lo, hi = linear_range
-            t = (self._default - lo) / max(hi - lo, 1e-8)
-            self._exponent = self.EXPO_MIN + float(np.clip(t, 0.0, 1.0)) * (self.EXPO_MAX - self.EXPO_MIN)
-        else:
-            self._exponent = 0.0  # 1× = default
-
-    @property
-    def field(self) -> str:
-        return self._field
-
-    @property
-    def target_dict(self) -> dict:
-        return self._target_dict
-
-    @property
-    def value(self) -> float:
-        if self._linear_range is not None:
-            lo, hi = self._linear_range
-            t = (self._exponent - self.EXPO_MIN) / (self.EXPO_MAX - self.EXPO_MIN)
-            return lo + float(np.clip(t, 0.0, 1.0)) * (hi - lo)
-        return self._default * (10.0 ** self._exponent)
-
-    def reset(self) -> None:
-        if self._linear_range is not None:
-            lo, hi = self._linear_range
-            t = (self._default - lo) / max(hi - lo, 1e-8)
-            self._exponent = self.EXPO_MIN + float(np.clip(t, 0.0, 1.0)) * (self.EXPO_MAX - self.EXPO_MIN)
-        else:
-            self._exponent = 0.0
-
-    def hit_reset(self, pos) -> bool:
-        return self._reset_rect.collidepoint(pos)
-
-    def _handle_x(self) -> int:
-        t = (self._exponent - self.EXPO_MIN) / (self.EXPO_MAX - self.EXPO_MIN)
-        return int(self._track_rect.left + t * self._track_rect.width)
-
-    def draw(self, surface: pygame.Surface, font) -> None:
-        r = self._track_rect
-        if self._linear_range is not None:
-            label_str = f"{self._label}: {self._fmt.format(self.value)}"
-        else:
-            mult = 10.0 ** self._exponent
-            label_str = f"{self._label}: {self._fmt.format(self.value)} ({mult:.2f}\u00d7)"
-        txt = font.render(label_str, True, (190, 215, 255))
-        surface.blit(txt, (r.left, r.top - 14))
-        # Track
-        pygame.draw.rect(surface, (50, 60, 80, 220), r, border_radius=3)
-        # Fill
-        hx = self._handle_x()
-        fill_r = pygame.Rect(r.left, r.top, hx - r.left, r.height)
-        if fill_r.width > 0:
-            pygame.draw.rect(surface, (60, 130, 200, 220), fill_r, border_radius=3)
-        # Handle
-        pygame.draw.circle(surface, (180, 210, 255), (hx, r.centery), 6)
-        # Per-slider reset button (↺)
-        is_default = abs(self._exponent - (self.EXPO_MIN + (
-            (self._default - self._linear_range[0]) / max(self._linear_range[1] - self._linear_range[0], 1e-8)
-            if self._linear_range else 0.5
-        ) * (self.EXPO_MAX - self.EXPO_MIN))) < 0.01 if self._linear_range else abs(self._exponent) < 0.01
-        bg_col = (40, 25, 25, 200) if not is_default else (25, 30, 40, 200)
-        pygame.draw.rect(surface, bg_col, self._reset_rect, border_radius=3)
-        pygame.draw.rect(surface, (120, 80, 80, 180), self._reset_rect, 1, border_radius=3)
-        lbl = font.render("\u21ba", True, (200, 140, 140) if not is_default else (80, 90, 110))
-        surface.blit(lbl, (self._reset_rect.centerx - lbl.get_width() // 2,
-                            self._reset_rect.centery - lbl.get_height() // 2))
-
-    def hit_handle(self, pos) -> bool:
-        # Whole track is draggable, not just the knob — clicking anywhere on
-        # the bar grabs the slider and snaps the knob to that x.
-        r = self._track_rect
-        return (r.left <= pos[0] <= r.right and
-                abs(pos[1] - r.centery) <= 10)
-
-    def handle_drag(self, pos) -> float:
-        r = self._track_rect
-        t = (pos[0] - r.left) / max(r.width, 1)
-        self._exponent = self.EXPO_MIN + float(max(0.0, min(1.0, t))) * (self.EXPO_MAX - self.EXPO_MIN)
-        return self.value
-
 
 # ── Renderer ──────────────────────────────────────────────────────────────────
 
@@ -421,6 +335,31 @@ class Renderer:
     MODE_BONDS  = "bonds"
     MODE_MERGED = "merged"
     MODE_NONE   = "none"   # plain particles, no bond overlay / no COM blob
+
+    # Button background tints, keyed by an action substring or sentinel.
+    # Pause shows the alternate tint when self._paused is True. Looked up by
+    # _button_bg_color() so the giant _render_hud_surface block stays tidy.
+    BUTTON_BG = {
+        'default':      (40, 55, 80, 200),
+        'reset':        (90, 40, 40, 200),
+        'reroll':       (60, 40, 80, 200),   # any action starting with 'reroll_'
+        'pause':        (40, 80, 50, 200),   # play/idle state
+        'pause_active': (80, 60, 30, 200),   # actually paused
+    }
+
+    # Total stats-panel height in pixels. Derived from the row layout inside
+    # _render_hud_surface:
+    #   4 static rows (16px each)
+    # + 6 spark-stat rows (15px label + 18px sparkline = 33px each)
+    # + 4px gap
+    # + 18px histogram header
+    # + 64px chart
+    # + 20px tick row
+    # + 10px bottom padding
+    # Used both for the panel itself AND by the inspector panel to know how
+    # far down to slide when the stats panel is open. The two had drifted
+    # apart as literals in the past, so it lives here as a single source.
+    STATS_PANEL_H = 4 * 16 + 6 * 33 + 4 + 18 + 64 + 20 + 10
 
     def __init__(self, config: SimConfig, metrics: ProfileMetrics = None):
         self.config = config
@@ -480,7 +419,7 @@ class Renderer:
 
         # ── HUD shader (pygame surface → fullscreen quad) ────────────────────
         self.hud_prog = self.ctx.program(
-            vertex_shader=HUD_VERTEX_SHADER,
+            vertex_shader=FULLSCREEN_QUAD_VS,
             fragment_shader=HUD_FRAGMENT_SHADER,
         )
         # Fullscreen quad: 2 triangles (6 vertices)
@@ -508,7 +447,7 @@ class Renderer:
         # output to the default framebuffer. The HUD is drawn on top of the
         # tonemapped output in LDR space.
         self.tonemap_prog = self.ctx.program(
-            vertex_shader=TONEMAP_VERTEX_SHADER,
+            vertex_shader=FULLSCREEN_QUAD_VS,
             fragment_shader=TONEMAP_FRAGMENT_SHADER,
         )
         # Reuse the HUD fullscreen-quad VBO geometry — same -1..1 NDC quad.
@@ -535,7 +474,7 @@ class Renderer:
         self._trail_idx = 0
 
         self.trail_decay_prog = self.ctx.program(
-            vertex_shader=TRAIL_DECAY_VERTEX_SHADER,
+            vertex_shader=FULLSCREEN_QUAD_VS,
             fragment_shader=TRAIL_DECAY_FRAGMENT_SHADER,
         )
         self._trail_decay_vao = self.ctx.vertex_array(
@@ -582,15 +521,12 @@ class Renderer:
         }
 
         # ── Camera (pan + zoom) ──────────────────────────────────────────────
-        # World point at the screen center, and how zoomed in we are.
-        # view_scale = 1.0 is the default (full world visible just like before
-        # the camera existed); > 1.0 zooms in. view_center defaults to the
-        # world midpoint so the initial frame is identical to the no-camera
-        # version of the renderer.
-        self._view_center = [config.world_width * 0.5, config.world_height * 0.5]
-        self._view_scale  = 1.0
-        self._view_scale_min = 0.25
-        self._view_scale_max = 40.0
+        # Pan/zoom state and conversions live in halflife/render/camera.py.
+        # Defaults: view_center = world midpoint, view_scale = 1.0 (identical
+        # to the no-camera frame). main.py drives it via self.camera.zoom_at,
+        # .pan_by, and .reset; the renderer pushes its uniforms onto every
+        # world-space program at the top of render().
+        self.camera = Camera(config)
 
         # ── Event sprite shader ──────────────────────────────────────────────
         self.event_prog = self.ctx.program(
@@ -598,6 +534,17 @@ class Renderer:
             fragment_shader=EVENT_FRAGMENT_SHADER,
         )
         self.event_prog['u_world_size'].value = (config.world_width, config.world_height)
+
+        # Programs that read the camera uniforms (u_view_center, u_view_scale).
+        # self.camera.push_uniforms() pushes the current view onto every one
+        # of them each frame; u_world_size is already set above and doesn't
+        # change.
+        self._world_space_progs = [
+            self.particle_prog,
+            self.bond_prog,
+            self.highlight_prog,
+            self.event_prog,
+        ]
 
         self._event_max = 200
         self._event_vbo = self.ctx.buffer(reserve=self._event_max * 6 * 4)
@@ -740,22 +687,11 @@ class Renderer:
         # same feel at all zoom levels.
         self._select_radius_world = 2.5
         # Cached per-frame state arrays (populated at the top of update()).
-        # None until the first update() runs.
-        self._last_positions          = None
-        self._last_velocities         = None
-        self._last_species            = None
-        self._last_mass               = None
-        self._last_energy             = None
-        self._last_age                = None
-        self._last_comp_id            = None
-        self._last_comp_members       = None
-        self._last_comp_count         = None
-        self._last_comp_alive         = None
-        self._last_comp_species_hash  = None
-        self._last_comp_binding_energy = None
-        self._last_comp_half_life      = None
-        self._last_comp_age            = None
-        self._last_comp_free_bonds     = None
+        # None until the first update() runs. Single CPUStateSnapshot tuple
+        # so adding a new cached array touches one definition (the NamedTuple
+        # at the top of this file) instead of an init block + an assignment
+        # block + every read site.
+        self._cpu_state: Optional[CPUStateSnapshot] = None
         # Per-species valence cache — built lazily on first inspector access.
         self._species_valence = None
 
@@ -806,6 +742,13 @@ class Renderer:
         self._spark_energy = collections.deque(maxlen=SPARK_LEN)
         self._spark_fusion = collections.deque(maxlen=SPARK_LEN)
         self._spark_decay  = collections.deque(maxlen=SPARK_LEN)
+
+        # ── HUD painter ──────────────────────────────────────────────────────
+        # Owns the pygame-surface drawing (buttons, panels, inspector). Holds
+        # a back-reference to this Renderer; all state still lives here.
+        # Instantiated last so every field it reads (sliders, stats, etc.)
+        # has been initialized above.
+        self.hud = HUDPainter(self)
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -894,29 +837,20 @@ class Renderer:
         if reset_rect.collidepoint(pos):
             for s in sliders:
                 s.reset()
-                if s.target_dict is not None:
-                    s.target_dict[s.field] = s.value
-                else:
-                    self._physics_updates[s.field] = s.value
+                s.commit(self._physics_updates)
             self._hud_dirty = True
             return True
         for slider in sliders:
             if slider.hit_reset(pos):
                 slider.reset()
-                if slider.target_dict is not None:
-                    slider.target_dict[slider.field] = slider.value
-                else:
-                    self._physics_updates[slider.field] = slider.value
+                slider.commit(self._physics_updates)
                 self._hud_dirty = True
                 return True
         for slider in sliders:
             if slider.hit_handle(pos):
                 self._dragging_slider = slider
                 slider.handle_drag(pos)
-                if slider.target_dict is not None:
-                    slider.target_dict[slider.field] = slider.value
-                else:
-                    self._physics_updates[slider.field] = slider.value
+                slider.commit(self._physics_updates)
                 self._hud_dirty = True
                 return True
         return False
@@ -924,10 +858,7 @@ class Renderer:
     def handle_mousemotion(self, pos) -> None:
         if self._dragging_slider is not None:
             self._dragging_slider.handle_drag(pos)
-            if self._dragging_slider.target_dict is not None:
-                self._dragging_slider.target_dict[self._dragging_slider.field] = self._dragging_slider.value
-            else:
-                self._physics_updates[self._dragging_slider.field] = self._dragging_slider.value
+            self._dragging_slider.commit(self._physics_updates)
             self._hud_dirty = True
 
     def handle_mouseup(self) -> None:
@@ -940,44 +871,10 @@ class Renderer:
         return updates
 
     # ── Camera (pan + zoom) interface ─────────────────────────────────────────
-
-    def zoom_at(self, sx: int, sy: int, factor: float) -> None:
-        """Zoom by `factor` while keeping the world point under (sx, sy) fixed.
-
-        Pin the world-coord that lives under the cursor, change scale, then
-        recompute view_center so that same world-coord still maps to the same
-        screen coord. Result: cursor sits on the same molecule before and
-        after the zoom step.
-        """
-        wx_before, wy_before = self._screen_to_world(sx, sy)
-        new_scale = float(np.clip(self._view_scale * factor,
-                                   self._view_scale_min, self._view_scale_max))
-        if abs(new_scale - self._view_scale) < 1e-6:
-            return
-        self._view_scale = new_scale
-        wx_after, wy_after = self._screen_to_world(sx, sy)
-        self._view_center[0] += wx_before - wx_after
-        self._view_center[1] += wy_before - wy_after
-
-    def reset_view(self) -> None:
-        """Reset pan and zoom to defaults (world midpoint, scale 1.0)."""
-        config = self.config
-        self._view_center = [config.world_width * 0.5, config.world_height * 0.5]
-        self._view_scale  = 1.0
-
-    def pan_by(self, dx_pixels: int, dy_pixels: int) -> None:
-        """Translate the view by (dx, dy) screen pixels.
-
-        Converts pixel deltas → world deltas via the current zoom and shifts
-        view_center in the opposite direction — dragging right scrolls world
-        content right, so view_center must move left.
-        """
-        config = self.config
-        world_dx = -dx_pixels * (config.world_width  / config.window_width)  / self._view_scale
-        world_dy =  dy_pixels * (config.world_height / config.window_height) / self._view_scale
-        # y inverted because pygame Y goes down while world Y goes up
-        self._view_center[0] += world_dx
-        self._view_center[1] += world_dy
+    # Camera state and its methods live in halflife/render/camera.py and are
+    # accessed via self.camera (zoom_at, pan_by, reset, screen_to_world,
+    # push_uniforms). Callers go through the Camera directly instead of
+    # delegating through Renderer.
 
     # ── Particle selection (click-to-inspect) ─────────────────────────────────
 
@@ -988,18 +885,15 @@ class Renderer:
         extra GPU sync is needed. A click further than _select_radius_world
         from every particle clears the selection (out-of-radius dismiss).
         """
-        if self._last_positions is None:
+        if self._cpu_state is None:
             return
-        wx, wy = self._screen_to_world(sx, sy)
-        pos = self._last_positions
-        dx = pos[:, 0] - wx
-        dy = pos[:, 1] - wy
+        wx, wy = self.camera.screen_to_world(sx, sy)
+        pos = self._cpu_state.positions
         # Periodic min-image so a click near a wrap edge can still pick a
         # particle that visually looks close but lives on the other side.
-        if self.config.boundary_mode == "periodic":
-            dx -= self.config.world_width  * np.round(dx / self.config.world_width)
-            dy -= self.config.world_height * np.round(dy / self.config.world_height)
-        d2 = dx * dx + dy * dy
+        delta = pos - np.array([wx, wy], dtype=pos.dtype)
+        self._wrap_min_image(delta)
+        d2 = (delta * delta).sum(axis=1)
         best = int(np.argmin(d2))
         if d2[best] <= self._select_radius_world ** 2:
             self._selected_idx = best
@@ -1044,21 +938,16 @@ class Renderer:
         # Stashed for select_at() and _refresh_selected_snapshot(), both of
         # which run after this method returns. All these arrays are already on
         # CPU at this point — no extra transfer cost.
-        self._last_positions          = pos
-        self._last_velocities         = vel
-        self._last_species            = species
-        self._last_mass               = mass
-        self._last_energy             = p_energy
-        self._last_age                = p_age
-        self._last_comp_id            = comp_id
-        self._last_comp_members       = comp_members
-        self._last_comp_count         = comp_count
-        self._last_comp_alive         = comp_alive
-        self._last_comp_species_hash  = comp_species_hash
-        self._last_comp_binding_energy = comp_binding_energy
-        self._last_comp_half_life      = comp_half_life
-        self._last_comp_age            = comp_age
-        self._last_comp_free_bonds     = comp_free_bonds
+        self._cpu_state = CPUStateSnapshot(
+            positions=pos, velocities=vel, species=species,
+            mass=mass, energy=p_energy, age=p_age,
+            comp_id=comp_id,
+            comp_members=comp_members, comp_count=comp_count,
+            comp_alive=comp_alive, comp_species_hash=comp_species_hash,
+            comp_binding_energy=comp_binding_energy,
+            comp_half_life=comp_half_life, comp_age=comp_age,
+            comp_free_bonds=comp_free_bonds,
+        )
 
         # ── Particle vertex data ──────────────────────────────────────────────
         alive_idx = np.arange(len(pos))
@@ -1136,9 +1025,7 @@ class Renderer:
                 if len(mem_a) > 0:
                     pos_a = pos[mem_a]
                     dx    = pos[mem_b] - pos_a
-                    if config.boundary_mode == "periodic":
-                        dx[:, 0] -= config.world_width  * np.round(dx[:, 0] / config.world_width)
-                        dx[:, 1] -= config.world_height * np.round(dx[:, 1] / config.world_height)
+                    self._wrap_min_image(dx)
                     pos_b = pos_a + dx
 
                     # Alpha falls off with composite size (sqrt) so cliquey large
@@ -1182,9 +1069,7 @@ class Renderer:
             # composites (fusion packs members densely from index 0).
             ref_pos = g_pos[:, 0, :]                                 # (n_comps, 2)
             rel     = g_pos - ref_pos[:, None, :]                    # (n_comps, max_n, 2)
-            if config.boundary_mode == "periodic":
-                rel[..., 0] -= config.world_width  * np.round(rel[..., 0] / config.world_width)
-                rel[..., 1] -= config.world_height * np.round(rel[..., 1] / config.world_height)
+            self._wrap_min_image(rel)
             com_rel = (rel * vm_f[:, :, None]).sum(1) / sum_vm
             com     = ref_pos + com_rel                              # (n_comps, 2)
             if config.boundary_mode == "periodic":
@@ -1322,7 +1207,7 @@ class Renderer:
 
         # ── Inspector snapshot ────────────────────────────────────────────────
         # Reads from the cached arrays stashed at the top of this method.
-        self._refresh_selected_snapshot()
+        self.hud.refresh_selected_snapshot()
 
     # ── Rendering ─────────────────────────────────────────────────────────────
 
@@ -1338,16 +1223,10 @@ class Renderer:
         sz_m   = float(rs['particle_size_mult'])
         al_m   = float(rs['particle_alpha_mult'])
 
-        # Push camera uniforms to every world-space program. Cheap; saves
-        # branching on whether the camera moved this frame.
-        vc = (float(self._view_center[0]), float(self._view_center[1]))
-        vs = float(self._view_scale)
-        self.particle_prog['u_view_center'].value = vc
-        self.particle_prog['u_view_scale'].value  = vs
-        self.bond_prog['u_view_center'].value     = vc
-        self.bond_prog['u_view_scale'].value      = vs
-        self.event_prog['u_view_center'].value    = vc
-        self.event_prog['u_view_scale'].value     = vs
+        # Push camera uniforms to every world-space program (particle, bond,
+        # event, highlight). Adding a new world-space program means just
+        # appending to self._world_space_progs in __init__.
+        self.camera.push_uniforms(self._world_space_progs)
 
         curr_fbo = self._trail_fbos[self._trail_idx]
         prev_tex = self._trail_texs[1 - self._trail_idx]
@@ -1394,19 +1273,17 @@ class Renderer:
             self.ctx.line_width = 1.0
             self.bond_vao.render(moderngl.LINES, vertices=self._n_bond_vertices)
 
-        # Event sprites
+        # Event sprites. u_world_size was already set in __init__ and never
+        # changes; camera uniforms are pushed at the top of render() via
+        # self.camera.push_uniforms(), so this branch just issues the draw.
         if self._show_events and self._n_event_vertices > 0:
-            self.event_prog['u_world_size'].value = (
-                self.config.world_width, self.config.world_height
-            )
             self._event_vao.render(moderngl.POINTS, vertices=self._n_event_vertices)
 
-        # Selection highlight ring
-        if self._selected_idx >= 0 and self._last_positions is not None:
-            sel_pos = self._last_positions[self._selected_idx].astype(np.float32)
+        # Selection highlight ring. Camera uniforms are already on the
+        # highlight program (pushed via self.camera at the top of render()).
+        if self._selected_idx >= 0 and self._cpu_state is not None:
+            sel_pos = self._cpu_state.positions[self._selected_idx].astype(np.float32)
             self._highlight_vbo.write(sel_pos.tobytes())
-            self.highlight_prog['u_view_center'].value = vc
-            self.highlight_prog['u_view_scale'].value  = vs
             # Constant screen-pixel diameter so the ring stays visible even
             # on tiny zoomed-out particles. ~26 px works at default windowing.
             self.highlight_prog['u_size_px'].value = 26.0
@@ -1445,7 +1322,7 @@ class Renderer:
             self._hud_dirty = True
 
         if self._hud_dirty:
-            self._render_hud_surface(fps)
+            self.hud.paint(fps)
             surf_data = pygame.image.tostring(self._hud_surface, 'RGBA', True)
             self._hud_texture.write(surf_data)
             self._hud_dirty = False
@@ -1461,238 +1338,21 @@ class Renderer:
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
-    def _build_species_valence(self) -> None:
-        """Compute per-species valence using the same hash chemistry uses."""
-        from halflife.chemistry import _hash_to_valence
-        import jax.numpy as jnp
-        config = self.config
-        self._species_valence = np.zeros(config.num_species, dtype=np.int32)
-        # _hash_to_valence expects a JAX-style scalar (it calls .astype on its
-        # input), so wrap the Python int. Called once, cached after.
-        for s in range(config.num_species):
-            self._species_valence[s] = int(_hash_to_valence(jnp.int32(s), config))
+    def _wrap_min_image(self, delta: np.ndarray) -> None:
+        """In-place periodic min-image: subtract integer multiples of world
+        size so each component of `delta[..., 0:2]` falls in [-W/2, W/2].
 
-    def _refresh_selected_snapshot(self) -> None:
-        """Rebuild the dict of stats shown in the inspector panel.
-
-        Called once per frame from update(); cheap (touches a few scalars).
-        Stashes None when nothing is selected so the panel renderer can early-out.
+        No-op when boundary_mode != "periodic". Accepts any array shape where
+        the last axis is the spatial (x, y) pair, so the same helper handles
+        1D-per-component selects, (N, 2) bond deltas, and (n_comps, max_n, 2)
+        member-relative arrays.
         """
-        i = self._selected_idx
-        if i < 0 or self._last_positions is None:
-            self._selected_snapshot = None
+        if self.config.boundary_mode != "periodic":
             return
-
-        config = self.config
-        px, py = float(self._last_positions[i, 0]), float(self._last_positions[i, 1])
-        vx, vy = float(self._last_velocities[i, 0]), float(self._last_velocities[i, 1])
-        speed  = float(np.hypot(vx, vy))
-        species_i = int(self._last_species[i])
-        mass_i    = float(self._last_mass[i])
-        energy_i  = float(self._last_energy[i])
-        age_i     = float(self._last_age[i])
-        cid       = int(self._last_comp_id[i])
-
-        if config.use_valence:
-            if self._species_valence is None:
-                self._build_species_valence()
-            valence_i = int(self._species_valence[species_i])
-        else:
-            valence_i = None
-
-        snap = {
-            'idx':       i,
-            'pos':       (px, py),
-            'vel':       (vx, vy),
-            'speed':     speed,
-            'species':   species_i,
-            'valence':   valence_i,
-            'mass':      mass_i,
-            'energy':    energy_i,
-            'age':       age_i,
-            'composite': None,
-        }
-
-        if cid >= 0 and bool(self._last_comp_alive[cid]):
-            count = int(self._last_comp_count[cid])
-            member_species = [int(self._last_species[m])
-                              for m in self._last_comp_members[cid][:count] if m >= 0]
-            snap['composite'] = {
-                'id':             cid,
-                'size':           count,
-                'hash':           int(self._last_comp_species_hash[cid]),
-                'members':        member_species,
-                'binding_energy': float(self._last_comp_binding_energy[cid]),
-                'half_life':      float(self._last_comp_half_life[cid]),
-                'age':            float(self._last_comp_age[cid]),
-                'free_bonds':     (int(self._last_comp_free_bonds[cid])
-                                   if config.use_valence else None),
-            }
-        self._selected_snapshot = snap
-
-    def _render_inspector_panel(self, surface: pygame.Surface) -> None:
-        """Top-right panel showing the selected particle's stats.
-
-        Returns early if nothing is selected. Layout follows the mockup at
-        notes/2026-05-14-particle-info-panel-mockup.html.
-        """
-        snap = self._selected_snapshot
-        if snap is None:
-            return
-
-        font = self._font
-
-        BG           = (15, 18, 35, 235)
-        BORDER       = (70, 100, 150, 220)
-        DIVIDER      = (70, 100, 150, 110)
-        LABEL_FG     = (160, 185, 230)
-        VALUE_FG     = (220, 230, 255)
-        MUTED_FG     = (120, 140, 165)
-        CLOSE_BG     = (80, 30, 30, 220)
-        CLOSE_BORDER = (150, 80, 80, 220)
-        CLOSE_FG     = (255, 160, 160)
-
-        comp = snap['composite']
-
-        # Height: header(22) + species(20) + 8 kv rows(15 each) + bottom pad,
-        # plus composite section if applicable.
-        base_h = 22 + 20 + 8 * 15 + 8
-        comp_h = 0
-        if comp is not None:
-            # divider(8) + section title(18) + 5 kv rows(15) + members
-            # label(15) + chip rows(~16 each, estimate 1-2 rows) + pad
-            est_chip_rows = max(1, (len(comp['members']) + 7) // 8)
-            comp_h = 8 + 18 + 5 * 15 + 15 + est_chip_rows * 18 + 8
-        panel_w = 235
-        panel_h = base_h + comp_h + 6
-
-        panel_x = self.config.window_width - panel_w - 8
-        panel_y = self._stats_btn_rect.bottom + 6
-        if self._show_stats:
-            # Slide below the open Stats panel — height matches the constant
-            # computed in the stats block of _render_hud_surface.
-            stats_panel_h = (4 * 16 + 6 * 33 + 4 + 18 + 64 + 20 + 10)
-            panel_y += stats_panel_h + 4
-
-        panel_rect = pygame.Rect(panel_x, panel_y, panel_w, panel_h)
-        pygame.draw.rect(surface, BG, panel_rect, border_radius=6)
-        pygame.draw.rect(surface, BORDER, panel_rect, 1, border_radius=6)
-
-        x_text = panel_x + 10
-        y      = panel_y + 6
-
-        # Header
-        title = font.render(f"Particle #{snap['idx']}", True, VALUE_FG)
-        surface.blit(title, (x_text, y))
-
-        # Close button — stash rect for click-handling
-        close_size = 18
-        self._inspector_close_rect = pygame.Rect(
-            panel_x + panel_w - close_size - 8, y - 1, close_size, close_size
-        )
-        pygame.draw.rect(surface, CLOSE_BG, self._inspector_close_rect, border_radius=3)
-        pygame.draw.rect(surface, CLOSE_BORDER, self._inspector_close_rect, 1, border_radius=3)
-        close_lbl = font.render("×", True, CLOSE_FG)
-        surface.blit(close_lbl,
-                     (self._inspector_close_rect.centerx - close_lbl.get_width() // 2,
-                      self._inspector_close_rect.centery - close_lbl.get_height() // 2 - 1))
-        y += 18
-        pygame.draw.line(surface, DIVIDER, (panel_x + 6, y),
-                         (panel_x + panel_w - 6, y), 1)
-        y += 4
-
-        # Species line with color swatch
-        sp = snap['species']
-        col_lin  = self.species_colors[sp]
-        # Linear sRGB → display sRGB for HUD (pygame surface is sRGB).
-        col_disp = np.clip(col_lin, 0.0, 1.0) ** (1.0 / 2.2)
-        col_rgb  = tuple(int(round(c * 255)) for c in col_disp)
-        sw_rect = pygame.Rect(x_text, y + 3, 14, 14)
-        pygame.draw.rect(surface, col_rgb, sw_rect, border_radius=2)
-        pygame.draw.rect(surface, (255, 255, 255, 50), sw_rect, 1, border_radius=2)
-        lbl = font.render(f"Species {sp}", True, VALUE_FG)
-        surface.blit(lbl, (x_text + 18, y))
-        if snap['valence'] is not None:
-            v_txt = font.render(f"valence {snap['valence']}", True, MUTED_FG)
-            surface.blit(v_txt, (panel_x + panel_w - v_txt.get_width() - 10, y))
-        y += 20
-
-        def kv(label: str, value: str, value_color=VALUE_FG):
-            nonlocal y
-            l = font.render(label, True, LABEL_FG)
-            v = font.render(value, True, value_color)
-            surface.blit(l, (x_text, y))
-            surface.blit(v, (panel_x + panel_w - v.get_width() - 10, y))
-            y += 15
-
-        px, py = snap['pos']
-        vx, vy = snap['vel']
-        kv("Position",  f"{px:.1f}, {py:.1f}")
-        kv("Velocity",  f"{vx:.2f}, {vy:.2f}")
-        kv("Speed",     f"{snap['speed']:.2f}")
-        kv("Mass",      f"{snap['mass']:.2f}")
-        kv("Energy",    f"{snap['energy']:.2f}")
-        kv("Age",       f"{snap['age']:.1f} s")
-        kv("Composite", "free" if comp is None else f"#{comp['id']}",
-           value_color=MUTED_FG if comp is None else VALUE_FG)
-
-        if comp is not None:
-            y += 4
-            pygame.draw.line(surface, DIVIDER, (panel_x + 6, y),
-                             (panel_x + panel_w - 6, y), 1)
-            y += 4
-            hdr = font.render(
-                f"Composite #{comp['id']} — {comp['size']} members",
-                True, VALUE_FG
-            )
-            surface.blit(hdr, (x_text, y))
-            y += 18
-
-            kv("Hash",      f"{comp['hash']:08x}"[:8])
-            kv("Binding E", f"{comp['binding_energy']:.2f}")
-            kv("Age",       f"{comp['age']:.1f} s")
-            kv("Half-life", f"{comp['half_life']:.1f} s")
-            if comp['free_bonds'] is not None:
-                total_v = sum(int(self._species_valence[s]) for s in comp['members'])
-                kv("Free bonds", f"{comp['free_bonds']} / {total_v}")
-
-            # Members chips — wrap onto multiple rows if needed.
-            ml = font.render("Members", True, LABEL_FG)
-            surface.blit(ml, (x_text, y))
-            y += 16
-            chip_x = x_text
-            chip_h = 16
-            for s in comp['members']:
-                cl = np.clip(self.species_colors[s], 0.0, 1.0) ** (1.0 / 2.2)
-                crgb = tuple(int(round(c * 255)) for c in cl)
-                txt = font.render(str(int(s)), True, VALUE_FG)
-                cw = txt.get_width() + 16
-                if chip_x + cw > panel_x + panel_w - 10:
-                    chip_x = x_text
-                    y += chip_h + 2
-                chip_rect = pygame.Rect(chip_x, y, cw, chip_h)
-                pygame.draw.rect(surface, (70, 100, 150, 46), chip_rect, border_radius=3)
-                pygame.draw.circle(surface, crgb,
-                                   (chip_rect.left + 6, chip_rect.centery), 4)
-                surface.blit(txt, (chip_rect.left + 12,
-                                   chip_rect.centery - txt.get_height() // 2))
-                chip_x += cw + 4
-
-    def _screen_to_world(self, sx: int, sy: int) -> tuple:
-        """Convert window-pixel coords → world coords using the current camera.
-
-        Inverse of the vertex-shader math:
-            view = (pos - center) * scale + world_size * 0.5
-            ndc  = view / world_size * 2 - 1
-        Solving for pos:
-            pos = ndc * world_size / 2 / scale + center
-        """
-        config = self.config
-        ndc_x = (sx / config.window_width)  * 2.0 - 1.0
-        ndc_y = 1.0 - (sy / config.window_height) * 2.0   # pygame Y is top-down
-        wx = ndc_x * config.world_width  * 0.5 / self._view_scale + self._view_center[0]
-        wy = ndc_y * config.world_height * 0.5 / self._view_scale + self._view_center[1]
-        return wx, wy
+        W = self.config.world_width
+        H = self.config.world_height
+        delta[..., 0] -= W * np.round(delta[..., 0] / W)
+        delta[..., 1] -= H * np.round(delta[..., 1] / H)
 
     def _periodic_com(self, positions_2d: np.ndarray) -> np.ndarray:
         """Periodic-aware center of mass for an (n, 2) array of positions.
@@ -1706,9 +1366,7 @@ class Renderer:
         config = self.config
         ref = positions_2d[0]
         rel = positions_2d - ref
-        if config.boundary_mode == "periodic":
-            rel[:, 0] -= config.world_width  * np.round(rel[:, 0] / config.world_width)
-            rel[:, 1] -= config.world_height * np.round(rel[:, 1] / config.world_height)
+        self._wrap_min_image(rel)
         com = ref + rel.mean(axis=0)
         if config.boundary_mode == "periodic":
             com = np.array([
@@ -1717,299 +1375,6 @@ class Renderer:
             ])
         return com
 
-    # ── HUD surface drawing ───────────────────────────────────────────────────
-
-    def _draw_sparkline(self, surface, data, x, y, w, h, color):
-        if len(data) < 2:
-            return
-        arr = np.array(data, dtype=np.float32)
-        lo, hi = arr.min(), arr.max()
-        if hi == lo:
-            hi = lo + 1
-        pts = [
-            (x + int(k * w / (len(arr) - 1)),
-             y + h - int((v - lo) / (hi - lo) * h))
-            for k, v in enumerate(arr)
-        ]
-        pygame.draw.lines(surface, color, False, pts, 1)
-
-    def _render_hud_surface(self, fps: float):
-        """Draw buttons and optional stats panel onto the transparent HUD surface."""
-        surface = self._hud_surface
-        surface.fill((0, 0, 0, 0))  # clear to transparent
-        font    = self._font
-
-        # ── Buttons ──────────────────────────────────────────────────────────
-        for label, rect, action in self._buttons:
-            # Dynamic label
-            display_label = label
-            if action == 'pause':
-                display_label = "Resume" if self._paused else "Pause"
-            elif action == 'toggle_bonds':
-                # Label shows the CURRENT composite-view mode (not the next
-                # one the click will switch to — that "next-click" wording
-                # made the button read as opposite to what was on screen).
-                current_label = {
-                    self.MODE_BONDS:  "Bonds",
-                    self.MODE_MERGED: "Merged",
-                    self.MODE_NONE:   "None",
-                }
-                display_label = current_label.get(self.composite_mode, "Bonds")
-            elif action == 'toggle_events':
-                display_label = "Events ON" if self._show_events else "Events"
-            elif action == 'toggle_trails':
-                display_label = "Trails ON" if self._render_settings['trails_on'] else "Trails"
-            elif action == 'toggle_params':
-                display_label = "Params ON" if self._show_params else "Params"
-
-            # Background
-            if action in ('reset',):
-                bg_col = (90, 40, 40, 200)
-            elif action == 'pause':
-                bg_col = (40, 80, 50, 200) if not self._paused else (80, 60, 30, 200)
-            elif action.startswith('reroll_'):
-                bg_col = (60, 40, 80, 200)
-            else:
-                bg_col = (40, 55, 80, 200)
-            pygame.draw.rect(surface, bg_col, rect, border_radius=4)
-            pygame.draw.rect(surface, (100, 140, 200, 180), rect, 1, border_radius=4)
-
-            # Text — for the Trails button, the right ~18px belongs to the
-            # gear nub (separate click region opening the trails panel), so
-            # center the label in the remaining left portion.
-            txt = font.render(display_label, True, (210, 230, 255))
-            if action == 'toggle_trails':
-                text_cx = rect.left + (rect.width - 18) // 2
-                surface.blit(txt, (text_cx - txt.get_width() // 2,
-                                    rect.centery - txt.get_height() // 2))
-            else:
-                surface.blit(txt, (rect.centerx - txt.get_width() // 2,
-                                    rect.centery - txt.get_height() // 2))
-
-            # Gear nub on the Trails button — opens the trails settings panel.
-            # Active state (panel currently open) uses a brighter background.
-            if action == 'toggle_trails':
-                gear_rect = self._trails_gear_rect
-                nub_col = (60, 80, 110, 220) if self._show_render_params else (30, 40, 60, 220)
-                pygame.draw.rect(surface, nub_col, gear_rect, border_radius=3)
-                pygame.draw.rect(surface, (100, 140, 200, 180), gear_rect, 1, border_radius=3)
-                gear_glyph = font.render("⚙", True, (200, 220, 240))
-                surface.blit(gear_glyph,
-                             (gear_rect.centerx - gear_glyph.get_width() // 2,
-                              gear_rect.centery - gear_glyph.get_height() // 2))
-
-        # Stats button (top-right corner)
-        stats_rect = self._stats_btn_rect
-        stats_bg = (40, 55, 80, 200)
-        pygame.draw.rect(surface, stats_bg, stats_rect, border_radius=4)
-        pygame.draw.rect(surface, (100, 140, 200, 180), stats_rect, 1, border_radius=4)
-        stats_lbl = "Stats ON" if self._show_stats else "Stats"
-        txt = font.render(stats_lbl, True, (210, 230, 255))
-        surface.blit(txt, (stats_rect.centerx - txt.get_width() // 2,
-                            stats_rect.centery - txt.get_height() // 2))
-
-        # ── Stats panel ───────────────────────────────────────────────────────
-        if self._show_stats:
-            config = self.config
-            # panel_h: 4 static rows (16px) + 6 spark-stat rows (15+18px) +
-            #          gap + header (18px) + chart (64px) + ticks (20px) + bottom (10px)
-            panel_h = (4 * 16 + 6 * 33 + 4 + 18 + 64 + 20 + 10)
-            panel_w = 215
-            panel_x = config.window_width - panel_w - 8
-            panel_y = self._stats_btn_rect.bottom + 4
-
-            panel_rect = pygame.Rect(panel_x, panel_y, panel_w, panel_h)
-            pygame.draw.rect(surface, (15, 18, 35, 185), panel_rect, border_radius=6)
-            pygame.draw.rect(surface, (70, 100, 150, 180), panel_rect, 1, border_radius=6)
-
-            y_off = panel_y + 6
-
-            # Static lines (no sparkline)
-            for line in [
-                f"FPS:        {fps:.1f}",
-                f"Step:       {self._stats_step:,}",
-                f"Sim time:   {self._stats_sim_time:.1f}",
-                f"Particles:  {self._stats_alive:,}",
-            ]:
-                txt = font.render(line, True, (190, 215, 255))
-                surface.blit(txt, (panel_x + 6, y_off))
-                y_off += 16
-
-            # Spark-stat rows: label on one line, sparkline below it
-            spark_w = panel_w - 16
-            spark_h = 14
-            spark_x = panel_x + 8
-            for label, spark_data, color in [
-                (f"Free:       {self._stats_free:,}",     self._spark_free,   (80, 180, 255)),
-                (f"Composites: {self._stats_n_comp:,}",   self._spark_comp,   (120, 220, 120)),
-                (f"Unique:     {self._stats_n_unique:,}", self._spark_unique, (200, 140, 220)),
-                (f"Energy:     {self._stats_energy:.0f}", self._spark_energy, (220, 180, 80)),
-            ]:
-                txt = font.render(label, True, (190, 215, 255))
-                surface.blit(txt, (panel_x + 6, y_off))
-                y_off += 15
-                self._draw_sparkline(surface, spark_data, spark_x, y_off, spark_w, spark_h, color)
-                y_off += 18
-
-            # Spark-stat rows for fusions and decays
-            y_off += 4
-            for label, spark_data, color in [
-                (f"Fusions: {self._fusion_total:,} ({self._fusion_rate:.1f}/s)", self._spark_fusion, (220, 170, 60)),
-                (f"Decays:  {self._decay_total:,}  ({self._decay_rate:.1f}/s)",  self._spark_decay,  (80, 200, 220)),
-            ]:
-                txt = font.render(label, True, (190, 215, 255))
-                surface.blit(txt, (panel_x + 6, y_off))
-                y_off += 15
-                self._draw_sparkline(surface, spark_data, spark_x, y_off, spark_w, spark_h, color)
-                y_off += 18
-
-            # Histogram — vertical bar chart
-            y_off += 4
-            txt = font.render("Composite sizes:", True, (160, 185, 230))
-            surface.blit(txt, (panel_x + 6, y_off))
-            y_off += 18
-
-            chart_w = panel_w - 16
-            chart_h = 64
-            chart_x = panel_x + 8
-            chart_y = y_off
-            # X-axis auto-zooms to the largest live composite so the chart
-            # always uses the full chart_w (rather than reserving space for a
-            # max-size composite that may never form again after a reroll).
-            # Bounded below by a 2-size floor (so empty/early states aren't
-            # a single bar) and above by config.max_composite_size (the
-            # absolute physical cap). When size_max is large, bins are
-            # *widened* (bin_width > 1) so we never exceed MAX_BINS_HIST
-            # bars — 1px bars + 1px gaps always fit inside chart_w.
-            MAX_BINS_HIST = 100
-            # hist[i] = count of composites with member_count == i+1, so the
-            # largest live size = (highest non-zero index) + 1.
-            nz = np.flatnonzero(self._stats_hist) if len(self._stats_hist) else np.array([], dtype=np.int32)
-            largest_live = int(nz.max()) + 1 if len(nz) > 0 else 2
-            target_size  = max(2, min(largest_live, config.max_composite_size))
-            # Cached x-axis upper bound: grow immediately if a larger composite
-            # appears (otherwise its bar would clip off-chart), but only
-            # *shrink* once every HIST_AXIS_SHRINK_FRAMES frames so the axis
-            # doesn't twitch every time fusion/fission rearranges the tail.
-            HIST_AXIS_SHRINK_FRAMES = 100
-            self._hist_axis_age += 1
-            if target_size > self._hist_size_max_cached:
-                self._hist_size_max_cached = target_size
-                self._hist_axis_age = 0
-            elif (target_size < self._hist_size_max_cached
-                  and self._hist_axis_age >= HIST_AXIS_SHRINK_FRAMES):
-                self._hist_size_max_cached = target_size
-                self._hist_axis_age = 0
-            size_max  = self._hist_size_max_cached
-            bin_width = max(1, -(-size_max // MAX_BINS_HIST))   # ceil(size_max / MAX_BINS_HIST)
-            n_bins    = -(-size_max // bin_width)               # ceil(size_max / bin_width)
-            bar_w     = max(1, (chart_w - n_bins) // max(1, n_bins))
-
-            # Aggregate hist[i] (= count of composites with member_count == i+1)
-            # into n_bins of bin_width consecutive sizes. Right-pad with zeros
-            # so the reshape divides evenly without shifting counts.
-            padded  = np.zeros(n_bins * bin_width, dtype=np.int64)
-            src_len = min(len(self._stats_hist), padded.size)
-            padded[:src_len] = self._stats_hist[:src_len]
-            binned    = padded.reshape(n_bins, bin_width).sum(axis=1)
-            max_count = max(1, int(binned.max()))
-
-            for b in range(n_bins):
-                count = int(binned[b])
-                if count == 0:
-                    continue
-                bh = max(1, int(chart_h * count / max_count))
-                bx = chart_x + b * (bar_w + 1)
-                pygame.draw.rect(surface, (60, 140, 220, 200),
-                                 pygame.Rect(bx, chart_y + chart_h - bh, bar_w, bh))
-
-            pygame.draw.line(surface, (80, 110, 160),
-                             (chart_x, chart_y + chart_h),
-                             (chart_x + chart_w, chart_y + chart_h), 1)
-            # Ticks label the upper-edge size of selected bins. Bin b spans
-            # sizes [b*bin_width + 1, (b+1)*bin_width]; ticks are evenly
-            # spaced along the size axis so the rightmost tick reads size_max.
-            raw_ticks = np.linspace(bin_width, size_max, 5).astype(int)
-            seen = set()
-            for tick in raw_ticks:
-                tick = int(tick)
-                if tick in seen:
-                    continue
-                seen.add(tick)
-                b = (tick - 1) // bin_width
-                if 0 <= b < n_bins:
-                    tx = chart_x + b * (bar_w + 1)
-                    lbl = font.render(str(tick), True, (120, 150, 190))
-                    surface.blit(lbl, (tx - lbl.get_width() // 2, chart_y + chart_h + 2))
-            y_off = chart_y + chart_h + 20
-
-            # Composite size metrics (if profiling enabled)
-            if self.metrics is not None:
-                max_comp_size = self.metrics.max_composite_size_observed
-                num_samples = len(self.metrics.composite_size_samples)
-
-                y_off += 4
-                txt = font.render(f"Max composite: {max_comp_size} members", True, (160, 185, 230))
-                surface.blit(txt, (panel_x + 6, y_off))
-                y_off += 16
-
-                if num_samples > 0:
-                    recent_samples = self.metrics.composite_size_samples[-10:]  # Last 10 samples
-                    recent_max_sizes = [s[1] for s in recent_samples]
-                    avg_recent = sum(recent_max_sizes) / len(recent_max_sizes)
-                    txt = font.render(f"Recent avg max: {avg_recent:.1f}", True, (160, 185, 230))
-                    surface.blit(txt, (panel_x + 6, y_off))
-                    y_off += 16
-
-        # ── Params panel ──────────────────────────────────────────────────────
-        if self._show_params:
-            btn_w, btn_h, gap = 108, 26, 4
-            panel_x = 8 + btn_w + 8   # right of the button strip
-            slider_start_y = 8 + self._n_buttons * (btn_h + gap) + 8
-            panel_w = 244   # track(200) + gap(4) + reset-btn(14) + margins
-            panel_h = self._slider_content_h + 10 + 26
-            panel_rect = pygame.Rect(panel_x - 4, slider_start_y - 30, panel_w, panel_h)
-            pygame.draw.rect(surface, (15, 18, 35, 185), panel_rect, border_radius=6)
-            pygame.draw.rect(surface, (70, 100, 150, 180), panel_rect, 1, border_radius=6)
-            # Reset Params button
-            reset_rect = self._params_reset_rect
-            pygame.draw.rect(surface, (80, 30, 30, 200), reset_rect, border_radius=4)
-            pygame.draw.rect(surface, (150, 80, 80, 180), reset_rect, 1, border_radius=4)
-            reset_txt = font.render("Reset Params", True, (255, 160, 160))
-            surface.blit(reset_txt, (reset_rect.centerx - reset_txt.get_width() // 2,
-                                     reset_rect.centery - reset_txt.get_height() // 2))
-            for slider in self._sliders:
-                slider.draw(surface, font)
-
-        # ── Render-params panel (trails) ──────────────────────────────────────
-        if self._show_render_params:
-            btn_w, btn_h, gap = 108, 26, 4
-            panel_x = 8 + btn_w + 8
-            slider_start_y = 8 + self._n_buttons * (btn_h + gap) + 8
-            panel_w = 244
-            panel_h = self._render_slider_content_h + 10 + 26
-            panel_rect = pygame.Rect(panel_x - 4, slider_start_y - 30, panel_w, panel_h)
-            pygame.draw.rect(surface, (15, 18, 35, 185), panel_rect, border_radius=6)
-            pygame.draw.rect(surface, (70, 100, 150, 180), panel_rect, 1, border_radius=6)
-            # Reset Trails button
-            reset_rect = self._render_params_reset_rect
-            pygame.draw.rect(surface, (80, 30, 30, 200), reset_rect, border_radius=4)
-            pygame.draw.rect(surface, (150, 80, 80, 180), reset_rect, 1, border_radius=4)
-            reset_txt = font.render("Reset Trails", True, (255, 160, 160))
-            surface.blit(reset_txt, (reset_rect.centerx - reset_txt.get_width() // 2,
-                                     reset_rect.centery - reset_txt.get_height() // 2))
-            for slider in self._render_sliders:
-                slider.draw(surface, font)
-
-        # ── Inspector panel (live stats for the selected particle) ────────────
-        self._render_inspector_panel(surface)
-
-        # ── Bottom key hint ───────────────────────────────────────────────────
-        hint = "[Space] pause  [+/-] speed  [B] viz  [R] reset  [Q] quit"
-        hint_surf = font.render(hint, True, (120, 140, 160))
-        surface.blit(hint_surf,
-                     (self.config.window_width // 2 - hint_surf.get_width() // 2,
-                      self.config.window_height - hint_surf.get_height() - 4))
 
     # ── Legacy HUD (title bar only) ───────────────────────────────────────────
 

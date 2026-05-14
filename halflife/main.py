@@ -194,7 +194,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
                 # Right-click: snap back to the default framing (world
                 # midpoint, scale 1.0). Quick recovery after zoom/pan.
-                renderer.reset_view()
+                renderer.camera.reset()
 
             elif event.type == pygame.MOUSEWHEEL:
                 # Zoom toward the current mouse position. y > 0 = scroll up
@@ -202,7 +202,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                 if event.y != 0:
                     mx, my = pygame.mouse.get_pos()
                     factor = 1.15 ** event.y
-                    renderer.zoom_at(mx, my, factor)
+                    renderer.camera.zoom_at(mx, my, factor)
 
             elif event.type == pygame.MOUSEMOTION:
                 renderer.handle_mousemotion(event.pos)
@@ -215,7 +215,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                     if not is_panning and (abs(dx) + abs(dy)) > DRAG_PIXEL_THRESHOLD:
                         is_panning = True
                     if is_panning:
-                        renderer.pan_by(event.rel[0], event.rel[1])
+                        renderer.camera.pan_by(event.rel[0], event.rel[1])
 
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 renderer.handle_mouseup()
