@@ -1464,10 +1464,13 @@ class Renderer:
     def _build_species_valence(self) -> None:
         """Compute per-species valence using the same hash chemistry uses."""
         from halflife.chemistry import _hash_to_valence
+        import jax.numpy as jnp
         config = self.config
         self._species_valence = np.zeros(config.num_species, dtype=np.int32)
+        # _hash_to_valence expects a JAX-style scalar (it calls .astype on its
+        # input), so wrap the Python int. Called once, cached after.
         for s in range(config.num_species):
-            self._species_valence[s] = int(_hash_to_valence(s, config))
+            self._species_valence[s] = int(_hash_to_valence(jnp.int32(s), config))
 
     def _refresh_selected_snapshot(self) -> None:
         """Rebuild the dict of stats shown in the inspector panel.
