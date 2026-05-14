@@ -135,6 +135,54 @@ void main() {
 }
 """
 
+# Tonemap composite: sample HDR scene texture, apply ACES filmic curve,
+# convert linear → sRGB display gamma. Output replaces what would have been
+# the direct framebuffer write of the LDR pipeline. Bg/HUD compositing
+# happens *after* this pass.
+TONEMAP_VERTEX_SHADER = """
+#version 330
+
+in vec2 in_pos;
+out vec2 v_uv;
+
+void main() {
+    gl_Position = vec4(in_pos, 0.0, 1.0);
+    v_uv = in_pos * 0.5 + 0.5;
+}
+"""
+
+TONEMAP_FRAGMENT_SHADER = """
+#version 330
+
+in  vec2 v_uv;
+uniform sampler2D scene_tex;
+out vec4 fragColor;
+
+// Narkowicz 2015 ACES fit — close to the full ACES RRT+ODT for the
+// brightness range we render in, ~10 ALU ops.
+vec3 aces(vec3 x) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// Linear sRGB → display sRGB (gamma encoding).
+vec3 linear_to_srgb(vec3 x) {
+    vec3 lo = x * 12.92;
+    vec3 hi = 1.055 * pow(max(x, vec3(1e-6)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(hi, lo, step(x, vec3(0.0031308)));
+}
+
+void main() {
+    vec3 hdr    = texture(scene_tex, v_uv).rgb;
+    vec3 mapped = aces(hdr);
+    fragColor   = vec4(linear_to_srgb(mapped), 1.0);
+}
+"""
+
 # Event sprites: expanding rings at fusion/fission/spawn/decay sites
 EVENT_VERTEX_SHADER = """
 #version 330
@@ -361,6 +409,28 @@ class Renderer:
             (config.window_width, config.window_height), 4
         )
         self._hud_texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+
+        # ── HDR scene framebuffer + tonemap composite ─────────────────────────
+        # The scene (particles + bonds + events) is rendered into an RGBA16F
+        # framebuffer so we have headroom above 1.0. The tonemap pass samples
+        # this texture, applies an ACES filmic curve, and writes sRGB-gamma
+        # output to the default framebuffer. The HUD is drawn on top of the
+        # tonemapped output in LDR space.
+        self._scene_tex = self.ctx.texture(
+            (config.window_width, config.window_height), 4, dtype='f2'
+        )
+        self._scene_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self._scene_fbo = self.ctx.framebuffer(color_attachments=[self._scene_tex])
+
+        self.tonemap_prog = self.ctx.program(
+            vertex_shader=TONEMAP_VERTEX_SHADER,
+            fragment_shader=TONEMAP_FRAGMENT_SHADER,
+        )
+        # Reuse the HUD fullscreen-quad VBO geometry — same -1..1 NDC quad.
+        self._tonemap_vao = self.ctx.vertex_array(
+            self.tonemap_prog,
+            [(self._hud_quad_vbo, '2f', 'in_pos')],
+        )
 
         # ── Event sprite shader ──────────────────────────────────────────────
         self.event_prog = self.ctx.program(
@@ -882,6 +952,9 @@ class Renderer:
     def render(self, fps: float, step_count: int, n_alive: int):
         """Clear screen, draw scene, draw HUD, flip buffers."""
         bg = self.config.background_color
+
+        # ── Scene pass into HDR FBO ──────────────────────────────────────────
+        self._scene_fbo.use()
         self.ctx.clear(*bg)
 
         # Particles
@@ -900,6 +973,14 @@ class Renderer:
             )
             self._event_vao.render(moderngl.POINTS, vertices=self._n_event_vertices)
 
+        # ── Tonemap composite to default framebuffer ─────────────────────────
+        self.ctx.screen.use()
+        self.ctx.clear(0.0, 0.0, 0.0, 1.0)
+        self._scene_tex.use(location=0)
+        self.tonemap_prog['scene_tex'].value = 0
+        self._tonemap_vao.render(moderngl.TRIANGLES, vertices=6)
+
+        # ── HUD overlay (LDR, on top of tonemapped scene) ────────────────────
         # HUD overlay — only re-render the pygame surface and re-upload the
         # texture when the HUD has actually changed. The fullscreen-quad GL
         # blit always runs (it's cheap; reads the cached texture).
@@ -1192,5 +1273,9 @@ class Renderer:
         self._event_vbo.release()
         self._event_vao.release()
         self.event_prog.release()
+        self._scene_fbo.release()
+        self._scene_tex.release()
+        self._tonemap_vao.release()
+        self.tonemap_prog.release()
         self.ctx.release()
         pygame.quit()
