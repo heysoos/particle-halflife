@@ -686,6 +686,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
     N = config.num_particles
     M = config.max_composite_size
 
+    E_max = config.e_max
     fusion_r2 = config.fusion_radius ** 2
 
     # ── Step 1: Identify representatives ──────────────────────────────────────
@@ -702,21 +703,6 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
     all_entity_hash, all_entity_cnt = jax.vmap(
         lambda i: _compute_entity_hash(i, particles, composites, config)
     )(jnp.arange(N, dtype=jnp.int32))  # (N,) uint32, (N,) int32
-
-    # ── Pre-cache per-entity free bonds (only when valence gate is active) ───
-    # free_bonds(entity) = Σ v_s − 2 × (n − 1). Fusion requires both entities
-    # to have free_bonds ≥ 1 (one bond consumed on each side of the new edge).
-    # Static-`if` on the config flag keeps this branch out of the trace when
-    # the feature is off, so the toggle is genuinely zero-cost in that case.
-    species_valences = _species_valences(config)  # (S,) int32, cheap to recompute
-    if config.use_valence:
-        all_entity_free_bonds = jax.vmap(
-            lambda i: _entity_free_bonds(i, particles, composites,
-                                          species_valences, config)
-        )(jnp.arange(N, dtype=jnp.int32))  # (N,) int32
-    else:
-        # Unused stub. Same shape so closure types are stable across toggle.
-        all_entity_free_bonds = jnp.zeros(N, dtype=jnp.int32)
 
     # ── Pre-cache per-particle free bonds ─────────────────────────────────────
     # Per-particle: free_bond[i] = v_{species[i]} − degree[i].
@@ -842,7 +828,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
     free_comp_slots = find_free_slots(composites.alive, max_fusions)  # (max_fusions,) int32
 
     def fusion_scan_body(carry, i):
-        claimed, new_composite_id, composites_state, comp_count, free_slot_ptr = carry
+        claimed, new_composite_id, composites_state, comp_count, free_slot_ptr, degree_carry = carry
 
         valid_i = i < N
         safe_i  = jnp.minimum(i, N - 1)
@@ -893,12 +879,6 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         )
         hl_eff = hl_base / size_penalty
 
-        # New composite's free bonds: free_bonds(i) + free_bonds(j) − 2
-        # (one bond consumed on each side of the new joining edge).
-        merged_free_bonds = (
-            all_entity_free_bonds[safe_i] + all_entity_free_bonds[safe_j] - jnp.int32(2)
-        )
-
         # Build the merged member list: gather all member particle indices
         # i-side members
         i_members_comp = composites_state.members[ci]  # (M,)
@@ -923,6 +903,46 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         merged_members = jnp.full(M, -1, dtype=jnp.int32).at[out_pos].set(
             merged_members, mode='drop'
         )
+
+        # ── Build merged edge list ─────────────────────────────────────────
+        # i-side edges
+        i_edges_comp = composites_state.edges[ci]                          # (E_max, 2)
+        i_edges_free = jnp.full((E_max, 2), -1, dtype=jnp.int32)
+        i_edges = jnp.where(i_is_free, i_edges_free, i_edges_comp)
+
+        # j-side edges
+        j_edges_comp = composites_state.edges[cj]
+        j_edges_free = jnp.full((E_max, 2), -1, dtype=jnp.int32)
+        j_edges = jnp.where(j_is_free, j_edges_free, j_edges_comp)
+
+        # The new fusion edge: rep_i ↔ rep_j (= safe_i, safe_j since both are reps).
+        # For free+free, the reps are i and j themselves. For free+comp, rep is the
+        # free particle on one side and members[c, 0] on the other; we passed in
+        # both already via the merged-members construction.
+        new_edge = jnp.array([safe_i, safe_j], dtype=jnp.int32)[None, :]   # (1, 2)
+
+        # Concatenate (2·E_max + 1, 2) buffer
+        merged_edges_raw = jnp.concatenate([i_edges, j_edges, new_edge], axis=0)
+        edge_valid = merged_edges_raw[:, 0] >= 0  # both -1 or both valid
+        # Compact valid entries to front, drop overflow
+        epos    = jnp.cumsum(edge_valid.astype(jnp.int32)) - 1
+        eout    = jnp.where(edge_valid, epos, E_max)  # invalid → OOB
+        merged_edges = jnp.full((E_max, 2), -1, dtype=jnp.int32).at[eout].set(
+            merged_edges_raw, mode='drop'
+        )
+        merged_edge_count = jnp.sum(edge_valid.astype(jnp.int32))
+
+        # New composite's free bonds: Σ v_s − 2 · edge_count.
+        # Member species sum (same logic as compute_composite_free_bonds but
+        # against the just-computed merged_members).
+        merged_member_species = particles.species[
+            jnp.where(merged_members >= 0, merged_members, 0)
+        ]
+        merged_member_valid = merged_members >= 0
+        sum_v = jnp.sum(jnp.where(
+            merged_member_valid, species_valences[merged_member_species], 0
+        ))
+        merged_free_bonds = sum_v - jnp.int32(2) * merged_edge_count
 
         # Write to target composite
         safe_target = jnp.where(can_fuse, target, 0)
@@ -954,6 +974,12 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         new_comp_free_bonds = composites_state.free_bonds.at[safe_target].set(
             jnp.where(can_fuse, merged_free_bonds, composites_state.free_bonds[safe_target])
         )
+        new_comp_edges = composites_state.edges.at[safe_target].set(
+            jnp.where(can_fuse, merged_edges, composites_state.edges[safe_target])
+        )
+        new_comp_edge_count = composites_state.edge_count.at[safe_target].set(
+            jnp.where(can_fuse, merged_edge_count, composites_state.edge_count[safe_target])
+        )
         new_composites = composites_state._replace(
             members=new_members,
             alive=new_comp_alive,
@@ -962,6 +988,8 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             member_count=new_comp_count_arr,
             species_hash=new_comp_hash,
             free_bonds=new_comp_free_bonds,
+            edges=new_comp_edges,
+            edge_count=new_comp_edge_count,
         )
 
         # Update composite_id for all merged members
@@ -1008,16 +1036,23 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
             can_fuse & i_is_free & j_is_free, jnp.int32(1), jnp.int32(0)
         )
 
-        return (new_claimed, new_composite_id, new_composites, new_comp_count, new_free_slot_ptr), None
+        # Increment degree for the two new edge endpoints when fusion fires
+        delta = can_fuse.astype(jnp.int32)
+        degree_carry = degree_carry.at[safe_i].add(delta)
+        degree_carry = degree_carry.at[safe_j].add(delta)
+
+        return (new_claimed, new_composite_id, new_composites, new_comp_count,
+                new_free_slot_ptr, degree_carry), None
 
     claimed_init       = jnp.zeros(N, dtype=bool)
     composite_id_init  = particles.composite_id
     comp_count_init    = jnp.sum(composites.alive.astype(jnp.int32))
     free_slot_ptr_init = jnp.int32(0)
+    degree_init        = degree  # passed in from step.py via Task G
 
-    (_, final_composite_id, final_composites, _, _), _ = jax.lax.scan(
+    (_, final_composite_id, final_composites, _, _, final_degree), _ = jax.lax.scan(
         fusion_scan_body,
-        (claimed_init, composite_id_init, composites, comp_count_init, free_slot_ptr_init),
+        (claimed_init, composite_id_init, composites, comp_count_init, free_slot_ptr_init, degree_init),
         scan_indices,
     )
 
@@ -1027,4 +1062,4 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         particles=new_particles,
         composites=final_composites,
         rng_key=key,
-    ), degree
+    ), final_degree

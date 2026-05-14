@@ -775,3 +775,34 @@ def test_per_particle_fusion_gate_blocks_saturated_rep():
     # Particle 3 should NOT have been absorbed into composite 0 (rep is saturated)
     assert np.asarray(new_state.particles.composite_id)[3] == -1, \
         "Saturated rep should not fuse with free particle"
+
+
+def test_fusion_appends_edge_free_plus_free():
+    """When two free particles fuse, the new composite has exactly one edge: (i, j)."""
+    from halflife.chemistry import attempt_fusion
+    config = SimConfig(num_species=3, num_particles=10, max_composites=4,
+                       boundary_mode="reflect", world_width=20.0, world_height=20.0,
+                       fusion_radius=2.0, fusion_threshold=0.0)
+    world = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=0)
+    physics = initialize_physics_params(config)
+
+    # Place particles 0 and 1 within fusion_radius of each other
+    pos = np.array([[5.0, 5.0], [6.0, 5.0]] + [[50.0+i, 50.0] for i in range(8)],
+                   dtype=np.float32)
+    species = np.zeros(10, dtype=np.int32)
+    world = world._replace(particles=world.particles._replace(
+        position=jnp.asarray(pos), species=jnp.asarray(species)
+    ))
+
+    from halflife.spatial import build_cell_list, find_all_neighbors
+    cell_list = build_cell_list(world.particles.position, config)
+    neighbors = find_all_neighbors(world.particles.position, cell_list, config)
+    new_state, _ = attempt_fusion(world, neighbors, params, config, physics)
+
+    # One composite was created; it should hold exactly one edge (0, 1).
+    alive = np.asarray(new_state.composites.alive)
+    c = int(np.where(alive)[0][0])
+    assert np.asarray(new_state.composites.edge_count)[c] == 1
+    e = np.asarray(new_state.composites.edges[c, 0])
+    assert sorted(e.tolist()) == [0, 1]
