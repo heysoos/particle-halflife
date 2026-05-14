@@ -13,7 +13,9 @@ import functools
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import jax
-jax.config.update('jax_platform_name', 'cpu')
+# CPU pin disabled for this session — GPU available, live sim not running.
+# Restore (uncomment) if integration tests start contending with the live sim.
+# jax.config.update('jax_platform_name', 'cpu')
 import jax.numpy as jnp
 import numpy as np
 
