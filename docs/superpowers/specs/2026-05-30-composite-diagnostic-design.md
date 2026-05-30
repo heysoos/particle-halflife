@@ -46,6 +46,7 @@ halflife/analysis/
 ├── runner.py        — headless sim runner; lax.scan + periodic full-snapshot host-copy
 ├── events.py        — ReactionEvents NamedTuple, event-array helpers
 ├── transitions.py   — event log → composite-transition matrices (size-binned, top-K, full)
+├── compatibility.py — pure-chemistry fusion compatibility matrices (Tier 4)
 ├── metrics.py       — pure per-step metric functions (size, free_bonds, degree, edges)
 ├── plots.py         — matplotlib helpers; each returns base64 PNG
 ├── report.py        — HTML template assembly
@@ -79,11 +80,22 @@ Transitions:
      - top_k_matrix:    (K × K), K most-trafficked hashes, tail bucketed
      - full_matrix:     (U × U), every observed unique hash, sorted by size
    ↓
+Compatibility (post-process, pure chemistry — no simulation):
+   For every (composite type i, composite type j) pair:
+     merged_hash = (H_i + H_j) % modulus
+     be_merged   = _hash_to_binding_energy(merged_hash, physics)
+     passes_be   = be_merged >= fusion_threshold * binding_energy_scale
+     passes_val  = max_free_bonds(M_i) >= 1 AND max_free_bonds(M_j) >= 1
+   Produce two matrices:
+     - species_pair_compat: (S × S) — all species pairs, always-on
+     - observed_pair_compat: (K × K) — same top-K hashes as top_k_matrix above
+   ↓
 Report:
    header (scenario name, config dump, seed, duration, git SHA)
    tier 1 — macroscopic time series (max size, alive count, free-particle fraction)
    tier 2 — valence / edge structure (free_bonds histogram, degree saturation, rings)
-   tier 3 — chemical network matrices (three of them)
+   tier 3 — chemical network matrices (three of them, empirical)
+   tier 4 — fusion compatibility matrices (two of them, theoretical)
    footer (run timing, sim version)
 ```
 
@@ -215,6 +227,55 @@ eye can compare.
 - Embedded in HTML with `overflow:scroll` so a huge matrix is browsable
 - Explicitly flagged as "decide whether to keep after first use"
 
+### Tier 4 — fusion compatibility (chemistry, not dynamics)
+
+Pure post-processing of the multiset chemistry. No simulation involvement —
+runs in milliseconds after the run finishes. Answers "what *could* happen"
+versus Tier 3's "what *did* happen." Diffing the two visually is the core
+diagnostic move for the regression question.
+
+For every pair (i, j) of composite types under consideration:
+
+```python
+merged_hash = (H_i + H_j) % config.hash_modulus
+be_merged   = _hash_to_binding_energy(merged_hash, physics)
+passes_be   = be_merged >= physics.fusion_threshold * physics.binding_energy_scale
+passes_val  = max_free_bonds(M_i) >= 1 AND max_free_bonds(M_j) >= 1
+```
+
+where `max_free_bonds(M) = Σ v_{s_i in M} − 2·(n − 1)` is the structural
+upper bound on a fresh n-member composite of multiset M.
+
+**Matrix 4a: species-pair compatibility (always-on)**
+
+- Shape: `(S × S)`
+- Rows/cols: free particles, indexed by species
+- Cell color: merged BE for the pair (continuous, viridis-style colormap)
+- Greyed out: cells where `passes_be == False`
+- Hatched overlay: cells where `passes_val == False` (free particles of v=1
+  paired with each other, etc.)
+- Always rendered — small, fast, useful as a config-level "what does this
+  universe even support?" chart even before any sim has run
+
+**Matrix 4b: observed-composite compatibility (top-K)**
+
+- Shape: `(K × K)` — same K-most-trafficked composite types as Matrix 2 in
+  Tier 3, same sort order (size ascending, hash for tiebreak)
+- Same cell encoding as 4a
+- Designed for direct visual diff against Matrix 2: cells that are bright in
+  4b but cold in Matrix 2 are pairs that *could* react but never did →
+  either kinetic (they never met) or valence-saturated in practice (the
+  *typical* free_bonds was below the structural max because of pre-existing
+  edges)
+
+The diff between 4a/4b and Tier 3 is the diagnostic gold:
+
+| Tier 3 (empirical) | Tier 4 (compatibility) | Diagnosis |
+|---|---|---|
+| Few large→larger transitions | Lots of high-BE cells in top-right | Chemistry is fine — kinetics/diffusion bottleneck |
+| Few large→larger transitions | Few high-BE cells in top-right | Chemistry is the bottleneck — most products fail BE |
+| Few large→larger transitions | High-BE pairs hatched (valence-blocked) | **Valence is killing growth** (the regression hypothesis) |
+
 ---
 
 ## CLI surface
@@ -277,10 +338,14 @@ no external assets. Layout top-to-bottom:
 4. **Tier 2: Valence / edge structure** — 2×2 grid: free_bonds distribution
    heatmap (free_bonds × time), degree histogram heatmap (degree × time), degree
    saturation % over time, ring count over time.
-5. **Tier 3: Chemical network** — three matrices stacked vertically (size-binned,
-   top-K, full-unique). Each has its own caption. Matrix 3 wrapped in a
-   `<div style="overflow:scroll;max-width:100%;max-height:800px">`.
-6. **Footer** — JAX device used, JIT compile time, total wall time, sim version.
+5. **Tier 3: Chemical network (empirical)** — three matrices stacked vertically
+   (size-binned, top-K, full-unique). Each has its own caption. Matrix 3
+   wrapped in a `<div style="overflow:scroll;max-width:100%;max-height:800px">`.
+6. **Tier 4: Fusion compatibility (theoretical)** — two matrices stacked: 4a
+   species-pair, 4b top-K observed-composite. Matrix 4b uses the same K and
+   sort order as Tier 3 / Matrix 2 so the eye can diff them by scrolling
+   back and forth.
+7. **Footer** — JAX device used, JIT compile time, total wall time, sim version.
 
 ---
 
@@ -313,11 +378,17 @@ snapshots to disk rather than keep them in RAM (deferred to phase 2).
 
 Run the tool on `current_experiment` and `valence_off` separately. Open both
 HTMLs side-by-side. If the regression is valence-driven, the answer should be
-obvious from:
-- Degree saturation % over time (Tier 2) — should be visibly higher in
-  `current_experiment`
-- Size-binned matrix (Tier 3 / Matrix 1) — should show fewer transitions into
-  high-size cells in `current_experiment`
+obvious from one of three places:
+
+- **Degree saturation % over time (Tier 2)** — should be visibly higher in
+  `current_experiment`.
+- **Size-binned matrix (Tier 3 / Matrix 1)** — should show fewer transitions
+  into high-size cells in `current_experiment`.
+- **Tier 3 / Matrix 2 vs Tier 4 / Matrix 4b** — the same K composite types
+  appear in both, with the same sort. Cells that are bright-and-compatible
+  in 4b but cold in Matrix 2 are pairs that *could* fuse but never did. If
+  most cold cells are hatched (valence-blocked) in 4b, that's the
+  smoking-gun pattern.
 
 If those plots don't make the answer obvious, the design has failed and we
 need kernel counters in phase 2.
