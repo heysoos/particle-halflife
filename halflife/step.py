@@ -362,6 +362,25 @@ def simulation_step(state: WorldState, params: InteractionParams,
         step_count=state.step_count + 1,
     )
 
+    # ── Event log assembly (output only) ─────────────────────────────────────
+    # fusion_events:  ReactionEvent of shape (max_fusions_per_step, ...) from
+    #                 attempt_fusion (Task 2)
+    # fission_events: ReactionEvent of shape (max_composites, ...) from
+    #                 apply_composite_decay (Task 3)
+    # Concatenate along the leading axis so downstream consumers see one
+    # padded ReactionEvent per step with E = max_fusions + max_composites.
+    if config.emit_events:
+        from halflife.state import ReactionEvent
+        events = ReactionEvent(
+            kind=jnp.concatenate([fusion_events.kind, fission_events.kind]),
+            source_slots=jnp.concatenate([fusion_events.source_slots, fission_events.source_slots], axis=0),
+            source_hashes=jnp.concatenate([fusion_events.source_hashes, fission_events.source_hashes], axis=0),
+            source_sizes=jnp.concatenate([fusion_events.source_sizes, fission_events.source_sizes], axis=0),
+            product_slots=jnp.concatenate([fusion_events.product_slots, fission_events.product_slots], axis=0),
+            product_hashes=jnp.concatenate([fusion_events.product_hashes, fission_events.product_hashes], axis=0),
+            product_sizes=jnp.concatenate([fusion_events.product_sizes, fission_events.product_sizes], axis=0),
+        )
+        return final_state, events
     return final_state
 
 

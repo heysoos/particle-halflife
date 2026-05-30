@@ -164,3 +164,37 @@ def test_apply_composite_decay_emits_fission_events():
         n_fission_events = int((real.kind == KIND_FISSION).sum())
         assert n_fission_events >= n_died, \
             f"{n_died} composites died but only {n_fission_events} fission events emitted"
+
+
+# ── Task 4: simulation_step event wiring ─────────────────────────────────────
+
+
+def test_simulation_step_returns_events_when_enabled():
+    """simulation_step with emit_events=True returns (state, events). E_max = max_fusions + max_composites."""
+    import dataclasses
+    from halflife.step import simulation_step
+    config = dataclasses.replace(_tiny_config(), emit_events=True)
+    state = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=1)
+    physics = initialize_physics_params(config)
+
+    result = simulation_step(state, params, config, physics)
+    assert isinstance(result, tuple) and len(result) == 2
+    new_state, events = result
+    expected_e = config.max_fusions_per_step + config.max_composites
+    assert events.kind.shape == (expected_e,), f"expected ({expected_e},), got {events.kind.shape}"
+
+
+def test_simulation_step_returns_state_when_disabled():
+    """Default emit_events=False: simulation_step returns just state, unchanged signature."""
+    from halflife.step import simulation_step
+    import dataclasses
+    config = dataclasses.replace(_tiny_config(), emit_events=False)
+    state = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=1)
+    physics = initialize_physics_params(config)
+
+    result = simulation_step(state, params, config, physics)
+    # Just a WorldState, not a tuple.
+    from halflife.state import WorldState
+    assert isinstance(result, WorldState)
