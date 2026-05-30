@@ -124,3 +124,43 @@ def test_attempt_fusion_emits_consistent_fusion_events():
     # the fusion-event count.
     assert n_fusion_events >= max(0, alive_after - alive_before), \
         f"alive grew by {alive_after - alive_before} but only {n_fusion_events} fusion events emitted"
+
+
+# ── Task 3: fission event emission ───────────────────────────────────────────
+
+
+def test_apply_composite_decay_emits_fission_events():
+    """When emit_events=True, apply_composite_decay returns (state, events)."""
+    import dataclasses
+    from halflife.chemistry import apply_composite_decay
+
+    # Tiny config with short half-life so fission fires reliably within ~5 fusion steps + decay.
+    config = dataclasses.replace(
+        _tiny_config(),
+        emit_events=True,
+        half_life_min=0.1,    # force rapid decay
+        half_life_max=0.5,
+    )
+    state = initialize_world(config, seed=0)
+    physics = initialize_physics_params(config)
+
+    # Build some composites first by running a few fusion steps.
+    params = initialize_interaction_params(config, seed=1)
+    for _ in range(5):
+        neighbors = _build_neighbors(state, config)
+        state, _, _ = attempt_fusion(state, neighbors, params, config, physics)
+    assert int(state.composites.alive.sum()) > 0, "need composites to test fission"
+
+    result = apply_composite_decay(state, config, physics)
+    assert len(result) == 2, f"expected (state, events), got {len(result)}-tuple"
+    new_state, events = result
+    assert events.kind.shape == (config.max_composites,)
+
+    # Some composites should have died (half-life is 0.1-0.5 vs dt=physics.dt).
+    n_died = int(state.composites.alive.sum()) - int(new_state.composites.alive.sum())
+    if n_died > 0:
+        from halflife.analysis.events import filter_sentinels, KIND_FISSION
+        real = filter_sentinels(events)
+        n_fission_events = int((real.kind == KIND_FISSION).sum())
+        assert n_fission_events >= n_died, \
+            f"{n_died} composites died but only {n_fission_events} fission events emitted"

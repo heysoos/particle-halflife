@@ -327,7 +327,11 @@ def simulation_step(state: WorldState, params: InteractionParams,
     )
 
     # ── Phase 7: Decay ────────────────────────────────────────────────────────
-    state = apply_composite_decay(state, config, physics)
+    if config.emit_events:
+        state, fission_events = apply_composite_decay(state, config, physics)
+    else:
+        state = apply_composite_decay(state, config, physics)
+        fission_events = None
 
     # ── Phase 8: Energy Accounting ────────────────────────────────────────────
     current_energy = compute_total_energy(state)

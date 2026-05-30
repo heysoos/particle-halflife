@@ -36,7 +36,7 @@ import jax.numpy as jnp
 from halflife.state import ParticleState, CompositeState, WorldState, InteractionParams, PhysicsParams, ReactionEvent
 from halflife.config import SimConfig
 from halflife.utils import find_free_slots
-from halflife.analysis.events import KIND_FUSION, KIND_NONE
+from halflife.analysis.events import KIND_FUSION, KIND_FISSION, KIND_NONE
 
 
 # ── Hash Utilities ────────────────────────────────────────────────────────────
@@ -713,11 +713,59 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
         velocity=new_velocity,
     )
 
-    return state._replace(
+    # ── Per-composite event emission (output only; gated by config) ─────────
+    # Event kind=2 (fission) for every composite where `fissions[c]` is True.
+    # source_slots = (c, -1); product_slots = (c, target_p1[c]).
+    # source_hash/size = the parent composite at slot c BEFORE the state update.
+    # product_hashes = (p0_hash[c], p1_hash[c]); product_sizes = (p0_count[c], p1_count[c]).
+    # Slot 0 of products may be a shattered free particle (count=1, hash=0);
+    # slot 1 likewise. Either or both being product_size==1 is legal.
+    if config.emit_events:
+        c_arr = jnp.arange(C, dtype=jnp.int32)
+        ev_kind = jnp.where(fissions, jnp.int32(KIND_FISSION), jnp.int32(KIND_NONE))
+        ev_src_slots = jnp.stack([
+            jnp.where(fissions, c_arr, jnp.int32(-1)),
+            jnp.full((C,), -1, dtype=jnp.int32),
+        ], axis=1)
+        ev_src_hashes = jnp.stack([
+            jnp.where(fissions, composites.species_hash, jnp.uint32(0)),
+            jnp.zeros((C,), dtype=jnp.uint32),
+        ], axis=1)
+        ev_src_sizes = jnp.stack([
+            jnp.where(fissions, composites.member_count, jnp.int32(0)),
+            jnp.zeros((C,), dtype=jnp.int32),
+        ], axis=1)
+        ev_prod_slots = jnp.stack([
+            jnp.where(fissions, c_arr, jnp.int32(-1)),
+            jnp.where(fissions, all_target_p1, jnp.int32(-1)),
+        ], axis=1)
+        ev_prod_hashes = jnp.stack([
+            jnp.where(fissions, p0_hash, jnp.uint32(0)),
+            jnp.where(fissions, p1_hash, jnp.uint32(0)),
+        ], axis=1)
+        ev_prod_sizes = jnp.stack([
+            jnp.where(fissions, p0_count, jnp.int32(0)),
+            jnp.where(fissions, p1_count, jnp.int32(0)),
+        ], axis=1)
+        events = ReactionEvent(
+            kind=ev_kind,
+            source_slots=ev_src_slots,
+            source_hashes=ev_src_hashes,
+            source_sizes=ev_src_sizes,
+            product_slots=ev_prod_slots,
+            product_hashes=ev_prod_hashes,
+            product_sizes=ev_prod_sizes,
+        )
+
+    new_state = state._replace(
         particles=new_particles,
         composites=new_composites,
         rng_key=key,
     )
+
+    if config.emit_events:
+        return new_state, events
+    return new_state
 
 
 # ── Fusion ───────────────────────────────────────────────────────────────────
