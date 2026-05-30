@@ -147,6 +147,14 @@ class SimConfig:
     enable_profiling: bool = False
     cc_fusion_event_logging: bool = False  # Log individual C+C fusion events to console
 
+    # ── Diagnostic event log ─────────────────────────────────────────────────
+    # When True, attempt_fusion and apply_composite_decay emit per-reaction
+    # event tuples (source/product slot/hash/size) for the analysis pipeline.
+    # Static-arg: when False, the emission code path is dead-code-eliminated
+    # before JIT compilation — bit-for-bit the same kernel as before. The
+    # halflife.analysis runner sets this True; the live app leaves it False.
+    emit_events: bool = False
+
     # ── Rendering ────────────────────────────────────────────────────────────
     window_width: int = 1280
     window_height: int = 720

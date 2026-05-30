@@ -62,6 +62,28 @@ class CompositeState(NamedTuple):
     edge_count:     jnp.ndarray  # (C,)   int32   — number of valid edges
 
 
+class ReactionEvent(NamedTuple):
+    """A batch of reaction events emitted by a single kernel scan/vmap.
+
+    Each leading-axis slot is one (potential) event. Slots with kind == 0
+    are sentinels and should be filtered out by halflife.analysis.events
+    .filter_sentinels before consumption.
+
+    Fusion event:    kind=1, both source_slots/hashes/sizes filled,
+                            product_slots[i,0] filled, [i,1] == -1
+    Fission event:   kind=2, source_slots[i,0] filled, [i,1] == -1,
+                            both product_slots/hashes/sizes filled
+    Sentinel (no event): all fields zero.
+    """
+    kind:           jnp.ndarray  # (E,) int32   0=none, 1=fusion, 2=fission
+    source_slots:   jnp.ndarray  # (E, 2) int32
+    source_hashes:  jnp.ndarray  # (E, 2) uint32
+    source_sizes:   jnp.ndarray  # (E, 2) int32
+    product_slots:  jnp.ndarray  # (E, 2) int32
+    product_hashes: jnp.ndarray  # (E, 2) uint32
+    product_sizes:  jnp.ndarray  # (E, 2) int32
+
+
 class WorldState(NamedTuple):
     """Root container for the complete simulation state."""
     particles:    ParticleState
