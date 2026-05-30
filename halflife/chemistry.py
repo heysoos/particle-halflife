@@ -33,9 +33,10 @@ JIT notes:
 import jax
 import jax.numpy as jnp
 
-from halflife.state import ParticleState, CompositeState, WorldState, InteractionParams, PhysicsParams
+from halflife.state import ParticleState, CompositeState, WorldState, InteractionParams, PhysicsParams, ReactionEvent
 from halflife.config import SimConfig
 from halflife.utils import find_free_slots
+from halflife.analysis.events import KIND_FUSION, KIND_NONE
 
 
 # ── Hash Utilities ────────────────────────────────────────────────────────────
@@ -1115,8 +1116,55 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         degree_carry = degree_carry.at[safe_i].add(delta)
         degree_carry = degree_carry.at[safe_j].add(delta)
 
+        # ── Per-iteration event emission (zero-cost when emit_events=False
+        # because the outer attempt_fusion discards events_stack and XLA DCEs
+        # the unused build code). ────────────────────────────────────────────
+        # All inputs already exist in scan-body scope: safe_i, safe_j,
+        # all_entity_hash, all_entity_cnt, h (merged hash), mc (merged size),
+        # target (product slot). can_fuse gates emission to real events.
+        ev_kind = jnp.where(can_fuse, jnp.int32(KIND_FUSION), jnp.int32(KIND_NONE))
+        ev_src_slots = jnp.where(
+            can_fuse,
+            jnp.array([safe_i, safe_j], dtype=jnp.int32),
+            jnp.array([-1, -1], dtype=jnp.int32),
+        )
+        ev_src_hashes = jnp.where(
+            can_fuse,
+            jnp.array([all_entity_hash[safe_i], all_entity_hash[safe_j]], dtype=jnp.uint32),
+            jnp.array([0, 0], dtype=jnp.uint32),
+        )
+        ev_src_sizes = jnp.where(
+            can_fuse,
+            jnp.array([all_entity_cnt[safe_i], all_entity_cnt[safe_j]], dtype=jnp.int32),
+            jnp.array([0, 0], dtype=jnp.int32),
+        )
+        ev_prod_slots = jnp.where(
+            can_fuse,
+            jnp.array([target, -1], dtype=jnp.int32),
+            jnp.array([-1, -1], dtype=jnp.int32),
+        )
+        ev_prod_hashes = jnp.where(
+            can_fuse,
+            jnp.array([h, jnp.uint32(0)], dtype=jnp.uint32),
+            jnp.array([0, 0], dtype=jnp.uint32),
+        )
+        ev_prod_sizes = jnp.where(
+            can_fuse,
+            jnp.array([mc, jnp.int32(0)], dtype=jnp.int32),
+            jnp.array([0, 0], dtype=jnp.int32),
+        )
+        ev = ReactionEvent(
+            kind=ev_kind,
+            source_slots=ev_src_slots,
+            source_hashes=ev_src_hashes,
+            source_sizes=ev_src_sizes,
+            product_slots=ev_prod_slots,
+            product_hashes=ev_prod_hashes,
+            product_sizes=ev_prod_sizes,
+        )
+
         return (new_claimed, new_composite_id, new_composites, new_comp_count,
-                new_free_slot_ptr, degree_carry), None
+                new_free_slot_ptr, degree_carry), ev
 
     claimed_init       = jnp.zeros(N, dtype=bool)
     composite_id_init  = particles.composite_id
@@ -1124,7 +1172,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
     free_slot_ptr_init = jnp.int32(0)
     degree_init        = degree  # passed in from step.py via Task G
 
-    (_, final_composite_id, final_composites, _, _, final_degree), _ = jax.lax.scan(
+    (_, final_composite_id, final_composites, _, _, final_degree), events_stack = jax.lax.scan(
         fusion_scan_body,
         (claimed_init, composite_id_init, composites, comp_count_init, free_slot_ptr_init, degree_init),
         scan_indices,
@@ -1132,11 +1180,17 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
 
     new_particles = particles._replace(composite_id=final_composite_id)
 
-    return state._replace(
+    new_state = state._replace(
         particles=new_particles,
         composites=final_composites,
         rng_key=key,
-    ), final_degree
+    )
+    # Gate the return on config.emit_events. When False the events_stack is
+    # built (single trace path inside the scan body) but discarded here, and
+    # XLA's DCE removes the unused build code so the live path stays cost-free.
+    if config.emit_events:
+        return new_state, final_degree, events_stack
+    return new_state, final_degree
 
 
 # ── Ring Closure (Phase 6b) ───────────────────────────────────────────────────

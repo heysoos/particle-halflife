@@ -303,10 +303,21 @@ def simulation_step(state: WorldState, params: InteractionParams,
     )
 
     # ── Phase 6: Fusion ───────────────────────────────────────────────────────
-    state, degree = attempt_fusion(
-        state, neighbors, params, config, physics,
-        degree=degree, species_valences=species_valences,
-    )
+    # When config.emit_events is True (diagnostic mode), attempt_fusion also
+    # returns a per-iteration ReactionEvent batch. Task 4 will assemble the
+    # per-step event log from fusion_events + decay/fission events; for now
+    # we just keep the variable around.
+    if config.emit_events:
+        state, degree, fusion_events = attempt_fusion(
+            state, neighbors, params, config, physics,
+            degree=degree, species_valences=species_valences,
+        )
+    else:
+        state, degree = attempt_fusion(
+            state, neighbors, params, config, physics,
+            degree=degree, species_valences=species_valences,
+        )
+        fusion_events = None
 
     # ── Phase 6b: Ring closure (intra-composite fusion) ───────────────────────
     from halflife.chemistry import attempt_ring_closure
