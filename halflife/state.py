@@ -65,6 +65,8 @@ class CompositeState(NamedTuple):
 class ReactionEvent(NamedTuple):
     """A batch of reaction events emitted by a single kernel scan/vmap.
 
+    When emitted from a JIT'd kernel the arrays are JAX device arrays; halflife.analysis.events.filter_sentinels converts them to host-side numpy arrays.
+
     Each leading-axis slot is one (potential) event. Slots with kind == 0
     are sentinels and should be filtered out by halflife.analysis.events
     .filter_sentinels before consumption.
@@ -73,7 +75,7 @@ class ReactionEvent(NamedTuple):
                             product_slots[i,0] filled, [i,1] == -1
     Fission event:   kind=2, source_slots[i,0] filled, [i,1] == -1,
                             both product_slots/hashes/sizes filled
-    Sentinel (no event): all fields zero.
+    Sentinel (no event): kind == 0; other fields hold their padding values (-1 for slots, 0 for hashes/sizes).
     """
     kind:           jnp.ndarray  # (E,) int32   0=none, 1=fusion, 2=fission
     source_slots:   jnp.ndarray  # (E, 2) int32

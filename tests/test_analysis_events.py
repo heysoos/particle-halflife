@@ -1,6 +1,5 @@
 """Tests for ReactionEvent data structure and emit_events config flag."""
 import jax.numpy as jnp
-import pytest
 
 from halflife.config import SimConfig
 from halflife.state import ReactionEvent
