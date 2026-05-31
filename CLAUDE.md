@@ -72,19 +72,25 @@ Working directory is already the project root; absolute paths still work too.
 
 ## Git Operations
 
-**IMPORTANT: Git has no global identity configured in WSL.** Always supply `-c user.email` and
-`-c user.name` inline on every `add`/`commit` — never `git config --global` (that would mutate shared WSL state). This applies to **both** shell environments below.
+**Identity is set in WSL's global config** (`/home/heysoos/.gitconfig`) — `user.email =
+sina.abdollahi@gmail.com`, `user.name = Heysoos`. This is the email tied to the user's
+GitHub account, so commits made with it appear on GitHub's contribution graph. **Do not
+override it inline** (`-c user.email=...`) — earlier guidance in this file used to recommend
+that, and it produced ~80 commits attributed to a fake `heysoos@local` address that GitHub
+couldn't link to any account. Just let the global config flow through.
+
+Both shell environments below ultimately invoke `git` inside WSL, so both pick up the same
+WSL global identity.
 
 ### From Git Bash on Windows
 ```bash
-wsl bash -c "cd '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-particle' && git -c user.email='heysoos@local' -c user.name='Heysoos' add <files...> && git -c user.email='heysoos@local' -c user.name='Heysoos' commit -m 'message'"
+wsl bash -c "cd '/mnt/c/Users/Heysoos/Documents/Pycharm Projects/halflife-particle' && git add <files...> && git commit -m 'message'"
 ```
 
 ### From Claude Code running natively in WSL
 No wrapper, no `cd` (already at project root):
 ```bash
-git -c user.email='heysoos@local' -c user.name='Heysoos' add halflife/foo.py halflife/bar.py \
-  && git -c user.email='heysoos@local' -c user.name='Heysoos' commit -m 'your message here'
+git add halflife/foo.py halflife/bar.py && git commit -m 'your message here'
 ```
 
 **Never** use `git add -A` or `git add .` — the repo contains `.idea/`, `__pycache__/`, `bash.exe.stackdump`, and `init_prompt.txt` that should not be committed.
