@@ -328,6 +328,88 @@ config = SimConfig(
 )
 ```
 
+## Composite Diagnostic Reports (`halflife/analysis/`)
+
+For diagnosing composite formation dynamics — *why* large composites are/aren't forming.
+CLI-driven; runs one simulation and emits a single self-contained HTML report.
+
+Spec: [`docs/superpowers/specs/2026-05-30-composite-diagnostic-design.md`](docs/superpowers/specs/2026-05-30-composite-diagnostic-design.md)
+
+### Quick start (from WSL)
+
+```bash
+# Most common pattern: short-medium GPU run on a named scenario
+.venv/bin/python -m halflife.analysis --scenario baseline --steps 3000 --sample-every 100 --platform gpu
+
+# Output: tests/reports/diag_<scenario>_<timestamp>.html  (~600KB-1MB, opens in any browser)
+```
+
+3000 steps takes ~100 seconds on GPU. Step rate scales with `num_particles × num_species²`.
+
+### Scenarios
+
+| Preset name | What it changes from default `SimConfig` |
+|---|---|
+| `baseline` | (default config — `num_species=12, half_life_max=15.0`) |
+| `current_experiment` | `num_species=3, half_life_max=100.0` (the user's running experiment) |
+| `valence_off` | `use_valence=False` |
+| `polymer_world` | `max_valence=2, num_species=2` |
+| `branching_world` | `max_valence=3, num_species=3` |
+| `old_star_spring` | `bond_mode='star_spring'` |
+
+When the user's `current_experiment` knobs change, update the preset in `halflife/analysis/cli.py`.
+
+### Common flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--scenario <name>` | `baseline` | Preset name (see table above) |
+| `--steps N` | `10000` | Total sim steps. Use 1000-3000 for "quick look", 10000+ for thorough diagnosis. |
+| `--seed S` | `0` | RNG seed |
+| `--sample-every K` | `100` | Full-snapshot interval. Compact metrics are emitted every step regardless. |
+| `--top-k N` | `30` | K for the top-K transition / compatibility matrices |
+| `--override "k1=v1,k2=v2"` | none | Per-run config overrides (e.g. `"num_species=5,fusion_radius=3.0"`) |
+| `--out PATH` | auto | Output path (default: `tests/reports/diag_<scenario>_<ts>.html`) |
+| `--platform cpu\|gpu` | auto | Force JAX platform. Use `cpu` for tiny test runs, `gpu` for real diagnosis |
+
+### Comparing scenarios
+
+The tool produces one HTML per run; there's no built-in comparison view. To diagnose
+a regression: run the tool twice (e.g. `baseline` vs `current_experiment`) and open
+both HTMLs in side-by-side browser windows.
+
+The **Tier 4** fusion-compatibility matrices show what *could* happen chemistry-wise; the
+**Tier 3** transition matrices show what *actually did* happen. Diffing the two visually
+across the two scenarios is the core diagnostic move:
+- High-BE cell in Tier 4b but cold in Tier 3 Matrix 2 → those composites *could* fuse
+  but never met (kinetic problem) OR were valence-saturated in practice
+- Hatched-out cells in Tier 4a/b → valence-blocked regardless of BE
+
+### Cost
+
+- ~30 steps/sec on GPU at default `num_particles=5000`
+- Memory: ~5 MB compact metrics + ~100 MB events + ~65 MB snapshots for 10k steps (well within RAM)
+- Sub-second post-processing (transition matrices + compatibility matrices)
+- Output HTML is typically 500KB-2MB depending on `--top-k` and event count
+
+### Live-app cost
+
+**Zero.** The diagnostic kernel emission is gated by `SimConfig.emit_events` (default `False`,
+`static_argnums`). When the live app runs with the default config, the emit branch is
+dead-code-eliminated before JIT — the compiled kernel is bit-for-bit unchanged from the
+pre-pipeline version.
+
+### Testing the pipeline itself
+
+The pipeline has its own pytest suite (~22 tests):
+```bash
+JAX_PLATFORMS=cpu .venv/bin/pytest tests/test_analysis_events.py tests/test_analysis_metrics.py \
+  tests/test_analysis_transitions.py tests/test_analysis_compatibility.py tests/test_analysis_pipeline.py -v
+```
+~2 minutes on CPU. Run after touching any kernel-emission code (`halflife/chemistry.py:attempt_fusion`,
+`halflife/chemistry.py:apply_composite_decay`, `halflife/step.py:simulation_step`) or any
+`halflife/analysis/` module.
+
 ## Development Notes
 
 - **Build order**: config → state → utils → spatial → interactions → step → renderer → main → chemistry → energy
