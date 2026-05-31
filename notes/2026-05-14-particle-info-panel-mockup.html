@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Particle Info Panel — Mockup</title>
+<style>
+  :root {
+    --bg-page:        #0a0a12;
+    --bg-panel:       rgba(15, 18, 35, 0.93);
+    --border-panel:   rgba(70, 100, 150, 0.70);
+    --border-divider: rgba(70, 100, 150, 0.35);
+    --text-label:     rgb(160, 185, 230);
+    --text-value:     rgb(220, 230, 255);
+    --text-body:      rgb(190, 215, 255);
+    --text-muted:     rgb(120, 140, 165);
+    --close-bg:       rgba(80, 30, 30, 0.70);
+    --close-border:   rgba(150, 80, 80, 0.70);
+    --close-fg:       rgb(255, 160, 160);
+  }
+
+  html, body {
+    margin: 0;
+    background: var(--bg-page);
+    color: var(--text-body);
+    font-family: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+    min-height: 100vh;
+  }
+
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 24px 80px;
+    gap: 32px;
+  }
+
+  h2 {
+    font-size: 13px;
+    color: var(--text-muted);
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin: 0;
+  }
+
+  .row {
+    display: flex;
+    gap: 36px;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: flex-start;
+  }
+
+  /* ──────────── Panel ──────────── */
+
+  .panel {
+    background: var(--bg-panel);
+    border: 1px solid var(--border-panel);
+    border-radius: 6px;
+    padding: 8px 12px 10px;
+    width: 230px;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--text-body);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+  }
+
+  .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding-bottom: 6px;
+    margin-bottom: 6px;
+    border-bottom: 1px solid var(--border-divider);
+  }
+
+  .panel-title {
+    color: var(--text-value);
+    font-weight: 600;
+  }
+
+  .close {
+    width: 18px;
+    height: 18px;
+    line-height: 16px;
+    text-align: center;
+    color: var(--close-fg);
+    background: var(--close-bg);
+    border: 1px solid var(--close-border);
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 13px;
+    user-select: none;
+  }
+
+  .species-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+
+  .swatch {
+    width: 14px;
+    height: 14px;
+    border-radius: 2px;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    flex-shrink: 0;
+  }
+
+  .kv {
+    display: flex;
+    justify-content: space-between;
+    color: var(--text-body);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .kv .label { color: var(--text-label); }
+  .kv .value { color: var(--text-value); }
+
+  .free-label {
+    color: var(--text-muted);
+    font-style: italic;
+  }
+
+  .section {
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid var(--border-divider);
+  }
+
+  .section-title {
+    color: var(--text-value);
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+
+  .members {
+    margin-top: 4px;
+  }
+
+  .members-label {
+    color: var(--text-label);
+    margin-right: 6px;
+  }
+
+  .chip {
+    display: inline-block;
+    padding: 0 5px;
+    margin: 1px 2px 1px 0;
+    border-radius: 3px;
+    background: rgba(70, 100, 150, 0.18);
+    color: var(--text-value);
+    font-size: 12px;
+  }
+
+  .chip.dot {
+    width: 0;
+    overflow: hidden;
+    padding: 0 6px 0 0;
+  }
+  .chip-swatch {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 4px;
+    vertical-align: middle;
+    border: 1px solid rgba(255, 255, 255, 0.20);
+  }
+
+  /* ──────────── Caption ──────────── */
+
+  .caption {
+    color: var(--text-muted);
+    font-size: 12px;
+    max-width: 720px;
+    text-align: center;
+    line-height: 1.6;
+  }
+
+  /* OKLCh-ish swatch colors used as stand-ins. Match the renderer's
+     L≈0.72, C≈0.13 palette at the corresponding hue. */
+  .sw-0 { background: #c97a8d; }   /* hue   20° */
+  .sw-3 { background: #b3a755; }   /* hue 110° */
+  .sw-5 { background: #5fae87; }   /* hue 170° */
+  .sw-7 { background: #6a8ec8; }   /* hue 230° */
+  .sw-8 { background: #8c7dc0; }   /* hue 260° */
+</style>
+</head>
+<body>
+  <h2>Particle inspector — mockup</h2>
+
+  <div class="row">
+
+    <!-- ── Free particle ─────────────────────────────────────────── -->
+    <div class="panel" role="region" aria-label="Particle 1234 — free">
+      <div class="panel-header">
+        <div class="panel-title">Particle #1234</div>
+        <div class="close" title="Close">×</div>
+      </div>
+
+      <div class="species-line">
+        <span class="swatch sw-7"></span>
+        <span class="value">Species 7</span>
+        <span class="free-label" style="margin-left:auto;">valence 2</span>
+      </div>
+
+      <div class="kv"><span class="label">Position</span><span class="value">123.4, 56.7</span></div>
+      <div class="kv"><span class="label">Velocity</span><span class="value">1.23, -0.45</span></div>
+      <div class="kv"><span class="label">Speed</span><span class="value">1.31</span></div>
+      <div class="kv"><span class="label">Mass</span><span class="value">1.00</span></div>
+      <div class="kv"><span class="label">Energy</span><span class="value">0.85</span></div>
+      <div class="kv"><span class="label">Age</span><span class="value">12.3 s</span></div>
+      <div class="kv"><span class="label">Composite</span><span class="value free-label">free</span></div>
+    </div>
+
+    <!-- ── Composite member ──────────────────────────────────────── -->
+    <div class="panel" role="region" aria-label="Particle 2871 — composite member">
+      <div class="panel-header">
+        <div class="panel-title">Particle #2871</div>
+        <div class="close" title="Close">×</div>
+      </div>
+
+      <div class="species-line">
+        <span class="swatch sw-3"></span>
+        <span class="value">Species 3</span>
+        <span class="free-label" style="margin-left:auto;">valence 4</span>
+      </div>
+
+      <div class="kv"><span class="label">Position</span><span class="value">87.2, 31.8</span></div>
+      <div class="kv"><span class="label">Velocity</span><span class="value">0.45, 0.12</span></div>
+      <div class="kv"><span class="label">Speed</span><span class="value">0.47</span></div>
+      <div class="kv"><span class="label">Mass</span><span class="value">1.00</span></div>
+      <div class="kv"><span class="label">Energy</span><span class="value">0.62</span></div>
+      <div class="kv"><span class="label">Age</span><span class="value">45.1 s</span></div>
+
+      <div class="section">
+        <div class="section-title">Composite #42 &mdash; 5 members</div>
+        <div class="kv"><span class="label">Hash</span><span class="value">a3f7…b412</span></div>
+        <div class="kv"><span class="label">Binding E</span><span class="value">0.87</span></div>
+        <div class="kv"><span class="label">Age</span><span class="value">7.2 s</span></div>
+        <div class="kv"><span class="label">Half-life</span><span class="value">12.4 s</span></div>
+        <div class="kv"><span class="label">Free bonds</span><span class="value">2 / 7</span></div>
+
+        <div class="members">
+          <span class="members-label">Members</span>
+          <span class="chip"><span class="chip-swatch sw-7"></span>7</span>
+          <span class="chip"><span class="chip-swatch sw-3"></span>3</span>
+          <span class="chip"><span class="chip-swatch sw-3"></span>3</span>
+          <span class="chip"><span class="chip-swatch sw-5"></span>5</span>
+          <span class="chip"><span class="chip-swatch sw-8"></span>8</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="caption">
+    Two example states: a free particle (left) and a composite member (right).
+    The panel anchors in the top-right corner of the simulator window, below
+    the existing Stats button. <strong>×</strong> clears the selection; clicking
+    another particle swaps selection. Member chips are colored by species using
+    the same OKLCh palette as the rendered particles. All values update live as
+    the sim runs.
+  </div>
+</body>
+</html>
