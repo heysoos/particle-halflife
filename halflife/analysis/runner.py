@@ -4,11 +4,18 @@ Single entry point: run_diagnostic(config, n_steps, seed, sample_every) →
 RunResult. The runner drives the JIT'd simulation_step inside a lax.scan
 that emits per-step compact metrics + events, with periodic host-side
 copies of full snapshots for downstream distribution drill-downs.
+
+Caching: save_run_result / load_run_result persist a RunResult to disk
+(gzipped pickle). Used by the CLI's --from-cache flag so report-only
+iteration doesn't require re-running the simulation.
 """
 
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
+import gzip
+import os
+import pickle
 import time
 import dataclasses
 
@@ -160,3 +167,21 @@ def _take_snapshot(state: WorldState, step: int) -> CompositeSnapshot:
         edges=np.asarray(c.edges),
         edge_count=np.asarray(c.edge_count),
     )
+
+
+# ── Cache I/O ──────────────────────────────────────────────────────────────
+# Persisting a RunResult lets the user iterate on report presentation code
+# without re-running the (~minutes-long) GPU simulation. Cache files are
+# gzipped pickles — the snapshot arrays compress well (lots of -1 sentinels).
+
+def save_run_result(result: RunResult, path: str) -> None:
+    """Save a RunResult to a gzipped pickle file. Creates parent dirs."""
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    with gzip.open(path, 'wb') as f:
+        pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_run_result(path: str) -> RunResult:
+    """Load a RunResult from a gzipped pickle file."""
+    with gzip.open(path, 'rb') as f:
+        return pickle.load(f)

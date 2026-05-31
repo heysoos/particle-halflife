@@ -68,7 +68,11 @@ def test_size_bin_matrix_fission_contributes_to_both_product_cols():
 
 
 def test_top_k_matrix_buckets_tail_into_other():
-    """K=2 with 4 unique hashes: top 2 stay, remaining 2 collapse into 'other' row/col."""
+    """K=2 with 4 unique hashes: top 2 stay, remaining 2 collapse into 'other' row/col.
+
+    API contract: function returns (matrix, hashes) where hashes[i] is the
+    int species_hash for row/col i, or None for the 'other' bucket at the end.
+    """
     # Build several events so we have rankable hashes.
     evts = [
         _make_event(KIND_FUSION, [1, 2], [1, 1], [3, 0], [2, 0]),  # hashes 1,2 → 3
@@ -76,15 +80,22 @@ def test_top_k_matrix_buckets_tail_into_other():
         _make_event(KIND_FUSION, [4, 5], [1, 1], [9, 0], [2, 0]),  # rare hashes 4,5,9
     ]
     batch = _concat_events(*evts)
-    M, labels = top_k_transition_matrix(batch, K=2)
+    M, hashes = top_k_transition_matrix(batch, K=2)
     # Shape: K+1 by K+1 with "other" appended.
     assert M.shape == (3, 3)
-    assert labels[-1] == 'other'
+    assert hashes[-1] is None  # 'other' bucket sentinel
+    # All non-sentinel entries are ints (raw hashes), not strings.
+    assert all(isinstance(h, int) for h in hashes[:-1])
 
 
 def test_full_transition_matrix_uses_every_observed_hash():
-    """U×U where U = unique hashes across all events."""
+    """U×U where U = unique hashes across all events.
+
+    API contract: returns (matrix, hashes) — hashes are raw ints, no 'other'.
+    """
     evt = _make_event(KIND_FUSION, [1, 2], [1, 1], [3, 0], [2, 0])
-    M, labels = full_transition_matrix(evt)
-    assert len(labels) == 3  # hashes 1, 2, 3
+    M, hashes = full_transition_matrix(evt)
+    assert len(hashes) == 3  # hashes 1, 2, 3
     assert M.shape == (3, 3)
+    assert all(isinstance(h, int) for h in hashes)
+    assert set(hashes) == {1, 2, 3}

@@ -4,15 +4,21 @@ Usage:
   python -m halflife.analysis --scenario baseline --steps 10000
   python -m halflife.analysis --scenario current_experiment --steps 5000 \
       --override num_species=3,half_life_max=80
+
+  # Re-render the report from the previous run without re-simulating:
+  python -m halflife.analysis --scenario current_experiment --steps 5000 --from-cache
 """
 
 import argparse
 import dataclasses
+import hashlib
 import os
 import time
 
 from halflife.config import SimConfig
-from halflife.analysis.runner import run_diagnostic
+from halflife.analysis.runner import (
+    run_diagnostic, save_run_result, load_run_result,
+)
 from halflife.analysis.report import render_html
 
 
@@ -80,6 +86,26 @@ def build_config(scenario: str, overrides: dict) -> SimConfig:
     return config
 
 
+def _default_cache_path(scenario: str, n_steps: int, seed: int,
+                        sample_every: int, overrides: dict) -> str:
+    """Cache filename derived from the run args.
+
+    Same args → same cache slot, so a follow-up --from-cache invocation
+    with the same flags as the original run finds the right file. Overrides
+    are hashed into a short suffix so non-default overrides get their own
+    slot without bloating the filename.
+    """
+    if overrides:
+        # Sort for deterministic order; the user's argparse `--override`
+        # dict ordering shouldn't matter for cache identity.
+        ovr_str = ','.join(f"{k}={v}" for k, v in sorted(overrides.items()))
+        ovr_suffix = '_ovr' + hashlib.md5(ovr_str.encode()).hexdigest()[:8]
+    else:
+        ovr_suffix = ''
+    fname = f"{scenario}_n{n_steps}_seed{seed}_every{sample_every}{ovr_suffix}.pkl.gz"
+    return os.path.join('tests', 'reports', 'cache', fname)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="Run a single composite diagnostic simulation.")
     p.add_argument('--scenario',     default='baseline', choices=sorted(PRESETS))
@@ -95,27 +121,56 @@ def main(argv=None):
                    help="Output HTML path (default: tests/reports/diag_<scenario>_<ts>.html)")
     p.add_argument('--platform',     type=str, default='', choices=['', 'cpu', 'gpu'],
                    help="Force JAX platform (default: auto)")
+    p.add_argument('--from-cache',   action='store_true',
+                   help="Skip simulation; load the cached RunResult matching the other "
+                        "args and re-render the HTML. Useful when iterating on report "
+                        "presentation code without burning GPU time.")
+    p.add_argument('--cache-path',   type=str, default='',
+                   help="Override cache file path (default: derived from "
+                        "scenario+steps+seed+sample-every+overrides)")
+    p.add_argument('--no-cache',     action='store_true',
+                   help="Don't save the run to cache (default: save, overwriting).")
     args = p.parse_args(argv)
 
     if args.platform:
         os.environ['JAX_PLATFORMS'] = args.platform
 
     overrides = _parse_overrides(args.override)
-    config = build_config(args.scenario, overrides)
+    cache_path = args.cache_path or _default_cache_path(
+        args.scenario, args.steps, args.seed, args.sample_every, overrides,
+    )
 
     print(f"[diag] scenario={args.scenario} steps={args.steps} seed={args.seed}")
     print(f"[diag] sample_every={args.sample_every} top_k={args.top_k}")
     if overrides:
         print(f"[diag] overrides: {overrides}")
 
-    t0 = time.time()
-    result = run_diagnostic(
-        config, n_steps=args.steps, seed=args.seed, sample_every=args.sample_every,
-    )
-    t1 = time.time()
-    print(f"[diag] run finished in {t1 - t0:.1f}s  ({result.n_steps / (t1 - t0):.1f} steps/sec)")
+    if args.from_cache:
+        if not os.path.exists(cache_path):
+            raise SystemExit(
+                f"--from-cache: no cached run at {cache_path!r}. "
+                f"Run without --from-cache first to populate the cache."
+            )
+        print(f"[diag] loading cached run from {cache_path}")
+        t0 = time.time()
+        result = load_run_result(cache_path)
+        t1 = time.time()
+        print(f"[diag] loaded in {t1 - t0:.1f}s  ({result.n_steps} steps)")
+    else:
+        config = build_config(args.scenario, overrides)
+        t0 = time.time()
+        result = run_diagnostic(
+            config, n_steps=args.steps, seed=args.seed,
+            sample_every=args.sample_every,
+        )
+        t1 = time.time()
+        print(f"[diag] run finished in {t1 - t0:.1f}s  ({result.n_steps / (t1 - t0):.1f} steps/sec)")
+        if not args.no_cache:
+            save_run_result(result, cache_path)
+            cache_kb = os.path.getsize(cache_path) / 1024
+            print(f"[diag] cached run to {cache_path}  ({cache_kb:.0f} KB)")
 
-    html = render_html(result)
+    html = render_html(result, top_k=args.top_k)
 
     out = args.out or _default_out(args.scenario)
     out_dir = os.path.dirname(out)

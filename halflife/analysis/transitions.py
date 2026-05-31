@@ -59,19 +59,20 @@ def size_bin_transition_matrix(events: ReactionEvent, max_composite_size: int) -
 
 def top_k_transition_matrix(
     events: ReactionEvent, K: int = 30
-) -> Tuple[np.ndarray, List[str]]:
+) -> Tuple[np.ndarray, List]:
     """(K+1, K+1) matrix on the K most-trafficked species hashes, sorted by size.
 
     Sort key: (size ascending, hash ascending). "Trafficked" = total incidence
     (row + col before truncation). The last row/col is "other" and collects
     all tail traffic.
 
-    Returns (matrix, labels) where labels[i] is the human-readable hash for
-    row/col i ("0x..." or "other" for the last).
+    Returns (matrix, hashes) where hashes[i] is the raw int species_hash for
+    row/col i, or None for the "other" bucket at the last position. Caller
+    formats labels however it wants (hex, chemical formula, etc.).
     """
     edges = list(_iter_edges(events))
     if not edges:
-        return np.zeros((1, 1), dtype=np.int64), ['other']
+        return np.zeros((1, 1), dtype=np.int64), [None]
 
     # Map hash → size (first seen wins; should be deterministic).
     hash_size = {}
@@ -94,19 +95,23 @@ def top_k_transition_matrix(
         j = h_to_idx.get(ph, other_idx)
         matrix[i, j] += 1
 
-    labels = [f"0x{h:08x}" for h in top_hashes] + ['other']
+    hashes = list(top_hashes) + [None]   # None marks the 'other' bucket
     # Trim if there were fewer than K unique hashes.
     actual_k = len(top_hashes)
     if actual_k < K:
         matrix = matrix[:actual_k + 1, :actual_k + 1]
-        labels = labels[:actual_k + 1]
-    return matrix, labels
+        hashes = hashes[:actual_k + 1]
+    return matrix, hashes
 
 
 def full_transition_matrix(
     events: ReactionEvent,
-) -> Tuple[np.ndarray, List[str]]:
-    """(U, U) matrix over every observed unique hash, sorted by size ascending."""
+) -> Tuple[np.ndarray, List]:
+    """(U, U) matrix over every observed unique hash, sorted by size ascending.
+
+    Returns (matrix, hashes) where hashes[i] is the raw int species_hash for
+    row/col i. Caller formats labels however it wants.
+    """
     edges = list(_iter_edges(events))
     if not edges:
         return np.zeros((0, 0), dtype=np.int64), []
@@ -122,5 +127,4 @@ def full_transition_matrix(
     matrix = np.zeros((U, U), dtype=np.int64)
     for sh, _ss, ph, _ps in edges:
         matrix[h_to_idx[sh], h_to_idx[ph]] += 1
-    labels = [f"0x{h:08x}" for h in sorted_hashes]
-    return matrix, labels
+    return matrix, sorted_hashes

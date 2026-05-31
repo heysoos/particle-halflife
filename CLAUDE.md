@@ -371,6 +371,26 @@ When the user's `current_experiment` knobs change, update the preset in `halflif
 | `--override "k1=v1,k2=v2"` | none | Per-run config overrides (e.g. `"num_species=5,fusion_radius=3.0"`) |
 | `--out PATH` | auto | Output path (default: `tests/reports/diag_<scenario>_<ts>.html`) |
 | `--platform cpu\|gpu` | auto | Force JAX platform. Use `cpu` for tiny test runs, `gpu` for real diagnosis |
+| `--from-cache` | off | Skip simulation; load the cached `RunResult` matching the other args and re-render the HTML |
+| `--cache-path PATH` | auto | Override cache path (default derived from scenario+steps+seed+sample-every+overrides) |
+| `--no-cache` | off | Don't write to cache after running (default: write, overwriting prior cache) |
+
+### Cache
+
+Every non-`--from-cache` run writes its `RunResult` (gzipped pickle) to
+`tests/reports/cache/<scenario>_n<steps>_seed<seed>_every<K>[_ovr<hash>].pkl.gz`.
+Re-rendering the report from cache is essentially instant — useful when iterating
+on presentation code (`plots.py`, `report.py`, CSS) without burning GPU time on
+identical sim runs. Cache filename is derived from the same args, so a follow-up
+invocation with `--from-cache` and the same flags finds the right slot.
+
+```bash
+# First run: simulate + cache + render
+.venv/bin/python -m halflife.analysis --scenario X --steps 3000 --platform gpu
+
+# Tweak plot styling, then re-render from cache (no GPU, no sim):
+.venv/bin/python -m halflife.analysis --scenario X --steps 3000 --from-cache
+```
 
 ### Comparing scenarios
 

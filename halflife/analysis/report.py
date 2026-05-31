@@ -276,6 +276,36 @@ _HTML_TEMPLATE = """\
 """
 
 
+def _species_letter(idx: int) -> str:
+    """Excel-style species letters: 0→A, 1→B, …, 25→Z, 26→AA, 27→AB, …
+
+    For num_species ≤ 26 (the common case) this is just 'A'..'Z'.
+    Beyond Z we go to AA/AB/... so we never run out of distinct labels.
+    """
+    if idx < 26:
+        return chr(ord('A') + idx)
+    return _species_letter(idx // 26 - 1) + chr(ord('A') + idx % 26)
+
+
+def _multiset_to_formula(multiset) -> str:
+    """Render a sorted species multiset as a chemistry-style formula.
+
+    Examples (assuming species 0,1,2 → A,B,C):
+      (0,)            → 'A_1'
+      (0, 1, 1, 1, 2) → 'A_1 B_3 C_1'
+      (0, 0)          → 'A_2'
+
+    Counts are always shown explicitly (no implicit "_1") so cells with
+    the same species composition but different multiplicities line up
+    visually in the matrix tick labels.
+    """
+    from collections import Counter
+    counts = Counter(multiset)
+    return ' '.join(
+        f"{_species_letter(s)}_{counts[s]}" for s in sorted(counts)
+    )
+
+
 def _git_sha() -> str:
     import subprocess
     try:
@@ -338,8 +368,19 @@ def render_html(result: RunResult, top_k: int = 30) -> str:
     M_size_bin = transitions.size_bin_transition_matrix(
         result.events, result.config.max_composite_size
     )
-    M_top_k, top_k_labels = transitions.top_k_transition_matrix(result.events, K=top_k)
-    M_full, full_labels = transitions.full_transition_matrix(result.events)
+    M_top_k, top_k_hashes = transitions.top_k_transition_matrix(result.events, K=top_k)
+    M_full, full_hashes = transitions.full_transition_matrix(result.events)
+
+    # We need the multiset for each hash to render chemical-formula labels.
+    # _unique_multisets_from_snapshots gives us hash → sorted-species-tuple.
+    seen, incidence = _unique_multisets_from_snapshots(result.snapshots, particles_species)
+
+    def _formula_label(h):
+        """Format a hash as 'A_1 B_3 C_1'; fall back to hex if multiset unknown."""
+        if h is None:
+            return 'other'
+        m = seen.get(h)
+        return _multiset_to_formula(m) if m else f"0x{h:08x}"
 
     # Size-binned: explicit size labels '0', '1', …, 'M' so axis ticks
     # mean what they look like (the row/col IS the size class).
@@ -349,7 +390,7 @@ def render_html(result: RunResult, top_k: int = 30) -> str:
         title='Size-class transitions (rows = source size, cols = product size)',
     )
     img_top_k_matrix = plots.plot_transition_matrix(
-        M_top_k, labels=top_k_labels,
+        M_top_k, labels=[_formula_label(h) for h in top_k_hashes],
         title=f'Top-{top_k} composite-type transitions',
     )
     # All-observed: composite-indexed, NOT size-indexed. Hide ticks so
@@ -357,7 +398,7 @@ def render_html(result: RunResult, top_k: int = 30) -> str:
     # axis label communicates the sort order instead.
     img_full_matrix = plots.plot_transition_matrix(
         M_full, labels=None, hide_dense_ticks=True,
-        title=f'All {len(full_labels)} observed composite types',
+        title=f'All {len(full_hashes)} observed composite types',
     )
 
     # Tier 4 — Matrix 4a is species-pair (always small). Matrix 4b now has
@@ -369,7 +410,7 @@ def render_html(result: RunResult, top_k: int = 30) -> str:
         labels=[f's{i}' for i in range(result.config.num_species)],
     )
 
-    seen, incidence = _unique_multisets_from_snapshots(result.snapshots, particles_species)
+    # seen/incidence were already computed up in the Tier 3 section.
     if seen:
         from collections import Counter
         # Top-K view: K most-trafficked hashes by incidence, sorted by size then hash.
@@ -382,7 +423,7 @@ def render_html(result: RunResult, top_k: int = 30) -> str:
         img_compat_observed_topk = plots.plot_compatibility_matrix(
             be_b_topk, pbe_b_topk, pval_b_topk,
             title=f'Top-{top_k} observed-composite compatibility',
-            labels=[f"0x{h:08x}" for h in topk_hashes],
+            labels=[_multiset_to_formula(m) for m in topk_multisets],
         )
 
         # All-observed view: every unique hash seen across snapshots, sorted by size.
