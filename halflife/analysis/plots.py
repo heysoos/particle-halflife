@@ -107,6 +107,12 @@ def plot_transition_matrix(matrix: np.ndarray, labels: List[str] = None,
                            title: str = '', cmap: str = 'Reds',
                            log_color: bool = True) -> str:
     """Render a transition matrix (any size) as a heatmap."""
+    # Degenerate runs (no events observed) can hand us a (0, 0) matrix —
+    # matplotlib + matrix.max() both raise on zero-size arrays. Render a
+    # one-cell placeholder so the report still assembles cleanly.
+    if matrix.size == 0:
+        matrix = np.zeros((1, 1), dtype=np.int64)
+        labels = ['(no events)']
     fig, ax = plt.subplots(figsize=(max(6, min(20, matrix.shape[1] * 0.3)),
                                      max(6, min(20, matrix.shape[0] * 0.3))))
     if log_color and matrix.max() > 0:

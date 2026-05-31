@@ -1169,7 +1169,12 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         # the unused build code). ────────────────────────────────────────────
         # All inputs already exist in scan-body scope: safe_i, safe_j,
         # all_entity_hash, all_entity_cnt, h (merged hash), mc (merged size),
-        # target (product slot). can_fuse gates emission to real events.
+        # target (product slot). all_entity_hash/cnt are the per-rep ENTITY
+        # caches (line 826) — for a composite rep they hold the whole
+        # composite's hash/size, not just the rep particle's species. So
+        # ev_src_hashes/sizes correctly encode the source entities for
+        # both free+free and comp+free / comp+comp cases.
+        # can_fuse gates emission to real events.
         ev_kind = jnp.where(can_fuse, jnp.int32(KIND_FUSION), jnp.int32(KIND_NONE))
         ev_src_slots = jnp.where(
             can_fuse,

@@ -76,6 +76,14 @@ class ReactionEvent(NamedTuple):
     Fission event:   kind=2, source_slots[i,0] filled, [i,1] == -1,
                             both product_slots/hashes/sizes filled
     Sentinel (no event): kind == 0; other fields hold their padding values (-1 for slots, 0 for hashes/sizes).
+
+    Caveat for composite+composite fusion: source_slots[i,0/1] reference
+    the *particle* representatives of the two source entities (not their
+    composite slot ids), and the absorbed composite slot is not surfaced
+    anywhere in the event. The transition-matrix consumers in
+    halflife.analysis only use the hashes (which are correct), so this
+    is acceptable. Consumers that need slot-level death reconciliation
+    must diff CompositeState.alive across snapshots.
     """
     kind:           jnp.ndarray  # (E,) int32   0=none, 1=fusion, 2=fission
     source_slots:   jnp.ndarray  # (E, 2) int32

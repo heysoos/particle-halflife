@@ -107,7 +107,9 @@ def main(argv=None):
     html = render_html(result)
 
     out = args.out or _default_out(args.scenario)
-    os.makedirs(os.path.dirname(out), exist_ok=True)
+    out_dir = os.path.dirname(out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(out, 'w', encoding='utf-8') as f:
         f.write(html)
     print(f"[diag] wrote {out}  ({len(html) / 1024:.0f} KB)")
