@@ -112,13 +112,13 @@ _HTML_TEMPLATE = """\
     border-radius: 3px;
   }}
 
-  /* Matrix wrapper — scrollable when large. */
+  /* Matrix wrapper — always shrinks the image to fit; never scrolls.
+     The user explicitly wants the whole matrix visible at once even if
+     individual cells get tiny for big matrices. */
   .matrix-wrap {{
     border: 1px solid #ddd;
     border-radius: 3px;
     padding: 0.5em;
-    overflow: auto;
-    max-height: 800px;
     text-align: center;
     background: #fcfcfd;
   }}
@@ -126,10 +126,6 @@ _HTML_TEMPLATE = """\
     max-width: 100%;
     height: auto;
     display: inline-block;
-  }}
-  .matrix-wrap.large img {{
-    /* For the "all" view, don't shrink — let the scroll handle it. */
-    max-width: none;
   }}
 
   /* Pure-CSS radio toggle. Hide the inputs themselves; style the labels
@@ -168,6 +164,7 @@ _HTML_TEMPLATE = """\
   #t3_size:checked ~ .view-t3-size,
   #t3_topk:checked ~ .view-t3-topk,
   #t3_full:checked ~ .view-t3-full,
+  #t4_size:checked ~ .view-t4-size,
   #t4_topk:checked ~ .view-t4-topk,
   #t4_full:checked ~ .view-t4-full {{
     display: block;
@@ -177,6 +174,7 @@ _HTML_TEMPLATE = """\
   #t3_size:checked ~ .toggle-labels label[for="t3_size"],
   #t3_topk:checked ~ .toggle-labels label[for="t3_topk"],
   #t3_full:checked ~ .toggle-labels label[for="t3_full"],
+  #t4_size:checked ~ .toggle-labels label[for="t4_size"],
   #t4_topk:checked ~ .toggle-labels label[for="t4_topk"],
   #t4_full:checked ~ .toggle-labels label[for="t4_full"] {{
     background: #2c5b8f;
@@ -239,7 +237,7 @@ _HTML_TEMPLATE = """\
     <div class="matrix-wrap"><img src="data:image/png;base64,{img_top_k_matrix}"></div>
   </div>
   <div class="view view-t3-full">
-    <div class="matrix-wrap large"><img src="data:image/png;base64,{img_full_matrix}"></div>
+    <div class="matrix-wrap"><img src="data:image/png;base64,{img_full_matrix}"></div>
   </div>
 </div>
 
@@ -252,17 +250,22 @@ _HTML_TEMPLATE = """\
 
 <h3>Matrix 4b: Observed-composite compatibility</h3>
 <div class="toggle">
-  <input type="radio" name="t4" id="t4_topk" checked>
+  <input type="radio" name="t4" id="t4_size" checked>
+  <input type="radio" name="t4" id="t4_topk">
   <input type="radio" name="t4" id="t4_full">
   <div class="toggle-labels">
-    <label for="t4_topk">Top {top_k}</label>
-    <label for="t4_full">All {n_full_hashes}</label>
+    <label for="t4_size">Size × size</label>
+    <label for="t4_topk">Composite × composite (top {top_k})</label>
+    <label for="t4_full">Composite × composite (all {n_full_hashes})</label>
+  </div>
+  <div class="view view-t4-size">
+    <div class="matrix-wrap"><img src="data:image/png;base64,{img_compat_observed_size}"></div>
   </div>
   <div class="view view-t4-topk">
     <div class="matrix-wrap"><img src="data:image/png;base64,{img_compat_observed_topk}"></div>
   </div>
   <div class="view view-t4-full">
-    <div class="matrix-wrap large"><img src="data:image/png;base64,{img_compat_observed_full}"></div>
+    <div class="matrix-wrap"><img src="data:image/png;base64,{img_compat_observed_full}"></div>
   </div>
 </div>
 
@@ -388,6 +391,19 @@ def render_html(result: RunResult, top_k: int = 30) -> str:
             labels=None,
         )
         n_full_hashes = len(all_hashes)
+
+        # Size-binned view: aggregate the all-observed pairwise matrix into
+        # (max_composite_size+1)² cells by source/product size. Cell = mean
+        # merged BE over all observed type-pairs of that size combination.
+        be_b_size, pbe_b_size, pval_b_size = compatibility.size_pair_compat_matrix(
+            np.array(all_hashes, dtype=np.uint32), all_multisets,
+            result.config, physics,
+        )
+        img_compat_observed_size = plots.plot_compatibility_matrix(
+            be_b_size, pbe_b_size, pval_b_size,
+            title='Size-pair compatibility (mean BE over observed types)',
+            labels=None,
+        )
     else:
         # No composites ever formed — render 1×1 placeholders for both views.
         img_compat_observed_topk = plots.plot_compatibility_matrix(
@@ -395,6 +411,7 @@ def render_html(result: RunResult, top_k: int = 30) -> str:
             title='(no observed composites)',
         )
         img_compat_observed_full = img_compat_observed_topk
+        img_compat_observed_size = img_compat_observed_topk
         n_full_hashes = 0
 
     # Headline derived numbers.
@@ -437,6 +454,7 @@ def render_html(result: RunResult, top_k: int = 30) -> str:
         img_top_k_matrix=img_top_k_matrix,
         img_full_matrix=img_full_matrix,
         img_compat_species=img_compat_species,
+        img_compat_observed_size=img_compat_observed_size,
         img_compat_observed_topk=img_compat_observed_topk,
         img_compat_observed_full=img_compat_observed_full,
         n_fusion=n_fusion, n_fission=n_fission,

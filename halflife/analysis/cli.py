@@ -16,7 +16,18 @@ from halflife.analysis.runner import run_diagnostic
 from halflife.analysis.report import render_html
 
 
-# Each preset is a dict of {field: value} layered on top of SimConfig defaults.
+# Canonical "factory defaults" — the SimConfig values the project was tuned
+# against before the user's running experiments. Layered FIRST, then per-preset
+# overrides, then any --override flags. Without this baseline-like presets
+# would silently inherit whatever the user happens to be currently editing in
+# halflife/config.py (e.g. num_species=3 for current_experiment), making
+# 'baseline' identical to 'current_experiment' until config.py is reverted.
+_FACTORY_DEFAULTS = {
+    'num_species':    12,
+    'half_life_max':  15.0,
+}
+
+# Each preset is a dict of {field: value} layered on top of _FACTORY_DEFAULTS.
 PRESETS = {
     'baseline':           {},
     'current_experiment': {'num_species': 3, 'half_life_max': 100.0},
@@ -60,7 +71,7 @@ def build_config(scenario: str, overrides: dict) -> SimConfig:
         raise SystemExit(
             f"unknown scenario {scenario!r}. Known: {sorted(PRESETS)}"
         )
-    fields = {**PRESETS[scenario], **overrides, 'emit_events': True}
+    fields = {**_FACTORY_DEFAULTS, **PRESETS[scenario], **overrides, 'emit_events': True}
     config = SimConfig(**{**dataclasses.asdict(SimConfig()), **fields})
     # Stash the scenario name for the report header (not a SimConfig field
     # so we just attach as a private attribute via __dict__ since SimConfig

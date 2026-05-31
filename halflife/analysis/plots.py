@@ -82,11 +82,42 @@ def _fig_to_base64(fig: Figure) -> str:
 def _square_matrix_size(n_cells: int) -> float:
     """Square figure side (inches) for an n×n matrix.
 
-    Scales gently with n but clamps to a readable range so a 5-cell matrix
-    doesn't render as a postage stamp and a 500-cell matrix doesn't blow
-    out the page.
+    Caps at 4.6in so even a 500-cell matrix fits comfortably on screen
+    without a scroll wrapper — the user explicitly wants to see the
+    whole matrix in one go, even if individual cells get tiny.
     """
-    return float(np.clip(2.6 + 0.06 * n_cells, 3.5, 7.5))
+    return float(np.clip(2.6 + 0.06 * n_cells, 3.2, 4.6))
+
+
+def _style_matrix_axes(ax, matrix: np.ndarray, labels: List[str] = None):
+    """Apply consistent border + tick styling for heatmap axes.
+
+    Matrix plots use a full 4-sided border (the global rcParams strip
+    top/right for line plots, but for heatmaps the box looks right).
+    Ticks are always shown: labelled when there are few enough, otherwise
+    a coarse evenly-spaced set so the user knows what scale they're at.
+    """
+    # Full 4-sided box, slightly heavier than the line-plot spines.
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(0.7)
+        spine.set_color('#666')
+
+    n_rows, n_cols = matrix.shape
+    if labels is not None and len(labels) <= 32:
+        # Few enough labels to render legibly — show them all.
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=90, fontsize=6.5)
+        ax.set_yticks(range(len(labels)))
+        ax.set_yticklabels(labels, fontsize=6.5)
+    else:
+        # Dense matrices: show ~10 evenly spaced numeric ticks per axis so
+        # the user can read the scale, but no individual cell labels.
+        step_x = max(1, n_cols // 10)
+        step_y = max(1, n_rows // 10)
+        ax.set_xticks(range(0, n_cols, step_x))
+        ax.set_yticks(range(0, n_rows, step_y))
+        ax.tick_params(axis='both', labelsize=6.5)
 
 
 # ── Tier 1: macroscopic time-series ─────────────────────────────────────────
@@ -223,16 +254,7 @@ def plot_transition_matrix(matrix: np.ndarray, labels: List[str] = None,
     else:
         im = ax.imshow(matrix, cmap=cmap, interpolation='nearest')
 
-    # Only show tick labels if there are few enough that they're readable.
-    if labels is not None and len(labels) <= 32:
-        ax.set_xticks(range(len(labels)))
-        ax.set_xticklabels(labels, rotation=90, fontsize=6.5)
-        ax.set_yticks(range(len(labels)))
-        ax.set_yticklabels(labels, fontsize=6.5)
-    else:
-        ax.set_xticks([])
-        ax.set_yticks([])
-
+    _style_matrix_axes(ax, matrix, labels)
     ax.set_xlabel('product')
     ax.set_ylabel('source')
     if title:
@@ -274,15 +296,7 @@ def plot_compatibility_matrix(
             ax.scatter(fail_val_x, fail_val_y,
                        marker='x', color='#333', s=marker_size, alpha=0.6, linewidths=0.5)
 
-    if labels is not None and len(labels) <= 32:
-        ax.set_xticks(range(len(labels)))
-        ax.set_xticklabels(labels, rotation=90, fontsize=6.5)
-        ax.set_yticks(range(len(labels)))
-        ax.set_yticklabels(labels, fontsize=6.5)
-    else:
-        ax.set_xticks([])
-        ax.set_yticks([])
-
+    _style_matrix_axes(ax, be, labels)
     ax.set_xlabel('partner B')
     ax.set_ylabel('partner A')
     if title:

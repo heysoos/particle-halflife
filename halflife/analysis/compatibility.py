@@ -114,3 +114,57 @@ def observed_pair_compat_matrix(
     passes_val = (mfb[:, None] >= 1) & (mfb[None, :] >= 1)
 
     return be, passes_be, passes_val
+
+
+def size_pair_compat_matrix(
+    hashes: np.ndarray,           # (K,) uint32 — unique species_hashes of observed composites
+    multisets: List,              # length K — sorted tuple of species per type
+    config: SimConfig,
+    physics: PhysicsParams,
+):
+    """Size-binned aggregation of the observed-composite compatibility matrix (Matrix 4b, size view).
+
+    For every size pair (i, j) in [1..max_composite_size]², aggregate over all
+    observed composite type pairs (a, b) where size(a)==i and size(b)==j:
+      mean_be[i, j]   — mean merged BE over those pairs
+      passes_be[i, j] — True iff at least one pair passes BE threshold AND
+                        the cell has any observed data
+      passes_val[i,j] — True iff at least half of the pairs pass valence
+
+    Cells with no observed pairs render as NaN (greyed by the plot helper),
+    matching the same visual language as 4a/4b. This answers: "for the
+    composite sizes I'm actually producing, can they chemistry-wise combine?"
+    """
+    M = config.max_composite_size
+    sizes = np.array([len(m) for m in multisets], dtype=np.int32)
+
+    # Compute pairwise merged BE across all observed type pairs (re-uses
+    # observed_pair_compat math; cheap because K is small in practice).
+    be_pair, passes_be_pair, passes_val_pair = observed_pair_compat_matrix(
+        hashes, multisets, config, physics,
+    )
+
+    # Pre-bucket type indices by size for O(1) cell lookup.
+    by_size = {}
+    for idx, s in enumerate(sizes):
+        by_size.setdefault(int(s), []).append(idx)
+
+    be         = np.full((M + 1, M + 1), np.nan, dtype=np.float32)
+    passes_be  = np.zeros((M + 1, M + 1), dtype=bool)
+    passes_val = np.ones((M + 1, M + 1), dtype=bool)
+    for i in range(1, M + 1):
+        a_idx = by_size.get(i)
+        if not a_idx:
+            continue
+        for j in range(1, M + 1):
+            b_idx = by_size.get(j)
+            if not b_idx:
+                continue
+            cell_bes  = be_pair[np.ix_(a_idx, b_idx)]
+            cell_pbe  = passes_be_pair[np.ix_(a_idx, b_idx)]
+            cell_pval = passes_val_pair[np.ix_(a_idx, b_idx)]
+            be[i, j]         = float(cell_bes.mean())
+            passes_be[i, j]  = bool(cell_pbe.any())
+            passes_val[i, j] = bool(cell_pval.mean() >= 0.5)
+
+    return be, passes_be, passes_val
