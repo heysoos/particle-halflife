@@ -2,6 +2,16 @@
 
 Single function: render_html(run_result) → str. Embeds all plots as base64
 PNGs so the output file is fully self-contained (no external assets).
+
+Layout philosophy:
+  - Tier 1 and Tier 2 plots are arranged in a 2-column CSS grid so multiple
+    fit on screen at once.
+  - Tier 3 (empirical transitions) uses ONE matrix display with a radio-button
+    toggle to switch between three views: size × size (default), composite ×
+    composite (top-K), and composite × composite (all observed). Pure CSS,
+    no JavaScript — uses the :checked sibling-combinator pattern.
+  - Tier 4 uses the same toggle UI for the observed-composite compatibility
+    matrix (top-K vs all).
 """
 
 import dataclasses
@@ -20,30 +30,173 @@ _HTML_TEMPLATE = """\
 <meta charset="utf-8">
 <title>Composite Diagnostic — {scenario}</title>
 <style>
-  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-         max-width: 1200px; margin: 1em auto; padding: 0 1em; color: #222; }}
-  h1 {{ border-bottom: 2px solid #444; padding-bottom: 0.3em; }}
-  h2 {{ border-bottom: 1px solid #ccc; padding-bottom: 0.2em; margin-top: 2em; }}
-  .meta {{ background: #f7f7f9; padding: 0.7em 1em; border-radius: 4px; font-family: monospace; font-size: 0.9em; }}
-  .stat-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.7em; margin: 1em 0; }}
-  .stat {{ background: #f0f0f5; padding: 0.7em; border-radius: 4px; text-align: center; }}
-  .stat .num {{ font-size: 1.5em; font-weight: bold; color: #1f77b4; }}
-  .stat .label {{ font-size: 0.85em; color: #666; }}
-  .full-matrix {{ max-width: 100%; max-height: 800px; overflow: scroll;
-                  border: 1px solid #ccc; padding: 0.5em; margin-top: 0.5em; }}
-  img {{ max-width: 100%; height: auto; }}
-  footer {{ font-size: 0.85em; color: #888; margin-top: 2em; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif;
+    max-width: 1280px;
+    margin: 1.5em auto;
+    padding: 0 1.5em;
+    color: #222;
+    line-height: 1.4;
+  }}
+  h1 {{
+    font-size: 1.5em;
+    border-bottom: 2px solid #444;
+    padding-bottom: 0.3em;
+    margin-bottom: 0.6em;
+  }}
+  h2 {{
+    font-size: 1.15em;
+    border-bottom: 1px solid #ccc;
+    padding-bottom: 0.2em;
+    margin-top: 2em;
+    color: #333;
+  }}
+  h3 {{
+    font-size: 0.95em;
+    color: #555;
+    margin-top: 1.2em;
+    margin-bottom: 0.4em;
+    font-weight: 600;
+  }}
+  p {{ font-size: 0.9em; }}
+  p.note {{ color: #666; margin-top: -0.2em; font-style: italic; }}
+
+  .meta {{
+    background: #f7f7f9;
+    padding: 0.6em 0.9em;
+    border-radius: 4px;
+    border-left: 3px solid #888;
+    font-family: SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.8em;
+    line-height: 1.55;
+  }}
+
+  .stat-grid {{
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.6em;
+    margin: 1em 0 1.4em 0;
+  }}
+  .stat {{
+    background: #f0f1f5;
+    padding: 0.6em;
+    border-radius: 4px;
+    text-align: center;
+  }}
+  .stat .num {{
+    font-size: 1.4em;
+    font-weight: 700;
+    color: #2c5b8f;
+    line-height: 1.1;
+  }}
+  .stat .label {{
+    font-size: 0.75em;
+    color: #666;
+    margin-top: 0.15em;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }}
+
+  /* Two-column grid for time-series plots (Tier 1 / Tier 2). */
+  .plot-grid {{
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0.6em 1em;
+    margin-top: 0.4em;
+  }}
+  .plot-grid img {{
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    border: 1px solid #eee;
+    border-radius: 3px;
+  }}
+
+  /* Matrix wrapper — scrollable when large. */
+  .matrix-wrap {{
+    border: 1px solid #ddd;
+    border-radius: 3px;
+    padding: 0.5em;
+    overflow: auto;
+    max-height: 800px;
+    text-align: center;
+    background: #fcfcfd;
+  }}
+  .matrix-wrap img {{
+    max-width: 100%;
+    height: auto;
+    display: inline-block;
+  }}
+  .matrix-wrap.large img {{
+    /* For the "all" view, don't shrink — let the scroll handle it. */
+    max-width: none;
+  }}
+
+  /* Pure-CSS radio toggle. Hide the inputs themselves; style the labels
+     as a button-strip; use :checked + sibling-combinator to reveal the
+     matching view. */
+  .toggle {{
+    margin: 0.4em 0 0.6em 0;
+  }}
+  .toggle input[type="radio"] {{
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+  }}
+  .toggle .toggle-labels {{
+    display: inline-flex;
+    border: 1px solid #bbb;
+    border-radius: 4px;
+    overflow: hidden;
+    font-size: 0.8em;
+  }}
+  .toggle label {{
+    padding: 0.35em 0.85em;
+    cursor: pointer;
+    background: #f5f5f7;
+    color: #444;
+    border-right: 1px solid #ddd;
+    user-select: none;
+    transition: background 0.1s;
+  }}
+  .toggle label:last-of-type {{ border-right: none; }}
+  .toggle label:hover {{ background: #e8e8ec; }}
+
+  .toggle .view {{ display: none; }}
+
+  /* Per-toggle-group :checked selectors — one rule per radio id. */
+  #t3_size:checked ~ .view-t3-size,
+  #t3_topk:checked ~ .view-t3-topk,
+  #t3_full:checked ~ .view-t3-full,
+  #t4_topk:checked ~ .view-t4-topk,
+  #t4_full:checked ~ .view-t4-full {{
+    display: block;
+  }}
+
+  /* "Active" highlight for the selected label. */
+  #t3_size:checked ~ .toggle-labels label[for="t3_size"],
+  #t3_topk:checked ~ .toggle-labels label[for="t3_topk"],
+  #t3_full:checked ~ .toggle-labels label[for="t3_full"],
+  #t4_topk:checked ~ .toggle-labels label[for="t4_topk"],
+  #t4_full:checked ~ .toggle-labels label[for="t4_full"] {{
+    background: #2c5b8f;
+    color: white;
+  }}
+
+  footer {{
+    font-size: 0.8em;
+    color: #888;
+    margin-top: 2.5em;
+    padding-top: 0.8em;
+    border-top: 1px solid #eee;
+  }}
 </style>
 </head><body>
 <h1>Composite Diagnostic Report</h1>
 <div class="meta">
-  <strong>Scenario:</strong> {scenario}<br>
-  <strong>Seed:</strong> {seed} &nbsp; <strong>Steps:</strong> {n_steps} &nbsp; <strong>Sample every:</strong> {sample_every}<br>
+  <strong>Scenario:</strong> {scenario} &nbsp; <strong>Seed:</strong> {seed} &nbsp; <strong>Steps:</strong> {n_steps} &nbsp; <strong>Sample every:</strong> {sample_every}<br>
   <strong>Wall time:</strong> {wall:.1f}s &nbsp; <strong>Git SHA:</strong> {git_sha}<br>
-  <strong>Config:</strong> num_particles={num_particles}, num_species={num_species},
-   max_composite_size={max_composite_size}, max_valence={max_valence},
-   use_valence={use_valence}, bond_mode={bond_mode},
-   fusion_threshold={fusion_threshold}, half_life_min={half_life_min}, half_life_max={half_life_max}<br>
+  <strong>Config:</strong> num_particles={num_particles}, num_species={num_species}, max_composite_size={max_composite_size}, max_valence={max_valence}, use_valence={use_valence}, bond_mode={bond_mode}, fusion_threshold={fusion_threshold}, half_life_min={half_life_min}, half_life_max={half_life_max}<br>
   <strong>Per-species valences:</strong> {valences}
 </div>
 
@@ -51,42 +204,70 @@ _HTML_TEMPLATE = """\
   <div class="stat"><div class="num">{peak_max_size}</div><div class="label">peak max size</div></div>
   <div class="stat"><div class="num">{final_max_size}</div><div class="label">final max size</div></div>
   <div class="stat"><div class="num">{mean_alive:.1f}</div><div class="label">mean alive count</div></div>
-  <div class="stat"><div class="num">{degree_sat:.0%}</div><div class="label">mean degree saturation</div></div>
+  <div class="stat"><div class="num">{degree_sat:.0%}</div><div class="label">mean degree sat.</div></div>
 </div>
 
 <h2>Tier 1 — Macroscopic time series</h2>
-<img src="data:image/png;base64,{img_size_trajectory}">
-<img src="data:image/png;base64,{img_size_dist}">
-<img src="data:image/png;base64,{img_free_particle}">
+<div class="plot-grid">
+  <img src="data:image/png;base64,{img_size_trajectory}">
+  <img src="data:image/png;base64,{img_size_dist}">
+  <img src="data:image/png;base64,{img_free_particle}">
+</div>
 
 <h2>Tier 2 — Valence / edge structure</h2>
-<img src="data:image/png;base64,{img_degree_sat}">
-<img src="data:image/png;base64,{img_free_bonds}">
-<img src="data:image/png;base64,{img_edges_rings}">
+<div class="plot-grid">
+  <img src="data:image/png;base64,{img_degree_sat}">
+  <img src="data:image/png;base64,{img_free_bonds}">
+  <img src="data:image/png;base64,{img_edges_rings}">
+</div>
 
 <h2>Tier 3 — Chemical network (empirical)</h2>
-<p><em>Built from {n_fusion} fusion events + {n_fission} fission events. Each
-event contributes 2 cells.</em></p>
-<h3>Matrix 1: Size × size mass-flow</h3>
-<img src="data:image/png;base64,{img_size_bin_matrix}">
-<h3>Matrix 2: Top-K composite types</h3>
-<img src="data:image/png;base64,{img_top_k_matrix}">
-<h3>Matrix 3: Every observed composite type</h3>
-<div class="full-matrix"><img src="data:image/png;base64,{img_full_matrix}"></div>
+<p class="note">Built from {n_fusion} fusion events + {n_fission} fission events. Each event contributes 2 cells (fusion: A→C, B→C; fission: C→A, C→B). Toggle the binning below.</p>
+<div class="toggle">
+  <input type="radio" name="t3" id="t3_size" checked>
+  <input type="radio" name="t3" id="t3_topk">
+  <input type="radio" name="t3" id="t3_full">
+  <div class="toggle-labels">
+    <label for="t3_size">Size × size</label>
+    <label for="t3_topk">Composite × composite (top {top_k})</label>
+    <label for="t3_full">Composite × composite (all {n_full_hashes})</label>
+  </div>
+  <div class="view view-t3-size">
+    <div class="matrix-wrap"><img src="data:image/png;base64,{img_size_bin_matrix}"></div>
+  </div>
+  <div class="view view-t3-topk">
+    <div class="matrix-wrap"><img src="data:image/png;base64,{img_top_k_matrix}"></div>
+  </div>
+  <div class="view view-t3-full">
+    <div class="matrix-wrap large"><img src="data:image/png;base64,{img_full_matrix}"></div>
+  </div>
+</div>
 
 <h2>Tier 4 — Fusion compatibility (theoretical)</h2>
-<p><em>Pure chemistry — what <strong>could</strong> happen if these pairs met.
-Greyed cells fail the BE threshold; cells with × markers fail the valence gate
-even at structural max. Compare against Tier 3 Matrix 2 (same sort) to see
-which compatible pairs never fired empirically.</em></p>
-<h3>Matrix 4a: Species-pair</h3>
-<img src="data:image/png;base64,{img_compat_species}">
-<h3>Matrix 4b: Top-K observed-composite</h3>
-<img src="data:image/png;base64,{img_compat_observed}">
+<p class="note">Pure chemistry — what <strong>could</strong> happen if these pairs met. Greyed cells fail the BE threshold; small × markers mark pairs that fail the valence gate even at their structural maximum.</p>
+<p class="note">Compare Tier 4 against Tier 3: bright cells in Tier 4 that are cold in Tier 3 are pairs that <em>could</em> fuse but never did — kinetic limitation, or valence-saturated by pre-existing edges.</p>
+
+<h3>Matrix 4a: Species-pair compatibility</h3>
+<div class="matrix-wrap"><img src="data:image/png;base64,{img_compat_species}"></div>
+
+<h3>Matrix 4b: Observed-composite compatibility</h3>
+<div class="toggle">
+  <input type="radio" name="t4" id="t4_topk" checked>
+  <input type="radio" name="t4" id="t4_full">
+  <div class="toggle-labels">
+    <label for="t4_topk">Top {top_k}</label>
+    <label for="t4_full">All {n_full_hashes}</label>
+  </div>
+  <div class="view view-t4-topk">
+    <div class="matrix-wrap"><img src="data:image/png;base64,{img_compat_observed_topk}"></div>
+  </div>
+  <div class="view view-t4-full">
+    <div class="matrix-wrap large"><img src="data:image/png;base64,{img_compat_observed_full}"></div>
+  </div>
+</div>
 
 <footer>
-  Generated by halflife.analysis on {timestamp}.
-  JAX platform: {jax_platform}.
+  Generated by halflife.analysis on {timestamp}. JAX platform: {jax_platform}.
 </footer>
 </body></html>
 """
@@ -126,7 +307,7 @@ def _unique_multisets_from_snapshots(snapshots, particles_species: np.ndarray = 
     return seen, incidence
 
 
-def render_html(result: RunResult) -> str:
+def render_html(result: RunResult, top_k: int = 30) -> str:
     """Build a single self-contained HTML string from a RunResult."""
     from halflife.state import (
         initialize_world,
@@ -149,56 +330,72 @@ def render_html(result: RunResult) -> str:
     img_free_bonds      = plots.plot_free_bonds_heatmap(result.per_step_metrics)
     img_edges_rings     = plots.plot_edge_and_ring_counts(result.per_step_metrics)
 
-    # Tier 3 matrices.
+    # Tier 3 matrices — all three views always rendered, the report's
+    # CSS toggle picks which one is displayed.
     M_size_bin = transitions.size_bin_transition_matrix(
         result.events, result.config.max_composite_size
     )
-    M_top_k, top_k_labels = transitions.top_k_transition_matrix(result.events, K=30)
+    M_top_k, top_k_labels = transitions.top_k_transition_matrix(result.events, K=top_k)
     M_full, full_labels = transitions.full_transition_matrix(result.events)
 
     img_size_bin_matrix = plots.plot_transition_matrix(
-        M_size_bin, title='Matrix 1: Size-class transitions (rows=source, cols=product)',
+        M_size_bin, title='Size-class transitions (rows = source, cols = product)',
     )
     img_top_k_matrix = plots.plot_transition_matrix(
-        M_top_k, labels=top_k_labels, title='Matrix 2: Top-K composite-type transitions',
+        M_top_k, labels=top_k_labels,
+        title=f'Top-{top_k} composite-type transitions',
     )
     img_full_matrix = plots.plot_transition_matrix(
         M_full, labels=None,  # too many to show
-        title=f'Matrix 3: All {len(full_labels)} observed composite types',
+        title=f'All {len(full_labels)} observed composite types',
     )
 
-    # Tier 4 compatibility matrices.
+    # Tier 4 — Matrix 4a is species-pair (always small). Matrix 4b now has
+    # both a top-K and an all-observed view, mirroring Tier 3's structure.
     be_a, pbe_a, pval_a = compatibility.species_pair_compat_matrix(result.config, physics)
     img_compat_species = plots.plot_compatibility_matrix(
         be_a, pbe_a, pval_a,
-        title='Matrix 4a: Species-pair fusion compatibility',
+        title='Species-pair compatibility',
         labels=[f's{i}' for i in range(result.config.num_species)],
     )
 
-    # For Matrix 4b, build the same top-K hash list used by Matrix 2 (sorted by size).
-    # Reconstruct multisets by re-walking incidence + snapshots.
     seen, incidence = _unique_multisets_from_snapshots(result.snapshots, particles_species)
     if seen:
-        # Pick top-K by incidence then sort by size,hash for stable display.
         from collections import Counter
-        top_hashes = [h for h, _ in Counter(incidence).most_common(30)]
-        top_hashes.sort(key=lambda h: (len(seen.get(h, ())), h))
-        top_multisets = [seen.get(h, ()) for h in top_hashes]
-        top_hashes_arr = np.array(top_hashes, dtype=np.uint32)
-        be_b, pbe_b, pval_b = compatibility.observed_pair_compat_matrix(
-            top_hashes_arr, top_multisets, result.config, physics,
+        # Top-K view: K most-trafficked hashes by incidence, sorted by size then hash.
+        topk_hashes = [h for h, _ in Counter(incidence).most_common(top_k)]
+        topk_hashes.sort(key=lambda h: (len(seen.get(h, ())), h))
+        topk_multisets = [seen.get(h, ()) for h in topk_hashes]
+        be_b_topk, pbe_b_topk, pval_b_topk = compatibility.observed_pair_compat_matrix(
+            np.array(topk_hashes, dtype=np.uint32), topk_multisets, result.config, physics,
         )
-        img_compat_observed = plots.plot_compatibility_matrix(
-            be_b, pbe_b, pval_b,
-            title='Matrix 4b: Top-K observed-composite compatibility',
-            labels=[f"0x{h:08x}" for h in top_hashes],
+        img_compat_observed_topk = plots.plot_compatibility_matrix(
+            be_b_topk, pbe_b_topk, pval_b_topk,
+            title=f'Top-{top_k} observed-composite compatibility',
+            labels=[f"0x{h:08x}" for h in topk_hashes],
         )
+
+        # All-observed view: every unique hash seen across snapshots, sorted by size.
+        all_hashes = sorted(seen.keys(), key=lambda h: (len(seen[h]), h))
+        all_multisets = [seen[h] for h in all_hashes]
+        be_b_full, pbe_b_full, pval_b_full = compatibility.observed_pair_compat_matrix(
+            np.array(all_hashes, dtype=np.uint32), all_multisets, result.config, physics,
+        )
+        # Don't pass labels for the full view — too many to draw legibly.
+        img_compat_observed_full = plots.plot_compatibility_matrix(
+            be_b_full, pbe_b_full, pval_b_full,
+            title=f'All {len(all_hashes)} observed-composite compatibility',
+            labels=None,
+        )
+        n_full_hashes = len(all_hashes)
     else:
-        # No composites ever formed — render a 1x1 placeholder.
-        img_compat_observed = plots.plot_compatibility_matrix(
+        # No composites ever formed — render 1×1 placeholders for both views.
+        img_compat_observed_topk = plots.plot_compatibility_matrix(
             np.zeros((1, 1)), np.zeros((1, 1), bool), np.ones((1, 1), bool),
-            title='Matrix 4b: (no observed composites)',
+            title='(no observed composites)',
         )
+        img_compat_observed_full = img_compat_observed_topk
+        n_full_hashes = 0
 
     # Headline derived numbers.
     peak_max_size  = int(result.per_step_metrics['max_size'].max())
@@ -240,8 +437,11 @@ def render_html(result: RunResult) -> str:
         img_top_k_matrix=img_top_k_matrix,
         img_full_matrix=img_full_matrix,
         img_compat_species=img_compat_species,
-        img_compat_observed=img_compat_observed,
+        img_compat_observed_topk=img_compat_observed_topk,
+        img_compat_observed_full=img_compat_observed_full,
         n_fusion=n_fusion, n_fission=n_fission,
+        top_k=top_k,
+        n_full_hashes=n_full_hashes,
         jax_platform=jax.default_backend(),
         timestamp=datetime.datetime.now().isoformat(timespec='seconds'),
     )

@@ -49,11 +49,15 @@ def test_full_pipeline_produces_html_with_all_sections():
     assert '<h2>Tier 4' in html
     # Plot images present (base64 PNG prefix).
     assert 'data:image/png;base64,' in html
-    # Headline stats rendered.
+    # Headline stats rendered (label text from the stat grid).
     assert 'peak max size' in html
-    assert 'mean degree saturation' in html
-    # At least one of the three transition matrices populated.
-    assert 'Matrix 1' in html
+    assert 'mean degree sat' in html
+    # Tier 3 toggle UI present.
+    assert 'Size \xd7 size' in html
+    assert 'Composite \xd7 composite' in html
+    # Tier 4 sub-section present.
+    assert 'Matrix 4a' in html
+    assert 'Matrix 4b' in html
 
 
 def test_cli_writes_file(tmp_path):
