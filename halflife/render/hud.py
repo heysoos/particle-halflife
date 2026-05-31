@@ -419,9 +419,12 @@ class HUDPainter:
         base_h = 22 + 20 + 8 * 15 + 8
         comp_h = 0
         if comp is not None:
-            # divider(8) + section title(18) + 5 kv rows(15) + members
-            # label(15) + chip rows(~16 each, estimate 1-2 rows) + pad
-            est_chip_rows = max(1, (len(comp['members']) + 7) // 8)
+            # divider(8) + section title(18) + 5 kv rows(15) + formula
+            # label(15) + chip rows(~18 each). Chips now aggregate by
+            # species (chemical-formula style), so the row count scales with
+            # the number of *distinct* species, not the total member count.
+            n_distinct = len(set(comp['members']))
+            est_chip_rows = max(1, (n_distinct + 4) // 5)
             comp_h = 8 + 18 + 5 * 15 + 15 + est_chip_rows * 18 + 8
         panel_w = 235
         panel_h = base_h + comp_h + 6
@@ -511,26 +514,43 @@ class HUDPainter:
                 total_v = sum(int(r._species_valence[s]) for s in comp['members'])
                 kv("Free bonds", f"{comp['free_bonds']} / {total_v}")
 
-            # Members chips — wrap onto multiple rows if needed.
-            ml = font.render("Members", True, LABEL_FG)
+            # Formula row — one colored dot per distinct species followed by
+            # a subscript-style count (drawn in a smaller font, baseline-
+            # shifted). Count is omitted when 1, just like real chemical
+            # formulas (H₂O, not H₂O₁). Packed tightly: dots butt up against
+            # the preceding subscript so the row reads as one molecule.
+            from collections import Counter
+            counts = Counter(int(s) for s in comp['members'])
+            sorted_species = sorted(counts.keys())
+
+            ml = font.render("Formula", True, LABEL_FG)
             surface.blit(ml, (x_text, y))
             y += 16
-            chip_x = x_text
-            chip_h = 16
-            for s in comp['members']:
-                crgb = self._species_display_rgb(s)
-                txt = font.render(str(int(s)), True, VALUE_FG)
-                cw = txt.get_width() + 16
-                if chip_x + cw > panel_x + panel_w - 10:
+            small_font = self.r._font_small
+            dot_r      = 5            # circle radius for each "atom"
+            row_h      = 16           # row height (dot + subscript fits)
+            x_right    = panel_x + panel_w - 8
+            chip_x     = x_text
+            for sp in sorted_species:
+                n = counts[sp]
+                crgb = self._species_display_rgb(sp)
+                sub_txt = small_font.render(str(n), True, VALUE_FG) if n > 1 else None
+                sub_w   = sub_txt.get_width() if sub_txt is not None else 0
+                glyph_w = 2 * dot_r + sub_w + (1 if sub_txt is not None else 2)
+
+                if chip_x + glyph_w > x_right:
                     chip_x = x_text
-                    y += chip_h + 2
-                chip_rect = pygame.Rect(chip_x, y, cw, chip_h)
-                pygame.draw.rect(surface, (70, 100, 150, 46), chip_rect, border_radius=3)
+                    y += row_h
+
                 pygame.draw.circle(surface, crgb,
-                                   (chip_rect.left + 6, chip_rect.centery), 4)
-                surface.blit(txt, (chip_rect.left + 12,
-                                   chip_rect.centery - txt.get_height() // 2))
-                chip_x += cw + 4
+                                   (chip_x + dot_r, y + row_h // 2), dot_r)
+                if sub_txt is not None:
+                    # Drop the subscript below the dot's vertical center so
+                    # it reads as a chemistry subscript rather than a label.
+                    sx = chip_x + 2 * dot_r
+                    sy = y + row_h // 2 + 1
+                    surface.blit(sub_txt, (sx, sy))
+                chip_x += glyph_w
 
     # ── Entry point ───────────────────────────────────────────────────────────
 

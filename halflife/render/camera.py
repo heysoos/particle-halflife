@@ -40,6 +40,11 @@ class Camera:
         # particle fills the screen at default sprite sizes.
         self.view_scale_min = 0.25
         self.view_scale_max = 40.0
+        # Per-frame easing factor for follow(). 1.0 = instant snap (jittery
+        # because the camera inherits every micro-vibration of the tracked
+        # particle); lower values low-pass the motion at the cost of some
+        # tracking lag. 0.2 ≈ ~3-frame half-life of high-frequency jitter.
+        self.follow_alpha = 0.2
 
     def reset(self) -> None:
         """Reset pan and zoom to defaults (world midpoint, scale 1.0)."""
@@ -101,16 +106,47 @@ class Camera:
                                             half_h, config.world_height - half_h))
 
     def follow(self, wx: float, wy: float) -> None:
-        """Center the view on world point (wx, wy), clamped to world bounds.
+        """Smoothly center the view on world point (wx, wy), clamped to bounds.
 
         Called per-frame by Renderer.update() while a particle is selected
-        and the camera is zoomed in. Clamping keeps the view from drifting
-        outside [0, world_width] x [0, world_height] even when the tracked
-        particle hugs an edge — the particle then sits off-center inside
-        the window rather than the window scrolling into empty void.
+        and the camera is zoomed in. Uses exponential easing (follow_alpha)
+        so high-frequency vibration of the tracked particle doesn't transfer
+        directly into the camera — gives a "cinematic" follow instead of a
+        rigid lock. Clamping keeps the view from drifting outside the world
+        even when the tracked particle hugs an edge.
+
+        Periodic boundary handling: the lerp uses the shortest signed path
+        under wrap (min-image delta), so the camera takes the short way
+        around rather than racing across the whole world. When the *raw*
+        displacement exceeds half a world (the particle just wrapped, or
+        the user freshly selected a faraway particle), we snap instead of
+        easing — easing across a wrap would scroll through empty space,
+        since the renderer doesn't tile the world.
         """
-        self.view_center[0] = float(wx)
-        self.view_center[1] = float(wy)
+        cx, cy = self.view_center
+        raw_dx = float(wx) - cx
+        raw_dy = float(wy) - cy
+        dx, dy = raw_dx, raw_dy
+        periodic = (self.config.boundary_mode == "periodic")
+        if periodic:
+            W = self.config.world_width
+            H = self.config.world_height
+            dx -= W * round(dx / W)
+            dy -= H * round(dy / H)
+
+        big_jump = (abs(raw_dx) > self.config.world_width  * 0.5 or
+                    abs(raw_dy) > self.config.world_height * 0.5)
+        if big_jump:
+            # Wrap or distant re-selection — teleport so the target stays
+            # visible instead of easing across the (untiled) void.
+            self.view_center[0] = float(wx)
+            self.view_center[1] = float(wy)
+        else:
+            self.view_center[0] = cx + self.follow_alpha * dx
+            self.view_center[1] = cy + self.follow_alpha * dy
+            if periodic:
+                self.view_center[0] %= self.config.world_width
+                self.view_center[1] %= self.config.world_height
         self.clamp_to_world()
 
     def pan_by(self, dx_pixels: int, dy_pixels: int) -> None:

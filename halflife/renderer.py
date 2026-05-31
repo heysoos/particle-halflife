@@ -649,6 +649,10 @@ class Renderer:
         self._n_particles_to_draw = 0
         self._n_bond_vertices = 0
         self._font = pygame.font.SysFont('monospace', 13)
+        # Smaller font for subscript-style counts in the inspector "Formula"
+        # row (e.g. the "₂" in H₂O). Drawn at a baseline-shifted offset so
+        # it reads as a chemical-formula subscript.
+        self._font_small = pygame.font.SysFont('monospace', 10)
         self._clock = pygame.time.Clock()
 
         self._show_stats  = False
