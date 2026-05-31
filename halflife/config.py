@@ -29,7 +29,7 @@ class SimConfig:
 
     # ── Particles ────────────────────────────────────────────────────────────
     num_particles: int = 5_000      # total particle count (fixed, all always alive)
-    num_species: int = 12           # number of distinct particle types
+    num_species: int = 3           # number of distinct particle types
     state_dim: int = 8              # internal state vector size (NCA-style, future use)
 
     # ── Composites ───────────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ class SimConfig:
     # ── Decay / Half-life ────────────────────────────────────────────────────
     # Composite half-lives are derived from their species hash using this range
     half_life_min: float = 1.0       # shortest composite half-life (sim time units)
-    half_life_max: float = 15.0      # longest composite half-life
+    half_life_max: float = 100.0      # longest composite half-life
 
     # ── Energy ───────────────────────────────────────────────────────────────
     # Kinetic energy scale at initialization (controls initial temperature)
