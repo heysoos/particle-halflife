@@ -341,15 +341,22 @@ def render_html(result: RunResult, top_k: int = 30) -> str:
     M_top_k, top_k_labels = transitions.top_k_transition_matrix(result.events, K=top_k)
     M_full, full_labels = transitions.full_transition_matrix(result.events)
 
+    # Size-binned: explicit size labels '0', '1', …, 'M' so axis ticks
+    # mean what they look like (the row/col IS the size class).
+    size_labels = [str(i) for i in range(M_size_bin.shape[0])]
     img_size_bin_matrix = plots.plot_transition_matrix(
-        M_size_bin, title='Size-class transitions (rows = source, cols = product)',
+        M_size_bin, labels=size_labels,
+        title='Size-class transitions (rows = source size, cols = product size)',
     )
     img_top_k_matrix = plots.plot_transition_matrix(
         M_top_k, labels=top_k_labels,
         title=f'Top-{top_k} composite-type transitions',
     )
+    # All-observed: composite-indexed, NOT size-indexed. Hide ticks so
+    # the integer positions don't get mistaken for size values; the
+    # axis label communicates the sort order instead.
     img_full_matrix = plots.plot_transition_matrix(
-        M_full, labels=None,  # too many to show
+        M_full, labels=None, hide_dense_ticks=True,
         title=f'All {len(full_labels)} observed composite types',
     )
 
@@ -385,24 +392,28 @@ def render_html(result: RunResult, top_k: int = 30) -> str:
             np.array(all_hashes, dtype=np.uint32), all_multisets, result.config, physics,
         )
         # Don't pass labels for the full view — too many to draw legibly.
+        # hide_dense_ticks: the integer indices would otherwise look like
+        # sizes; they're actually positions in a sorted-by-size list.
         img_compat_observed_full = plots.plot_compatibility_matrix(
             be_b_full, pbe_b_full, pval_b_full,
             title=f'All {len(all_hashes)} observed-composite compatibility',
-            labels=None,
+            labels=None, hide_dense_ticks=True,
         )
         n_full_hashes = len(all_hashes)
 
         # Size-binned view: aggregate the all-observed pairwise matrix into
         # (max_composite_size+1)² cells by source/product size. Cell = mean
         # merged BE over all observed type-pairs of that size combination.
+        # Pass explicit size labels so the ticks read as sizes, not indices.
         be_b_size, pbe_b_size, pval_b_size = compatibility.size_pair_compat_matrix(
             np.array(all_hashes, dtype=np.uint32), all_multisets,
             result.config, physics,
         )
+        size_compat_labels = [str(i) for i in range(be_b_size.shape[0])]
         img_compat_observed_size = plots.plot_compatibility_matrix(
             be_b_size, pbe_b_size, pval_b_size,
             title='Size-pair compatibility (mean BE over observed types)',
-            labels=None,
+            labels=size_compat_labels,
         )
     else:
         # No composites ever formed — render 1×1 placeholders for both views.

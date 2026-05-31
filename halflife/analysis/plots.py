@@ -89,13 +89,23 @@ def _square_matrix_size(n_cells: int) -> float:
     return float(np.clip(2.6 + 0.06 * n_cells, 3.2, 4.6))
 
 
-def _style_matrix_axes(ax, matrix: np.ndarray, labels: List[str] = None):
+def _style_matrix_axes(ax, matrix: np.ndarray, labels: List[str] = None,
+                       hide_dense_ticks: bool = False):
     """Apply consistent border + tick styling for heatmap axes.
 
     Matrix plots use a full 4-sided border (the global rcParams strip
     top/right for line plots, but for heatmaps the box looks right).
-    Ticks are always shown: labelled when there are few enough, otherwise
-    a coarse evenly-spaced set so the user knows what scale they're at.
+
+    Tick policy:
+      - labels provided AND short enough (≤32) → show all labels
+      - labels provided BUT too long → fall back to coarse numeric ticks
+        (the numbers are sensible — they're indices into the label list,
+        i.e. row/col positions, which is what the labels would name)
+      - labels is None AND hide_dense_ticks=True → hide ticks completely
+        (used for composite-indexed dense matrices where integer ticks
+        would falsely suggest "size" semantics)
+      - labels is None AND hide_dense_ticks=False → numeric ticks
+        (used for size-indexed matrices where ticks ARE the size class)
     """
     # Full 4-sided box, slightly heavier than the line-plot spines.
     for spine in ax.spines.values():
@@ -110,9 +120,13 @@ def _style_matrix_axes(ax, matrix: np.ndarray, labels: List[str] = None):
         ax.set_xticklabels(labels, rotation=90, fontsize=6.5)
         ax.set_yticks(range(len(labels)))
         ax.set_yticklabels(labels, fontsize=6.5)
+    elif hide_dense_ticks:
+        # Composite-indexed dense matrix — integer ticks would mislead.
+        ax.set_xticks([])
+        ax.set_yticks([])
     else:
-        # Dense matrices: show ~10 evenly spaced numeric ticks per axis so
-        # the user can read the scale, but no individual cell labels.
+        # Size-indexed (or otherwise meaningful) dense matrix: show ~10
+        # evenly spaced numeric ticks per axis so the user knows the scale.
         step_x = max(1, n_cols // 10)
         step_y = max(1, n_rows // 10)
         ax.set_xticks(range(0, n_cols, step_x))
@@ -224,7 +238,8 @@ def plot_edge_and_ring_counts(per_step: Dict[str, np.ndarray]) -> str:
 
 def plot_transition_matrix(matrix: np.ndarray, labels: List[str] = None,
                            title: str = '', cmap: str = 'rocket_r',
-                           log_color: bool = True) -> str:
+                           log_color: bool = True,
+                           hide_dense_ticks: bool = False) -> str:
     """Render a transition matrix (any size) as a heatmap.
 
     The `rocket_r` colormap (matplotlib via seaborn-style palette) reads
@@ -254,9 +269,9 @@ def plot_transition_matrix(matrix: np.ndarray, labels: List[str] = None,
     else:
         im = ax.imshow(matrix, cmap=cmap, interpolation='nearest')
 
-    _style_matrix_axes(ax, matrix, labels)
-    ax.set_xlabel('product')
-    ax.set_ylabel('source')
+    _style_matrix_axes(ax, matrix, labels, hide_dense_ticks=hide_dense_ticks)
+    ax.set_xlabel('product' + (' (sorted by size →)' if hide_dense_ticks else ''))
+    ax.set_ylabel('source' + (' (sorted by size →)' if hide_dense_ticks else ''))
     if title:
         ax.set_title(title)
 
@@ -269,6 +284,7 @@ def plot_transition_matrix(matrix: np.ndarray, labels: List[str] = None,
 def plot_compatibility_matrix(
     be: np.ndarray, passes_be: np.ndarray, passes_val: np.ndarray,
     title: str = '', labels: List[str] = None,
+    hide_dense_ticks: bool = False,
 ) -> str:
     """Tier 4: merged BE colormap with grey-out for failed BE and × for failed valence."""
     if be.size == 0:
@@ -296,9 +312,9 @@ def plot_compatibility_matrix(
             ax.scatter(fail_val_x, fail_val_y,
                        marker='x', color='#333', s=marker_size, alpha=0.6, linewidths=0.5)
 
-    _style_matrix_axes(ax, be, labels)
-    ax.set_xlabel('partner B')
-    ax.set_ylabel('partner A')
+    _style_matrix_axes(ax, be, labels, hide_dense_ticks=hide_dense_ticks)
+    ax.set_xlabel('partner B' + (' (sorted by size →)' if hide_dense_ticks else ''))
+    ax.set_ylabel('partner A' + (' (sorted by size →)' if hide_dense_ticks else ''))
     if title:
         ax.set_title(title)
 
