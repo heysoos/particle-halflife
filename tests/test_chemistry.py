@@ -577,10 +577,10 @@ def test_config_has_bond_mode_fields():
     """SimConfig exposes the new bond-mode knobs with safe defaults."""
     config = SimConfig()
     assert config.bond_mode in ("edges", "star_spring", "off")
-    assert config.bond_mode == "star_spring", "Default should preserve current behavior"
+    assert config.bond_mode == "edges", "Default is the covalent edges kernel"
     assert config.k_bond > 0
-    assert config.r_rest_min > 0
-    assert config.r_rest_max > config.r_rest_min
+    # Bond rest lengths span [repulsion_radius, fusion_radius] — no longer
+    # absolute config bounds. See test_r_rest_spans_hard_core_to_fusion_radius_and_rescales.
     assert isinstance(config.allow_ring_closure, bool)
     assert config.max_ring_closures_per_step > 0
     # Derived: E_max = M * max_valence // 2
@@ -605,17 +605,41 @@ if __name__ == '__main__':
 
 
 def test_r_rest_matrix_shape_and_symmetry():
-    """r_rest is (S, S), symmetric, and values fall in [r_rest_min, r_rest_max]."""
+    """r_rest is (S, S), symmetric, and values fall in [repulsion_radius, fusion_radius]."""
     config = SimConfig(num_species=5, bond_mode="edges")
     params = initialize_interaction_params(config, seed=42)
     assert params.r_rest.shape == (5, 5)
     # Symmetric: r_rest[i, j] == r_rest[j, i]
     diff = np.asarray(params.r_rest - params.r_rest.T)
     assert np.max(np.abs(diff)) < 1e-6, f"r_rest is not symmetric: max diff {np.max(np.abs(diff))}"
-    # In range
+    # In range: hash-derived span of [repulsion_radius, fusion_radius]
     vals = np.asarray(params.r_rest)
-    assert vals.min() >= config.r_rest_min - 1e-6
-    assert vals.max() <= config.r_rest_max + 1e-6
+    assert vals.min() >= config.repulsion_radius - 1e-6
+    assert vals.max() <= config.fusion_radius + 1e-6
+
+
+def test_r_rest_spans_hard_core_to_fusion_radius_and_rescales():
+    """
+    Bond rest length is hash-derived as a fraction of fusion_radius, with the
+    floor clamped to the hard core: every r_rest ∈ [repulsion_radius,
+    fusion_radius], and the whole band rescales when fusion_radius changes.
+    """
+    for fr in (1.5, 3.0):
+        config = SimConfig(num_species=6, bond_mode="edges",
+                           repulsion_radius=0.8, fusion_radius=fr)
+        vals = np.asarray(initialize_interaction_params(config, seed=7).r_rest)
+        assert vals.min() >= config.repulsion_radius - 1e-6, \
+            f"r_rest dipped below the hard core at fusion_radius={fr}: {vals.min()}"
+        assert vals.max() <= config.fusion_radius + 1e-6, \
+            f"r_rest exceeded fusion_radius at fusion_radius={fr}: {vals.max()}"
+
+    # Band rescales with fusion_radius: a larger fusion_radius lifts the ceiling.
+    v_small = np.asarray(initialize_interaction_params(
+        SimConfig(num_species=6, bond_mode="edges", fusion_radius=1.5), seed=7).r_rest)
+    v_large = np.asarray(initialize_interaction_params(
+        SimConfig(num_species=6, bond_mode="edges", fusion_radius=3.0), seed=7).r_rest)
+    assert v_large.max() > v_small.max() + 0.5, \
+        "r_rest ceiling should rise when fusion_radius grows"
 
 
 def test_r_rest_is_deterministic_per_hash_modulus():
@@ -715,10 +739,17 @@ def test_compute_composite_free_bonds_matches_per_particle():
     assert (cfb_np[2:] == 0).all()
 
 
-def test_per_particle_fusion_gate_blocks_saturated_rep():
+def test_per_particle_fusion_gate_blocks_saturated_contact_member():
     """
-    A composite rep that's already saturated (degree == v_s) cannot fuse with
-    a free particle even if the composite as a whole has free bonds.
+    The valence gate is per-contacting-particle: a free particle in range of
+    ONLY a saturated composite member (degree == v_s, no free bond) cannot fuse
+    with it, even though the composite as a whole still has free bonds on its
+    other — but out-of-range — members.
+
+    (Under the old rep-gated scheme this was phrased as "a saturated rep blocks
+    fusion". Fusion is no longer routed through the rep — proximity is judged on
+    the nearest member-pair — so the gate is now checked on whichever member
+    actually contacts the free particle.)
     """
     from halflife.chemistry import _species_valences, attempt_fusion
     # Use num_species=4 so that at least one species gets valence=2 under max_valence=2.
@@ -726,24 +757,26 @@ def test_per_particle_fusion_gate_blocks_saturated_rep():
     # Fibonacci remix; 4 species gives [1,1,1,2] reliably.)
     config = SimConfig(num_species=4, num_particles=10, max_composites=4,
                        max_valence=2, boundary_mode="reflect",
-                       world_width=20.0, world_height=20.0,
+                       world_width=40.0, world_height=40.0,
                        fusion_radius=2.0, fusion_threshold=0.0)
     world = initialize_world(config, seed=0)
     params = initialize_interaction_params(config, seed=0)
     physics = initialize_physics_params(config)
 
-    # Hand-build a 3-member composite where the rep (particle 0) is bonded
-    # to BOTH siblings (degree[0] = 2 = v_s for max_valence=2). Composite has
-    # remaining slack on particles 1 and 2 but rep is saturated.
+    # Hand-build a 3-member composite where the contacting member (particle 0)
+    # is bonded to BOTH siblings (degree[0] = 2 = v_s for max_valence=2), so it
+    # is saturated. The siblings keep a free bond each but are placed FAR away,
+    # so the only member within fusion_radius of the free particle is the
+    # saturated one — the fusion must not fire.
     sv = np.asarray(_species_valences(config))
-    # max_valence=2 means v_s ∈ [1, 2] — we need v_s[s_0] == 2 to make rep saturated.
-    # Find a species with valence 2 and assign it to the rep.
+    # max_valence=2 means v_s ∈ [1, 2] — we need v_s[s_0] == 2 to saturate member 0.
+    # Find a species with valence 2 and assign it to every particle.
     target_species = int(np.where(sv == 2)[0][0])
 
-    pos = np.array([[5.0, 5.0],   # rep (will be doubly-bonded)
-                    [4.0, 5.0],   # sibling A
-                    [6.0, 5.0],   # sibling B
-                    [5.5, 5.0],   # free particle within fusion_radius of rep
+    pos = np.array([[5.0, 5.0],    # 0  saturated member (doubly bonded)
+                    [5.0, 30.0],   # 1  sibling A — bonded to 0 but far from free particle
+                    [30.0, 5.0],   # 2  sibling B — bonded to 0 but far from free particle
+                    [6.0, 5.0],    # 3  free particle, within fusion_radius of member 0 only
                     [50.0, 50.0]] + [[50.0+i, 50.0] for i in range(5)],
                    dtype=np.float32)[:10]
     species = np.full(10, target_species, dtype=np.int32)
@@ -751,7 +784,7 @@ def test_per_particle_fusion_gate_blocks_saturated_rep():
     members = np.full((4, config.max_composite_size), -1, dtype=np.int32)
     members[0, :3] = (0, 1, 2)
     edges = np.full((4, config.e_max, 2), -1, dtype=np.int32)
-    edges[0, 0] = (0, 1); edges[0, 1] = (0, 2)  # rep 0 bonded to both
+    edges[0, 0] = (0, 1); edges[0, 1] = (0, 2)  # member 0 bonded to both siblings
     edge_count = np.array([2, 0, 0, 0], dtype=np.int32)
     alive = np.array([True, False, False, False], dtype=bool)
 
@@ -773,9 +806,10 @@ def test_per_particle_fusion_gate_blocks_saturated_rep():
     neighbors = find_all_neighbors(world.particles.position, cell_list, config)
     new_state, _ = attempt_fusion(world, neighbors, params, config, physics)
 
-    # Particle 3 should NOT have been absorbed into composite 0 (rep is saturated)
+    # Particle 3 should NOT have been absorbed: its only in-range partner (the
+    # saturated member 0) has no free bond.
     assert np.asarray(new_state.particles.composite_id)[3] == -1, \
-        "Saturated rep should not fuse with free particle"
+        "Free particle should not fuse through a saturated contact member"
 
 
 def test_fusion_appends_edge_free_plus_free():
@@ -807,6 +841,80 @@ def test_fusion_appends_edge_free_plus_free():
     assert np.asarray(new_state.composites.edge_count)[c] == 1
     e = np.asarray(new_state.composites.edges[c, 0])
     assert sorted(e.tolist()) == [0, 1]
+
+
+def test_composite_composite_fuses_on_nearest_member_not_rep():
+    """
+    Two composites whose representatives (slot-0 members) are far apart but
+    whose NON-rep members are within fusion_radius should still fuse. Fusion is
+    gated on the minimum member-member distance between the two composites, not
+    on the rep-to-rep distance.
+
+    use_valence=False isolates the proximity behavior (only distance + BE gate).
+    """
+    from halflife.chemistry import attempt_fusion
+    config = SimConfig(num_species=3, num_particles=10, max_composites=4,
+                       use_valence=False,
+                       boundary_mode="reflect", world_width=40.0, world_height=40.0,
+                       fusion_radius=2.0, fusion_threshold=0.0)
+    world = initialize_world(config, seed=0)
+    params = initialize_interaction_params(config, seed=0)
+    physics = initialize_physics_params(config)
+
+    # Composite A = {0, 1}, rep = particle 0.  Composite B = {2, 3}, rep = particle 2.
+    # Reps 0 and 2 are far apart AND outside each other's neighbor list (> 8);
+    # only the non-rep members 1 and 3 are within fusion_radius (dist 1.0).
+    # Under the old rep-to-rep rule no rep sees the other rep, so no fusion.
+    pos = np.array([
+        [ 5.0,  5.0],   # 0  rep A    — far from everything
+        [20.0, 20.0],   # 1  A member — touches particle 3
+        [35.0,  5.0],   # 2  rep B    — far from everything
+        [21.0, 20.0],   # 3  B member — touches particle 1 (dist 1.0 < fusion_radius)
+    ] + [[50.0 + i, 50.0] for i in range(6)], dtype=np.float32)[:10]
+    species = np.zeros(10, dtype=np.int32)
+    composite_id = np.array([0, 0, 1, 1, -1, -1, -1, -1, -1, -1], dtype=np.int32)
+
+    members = np.full((4, config.max_composite_size), -1, dtype=np.int32)
+    members[0, :2] = (0, 1)
+    members[1, :2] = (2, 3)
+    member_count = np.array([2, 2, 0, 0], dtype=np.int32)
+    edges = np.full((4, config.e_max, 2), -1, dtype=np.int32)
+    edges[0, 0] = (0, 1)
+    edges[1, 0] = (2, 3)
+    edge_count = np.array([1, 1, 0, 0], dtype=np.int32)
+    alive = np.array([True, True, False, False], dtype=bool)
+
+    world = world._replace(
+        particles=world.particles._replace(
+            position=jnp.asarray(pos), species=jnp.asarray(species),
+            composite_id=jnp.asarray(composite_id),
+        ),
+        composites=world.composites._replace(
+            members=jnp.asarray(members), member_count=jnp.asarray(member_count),
+            alive=jnp.asarray(alive), edges=jnp.asarray(edges),
+            edge_count=jnp.asarray(edge_count),
+        ),
+    )
+
+    from halflife.spatial import build_cell_list, find_all_neighbors
+    cell_list = build_cell_list(world.particles.position, config)
+    neighbors = find_all_neighbors(world.particles.position, cell_list, config)
+    new_state, _ = attempt_fusion(world, neighbors, params, config, physics)
+
+    cid = np.asarray(new_state.particles.composite_id)
+    alive_after = np.asarray(new_state.composites.alive)
+    # The two composites must have merged into one: all four members share a
+    # single composite, and exactly one of the two source slots stays alive.
+    assert cid[0] == cid[1] == cid[2] == cid[3], \
+        f"All four members should share one composite after fusion; got {cid[:4]}"
+    assert alive_after[0] != alive_after[1], \
+        "Exactly one of the two source composite slots should remain alive"
+    # The new fusion bond should attach at the contact members (1 ↔ 3), not the reps.
+    surviving = int(np.where(alive_after[:2])[0][0])
+    surv_edges = np.asarray(new_state.composites.edges[surviving])
+    edge_set = {tuple(sorted(e.tolist())) for e in surv_edges if e[0] >= 0}
+    assert (1, 3) in edge_set, \
+        f"Fusion bond should connect the contacting members 1↔3; edges={edge_set}"
 
 
 def test_ring_closure_adds_edge_between_same_composite_members():

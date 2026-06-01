@@ -29,7 +29,7 @@ class SimConfig:
 
     # ── Particles ────────────────────────────────────────────────────────────
     num_particles: int = 5_000      # total particle count (fixed, all always alive)
-    num_species: int = 3           # number of distinct particle types
+    num_species: int = 12           # number of distinct particle types
     state_dim: int = 8              # internal state vector size (NCA-style, future use)
 
     # ── Composites ───────────────────────────────────────────────────────────
@@ -54,15 +54,18 @@ class SimConfig:
     repulsion_strength: float = 2.0   # magnitude of hard-core repulsion
 
     # ── Fusion ───────────────────────────────────────────────────────────────
-    # Fusion occurs when two free particles are within fusion_radius AND
-    # the hash-derived binding energy exceeds fusion_threshold
-    fusion_radius: float = 4.0        # must be < interaction_radius
+    # Fusion occurs when two entities (free particles or composites) have a
+    # member-pair within fusion_radius AND the hash-derived binding energy
+    # exceeds fusion_threshold. Proximity is the minimum member-member distance
+    # between the two entities (nearest contacting pair), not rep-to-rep — so
+    # this radius is the surface-contact gap, not a body-overlap distance.
+    fusion_radius: float = 1.5        # must be < interaction_radius
     fusion_threshold: float = 0.6     # minimum binding energy to trigger fusion [0,1]
 
     # ── Decay / Half-life ────────────────────────────────────────────────────
     # Composite half-lives are derived from their species hash using this range
     half_life_min: float = 1.0       # shortest composite half-life (sim time units)
-    half_life_max: float = 100.0      # longest composite half-life
+    half_life_max: float = 20.0      # longest composite half-life
 
     # ── Energy ───────────────────────────────────────────────────────────────
     # Kinetic energy scale at initialization (controls initial temperature)
@@ -130,13 +133,10 @@ class SimConfig:
     # above the species-pair attraction (~1).
     k_bond: float = 20.0
 
-    # Range for hash-derived per-species-pair rest lengths.
-    # r_rest_min: comfortably outside repulsion_radius so bonded pairs don't
-    #             sit inside the hard core.
-    # r_rest_max: comfortably inside fusion_radius so bonds don't auto-cleave
-    #             on small perturbations.
-    r_rest_min: float = 1.2
-    r_rest_max: float = 3.6
+    # Hash-derived per-species-pair rest lengths are no longer configured as
+    # absolute bounds — they span [repulsion_radius, fusion_radius] (floor pinned
+    # to the hard core, ceiling at the fusion distance), so the band auto-rescales
+    # with fusion_radius. See chemistry._hash_to_rest_length.
 
     # Ring closure: allow intra-composite fusion when both members still have
     # per-particle free bonds (degree[i] < v_{species[i]}).

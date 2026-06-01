@@ -247,9 +247,11 @@ def test_edge_bond_force_on_two_particle_composite():
     """
     from halflife.step import compute_edge_bond_forces
     from halflife.state import initialize_world, initialize_interaction_params, initialize_physics_params
+    # r_rest now spans [repulsion_radius, fusion_radius]; collapsing both to 2.0
+    # pins every hash-derived rest length to exactly 2.0 (band width 0).
     config = SimConfig(num_species=3, num_particles=4, max_composites=2,
                        boundary_mode="reflect", world_width=100.0, world_height=100.0,
-                       k_bond=10.0, r_rest_min=2.0, r_rest_max=2.0)
+                       k_bond=10.0, repulsion_radius=2.0, fusion_radius=2.0)
     world = initialize_world(config, seed=0)
     params = initialize_interaction_params(config, seed=0)
     physics = initialize_physics_params(config)

@@ -123,8 +123,13 @@ def _hash_to_rest_length(s_i: jnp.ndarray, s_j: jnp.ndarray,
     valence so universes with the same num_species but different hash_modulus
     get genuinely different bond chemistries.
 
+    The rest length is a hash-derived fraction of fusion_radius, with the floor
+    clamped to the hard core: r_rest ∈ [repulsion_radius, fusion_radius]. Bonds
+    therefore never rest inside the hard core nor beyond the distance at which
+    fusion fires, and the whole band auto-rescales when fusion_radius is tuned.
+
     Returns:
-        scalar float32 in [config.r_rest_min, config.r_rest_max]
+        scalar float32 in [config.repulsion_radius, config.fusion_radius]
     """
     h_i = _entity_hash_val(s_i, config).astype(jnp.uint32)
     h_j = _entity_hash_val(s_j, config).astype(jnp.uint32)
@@ -132,9 +137,9 @@ def _hash_to_rest_length(s_i: jnp.ndarray, s_j: jnp.ndarray,
     # Fibonacci re-mix to decorrelate from BE / valence streams.
     h_mix = (h * jnp.uint32(0x9E3779B1)) ^ (h >> jnp.uint32(11))
     frac = (h_mix % jnp.uint32(1000)).astype(jnp.float32) / 999.0
-    return jnp.float32(config.r_rest_min) + frac * jnp.float32(
-        config.r_rest_max - config.r_rest_min
-    )
+    lo = jnp.float32(config.repulsion_radius)               # clamp floor to hard core
+    hi = jnp.maximum(jnp.float32(config.fusion_radius), lo)  # guard: never invert the band
+    return lo + frac * (hi - lo)
 
 def _species_valences(config: SimConfig) -> jnp.ndarray:
     """Pre-compute the (num_species,) valence vector. Fixed for a given config."""
@@ -780,8 +785,12 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
     Unified entity-entity fusion: any entity (free particle or composite) can
     fuse with any neighboring entity.
 
-    An entity is represented by its lowest-index member (the "representative").
-    Only representatives participate in the fusion scan to avoid double-counting.
+    Any member of an entity may initiate or accept a fusion: proximity is judged
+    on the minimum member-member distance between two entities, not on their
+    representatives. The lowest-index member (the "representative") survives only
+    as a stable per-entity key — for the per-entity candidate dedup and for the
+    `claimed` bookkeeping that still allows each entity at most one fusion per
+    step (the double-counting guard).
 
     Three cases handled uniformly:
       - free + free   → create new composite
@@ -812,14 +821,25 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
     E_max = config.e_max
     fusion_r2 = config.fusion_radius ** 2
 
+    # Bit layout for the per-entity dedup key (Step 2.5): the low INDEX_BITS hold
+    # an initiator particle index, the remaining bits hold a quantized BE rank.
+    # Sign-safe in int32 (one bit reserved). Computed host-side from the static N.
+    INDEX_BITS = max(1, N.bit_length())
+    INDEX_MASK = (1 << INDEX_BITS) - 1
+    BE_MAXQ    = (1 << (31 - INDEX_BITS - 1)) - 1
+
     # ── Step 1: Identify representatives ──────────────────────────────────────
+    # The representative (lowest-index member) no longer gates the fusion *scan* —
+    # any member may initiate/accept a fusion so composite-composite proximity is
+    # judged on the minimum member-member distance, not rep-to-rep. The rep
+    # survives only as a stable per-entity key for (a) the per-entity dedup below
+    # and (b) the `claimed` bookkeeping in the conflict-resolution scan.
     def get_rep(i):
         c = jnp.clip(particles.composite_id[i], 0, config.max_composites - 1)
         is_free = particles.composite_id[i] < 0
         return jnp.where(is_free, i, composites.members[c, 0])
 
     all_reps = jax.vmap(get_rep)(jnp.arange(N, dtype=jnp.int32))  # (N,)
-    is_rep = (all_reps == jnp.arange(N))  # (N,)
 
     # ── Pre-cache entity hashes (computed once, reused in check_neighbor) ─────
     # Commutative hash: H(i union j) = (H(i) + H(j)) % modulus — no sort needed.
@@ -834,23 +854,20 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
     # check: requires the specific rep doing the fusion to have unused valence.
     all_particle_free_bonds = species_valences[particles.species] - degree  # (N,) int32
 
-    # ── Step 2: For each representative, find its best fusion partner ──────────
+    # ── Step 2: For each member, find its best fusion partner ──────────────────
     def find_entity_partner(i):
         """
-        For representative particle i, scan its neighbors to find the best
-        entity partner. Returns (partner_rep, be_eff, merged_h, merged_count).
+        For particle i (any member of any entity), scan its neighbors to find the
+        best entity partner. Returns (partner_j, be_eff, merged_h, merged_count);
+        partner_j is the contacting particle in the other entity.
         """
-        i_is_rep = is_rep[i]
-
         h_i   = all_entity_hash[i]
         cnt_i = all_entity_cnt[i]
         c_i   = jnp.clip(particles.composite_id[i], 0, config.max_composites - 1)
 
         def check_neighbor(j):
-            j_is_rep = is_rep[j]
             valid = (
                 (j >= 0) & (j != i) &
-                j_is_rep &
                 # Don't fuse same composite with itself
                 ~((particles.composite_id[i] >= 0) &
                   (particles.composite_id[i] == particles.composite_id[j]))
@@ -911,18 +928,41 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         best_h   = hs[best_idx]
         best_mc  = mcounts[best_idx]
 
-        # Gate on i being a representative
-        final_j  = jnp.where(i_is_rep, best_j,  jnp.int32(-1))
-        final_be = jnp.where(i_is_rep, best_be,  jnp.float32(0.0))
-        final_h  = jnp.where(i_is_rep, best_h,   jnp.uint32(0))
-        final_mc = jnp.where(i_is_rep, best_mc,  jnp.int32(0))
-
-        return final_j, final_be, final_h, final_mc
+        # Any member may initiate — no rep gate. The per-entity dedup after this
+        # vmap collapses each entity's members down to one candidate.
+        return best_j, best_be, best_h, best_mc
 
     all_partners, all_be, all_hashes, all_merged_counts = jax.vmap(
         find_entity_partner
     )(jnp.arange(N, dtype=jnp.int32))
     # (N,), (N,), (N,), (N,)
+
+    # ── Step 2.5: Per-entity dedup ─────────────────────────────────────────────
+    # Dropping the rep gate means every member touching another entity is a
+    # candidate, so a pair of overlapping composites emits many duplicate A↔B
+    # candidates. Collapse them to one-per-entity BEFORE the budget-limited
+    # selection below; otherwise duplicates burn `max_fusions` slots that the
+    # `claimed` gate then no-ops (correct result, wasted throughput).
+    #
+    # Segmented arg-max keyed by the initiator's entity rep, as a single
+    # scatter-max over a packed int32 key: high bits = quantized BE (the rank),
+    # low bits = the initiator particle index (the payload we recover). be_q is
+    # offset by +1 so any real candidate has key > 0, distinguishing it from the
+    # no-partner sentinel (key 0) even when BE quantizes to 0 at particle 0.
+    be_scale = jnp.maximum(physics.binding_energy_scale, jnp.float32(1e-6))
+    be_q = (jnp.clip(all_be / be_scale, 0.0, 1.0) * BE_MAXQ).astype(jnp.int32) + 1
+    cand_key = jnp.where(
+        all_partners >= 0,
+        (be_q << INDEX_BITS) | jnp.arange(N, dtype=jnp.int32),
+        jnp.int32(0),
+    )
+    rep_best_key = jnp.zeros(N, dtype=jnp.int32).at[all_reps].max(cand_key)
+    my_rep_best  = rep_best_key[all_reps]                          # (N,)
+    is_winner = (
+        (my_rep_best > 0)
+        & ((my_rep_best & INDEX_MASK) == jnp.arange(N, dtype=jnp.int32))
+    )
+    all_partners = jnp.where(is_winner, all_partners, jnp.int32(-1))
 
     # ── Step 3: Conflict resolution via sequential scan ────────────────────────
     max_fusions = config.max_fusions_per_step
@@ -963,10 +1003,15 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
 
         safe_j = jnp.where(j >= 0, j, 0)
 
+        # `claimed` tracks original entities (keyed by their rep) so an entity
+        # fuses at most once per step even though any member can now initiate.
+        rep_i = all_reps[safe_i]
+        rep_j = all_reps[safe_j]
+
         can_fuse = (
             (j >= 0) &
-            ~claimed[safe_i] &
-            ~claimed[safe_j] &
+            ~claimed[rep_i] &
+            ~claimed[rep_j] &
             (comp_count < config.max_composites)
         )
 
@@ -1038,10 +1083,12 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         j_edges_free = jnp.full((E_max, 2), -1, dtype=jnp.int32)
         j_edges = jnp.where(j_is_free, j_edges_free, j_edges_comp)
 
-        # The new fusion edge: rep_i ↔ rep_j (= safe_i, safe_j since both are reps).
-        # For free+free, the reps are i and j themselves. For free+comp, rep is the
-        # free particle on one side and members[c, 0] on the other; we passed in
-        # both already via the merged-members construction.
+        # The new fusion edge connects the two contacting particles (safe_i,
+        # safe_j) — the actual nearest member-pair that brought the entities
+        # within fusion_radius, not their slot-0 reps. For free+free these are i
+        # and j themselves; for free+comp the free particle on one side and the
+        # touching member on the other. Both are already in the merged member
+        # list via the merged-members construction.
         new_edge = jnp.array([safe_i, safe_j], dtype=jnp.int32)[None, :]   # (1, 2)
 
         # Concatenate (2·E_max + 1, 2) buffer
@@ -1145,9 +1192,9 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         drop_j_pids = jnp.where(j_valid, j_pids, N)
         new_composite_id = new_composite_id.at[drop_j_pids].set(target, mode='drop')
 
-        # Mark both representatives as claimed
-        new_claimed = claimed.at[safe_i].set(claimed[safe_i] | can_fuse)
-        new_claimed = new_claimed.at[safe_j].set(new_claimed[safe_j] | can_fuse)
+        # Mark both source entities (by rep) as claimed
+        new_claimed = claimed.at[rep_i].set(claimed[rep_i] | can_fuse)
+        new_claimed = new_claimed.at[rep_j].set(new_claimed[rep_j] | can_fuse)
 
         # Only increment comp_count for free+free (new composite created)
         new_comp_count = comp_count + jnp.where(
