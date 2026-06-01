@@ -30,6 +30,8 @@ JIT notes:
   - Dead composite slots recycled using cumsum-based free-slot finding
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 
@@ -113,7 +115,8 @@ def _hash_to_valence(species: jnp.ndarray, config: SimConfig) -> jnp.ndarray:
 
 
 def _hash_to_rest_length(s_i: jnp.ndarray, s_j: jnp.ndarray,
-                         config: SimConfig) -> jnp.ndarray:
+                         config: SimConfig,
+                         fusion_radius=None, repulsion_radius=None) -> jnp.ndarray:
     """
     Hash-derived bond rest length for species pair (s_i, s_j).
 
@@ -128,8 +131,12 @@ def _hash_to_rest_length(s_i: jnp.ndarray, s_j: jnp.ndarray,
     therefore never rest inside the hard core nor beyond the distance at which
     fusion fires, and the whole band auto-rescales when fusion_radius is tuned.
 
+    fusion_radius / repulsion_radius default to the static config values (init
+    time). The runtime path passes the live PhysicsParams scalars so the band
+    tracks the fusion_radius (and repulsion_radius) sliders without a recompile.
+
     Returns:
-        scalar float32 in [config.repulsion_radius, config.fusion_radius]
+        scalar float32 in [repulsion_radius, fusion_radius]
     """
     h_i = _entity_hash_val(s_i, config).astype(jnp.uint32)
     h_j = _entity_hash_val(s_j, config).astype(jnp.uint32)
@@ -137,9 +144,32 @@ def _hash_to_rest_length(s_i: jnp.ndarray, s_j: jnp.ndarray,
     # Fibonacci re-mix to decorrelate from BE / valence streams.
     h_mix = (h * jnp.uint32(0x9E3779B1)) ^ (h >> jnp.uint32(11))
     frac = (h_mix % jnp.uint32(1000)).astype(jnp.float32) / 999.0
-    lo = jnp.float32(config.repulsion_radius)               # clamp floor to hard core
-    hi = jnp.maximum(jnp.float32(config.fusion_radius), lo)  # guard: never invert the band
+    rep = config.repulsion_radius if repulsion_radius is None else repulsion_radius
+    fus = config.fusion_radius    if fusion_radius    is None else fusion_radius
+    lo = jnp.float32(rep)                          # clamp floor to hard core
+    hi = jnp.maximum(jnp.float32(fus), lo)         # guard: never invert the band
     return lo + frac * (hi - lo)
+
+
+@functools.partial(jax.jit, static_argnums=(0,))
+def compute_r_rest_matrix(config: SimConfig, fusion_radius, repulsion_radius) -> jnp.ndarray:
+    """
+    Build the (num_species, num_species) hash-derived bond rest-length matrix
+    spanning [repulsion_radius, fusion_radius] for the GIVEN radii.
+
+    Called at init with the config values, and on every fusion_radius /
+    repulsion_radius slider change with the live PhysicsParams scalars, so bond
+    rest lengths track the sliders. The radii are dynamic args, so re-running it
+    with a new slider value does NOT recompile; it recompiles only if the static
+    `config` (num_species / hash constants) changes. Cost is O(num_species²) —
+    ~4 orders of magnitude below one simulation step (see CLAUDE.md).
+    """
+    species_idx = jnp.arange(config.num_species, dtype=jnp.int32)
+    return jax.vmap(
+        lambda i: jax.vmap(
+            lambda j: _hash_to_rest_length(i, j, config, fusion_radius, repulsion_radius)
+        )(species_idx)
+    )(species_idx)  # (S, S)
 
 def _species_valences(config: SimConfig) -> jnp.ndarray:
     """Pre-compute the (num_species,) valence vector. Fixed for a given config."""

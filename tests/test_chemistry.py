@@ -642,6 +642,23 @@ def test_r_rest_spans_hard_core_to_fusion_radius_and_rescales():
         "r_rest ceiling should rise when fusion_radius grows"
 
 
+def test_compute_r_rest_matrix_tracks_dynamic_radii():
+    """compute_r_rest_matrix builds the [repulsion_radius, fusion_radius] band
+    from the PASSED (runtime/slider) radii, independent of the config defaults —
+    this is what lets bond rest lengths follow the fusion_radius slider."""
+    from halflife.chemistry import compute_r_rest_matrix
+    config = SimConfig(num_species=6, fusion_radius=1.5, repulsion_radius=0.8)
+    # Pass radii that differ from config's defaults:
+    m = np.asarray(compute_r_rest_matrix(config, jnp.float32(3.0), jnp.float32(0.5)))
+    assert m.shape == (6, 6)
+    assert m.min() >= 0.5 - 1e-6, f"below passed repulsion_radius: {m.min()}"
+    assert m.max() <= 3.0 + 1e-6, f"above passed fusion_radius: {m.max()}"
+    # Proves it used the passed fusion_radius (3.0), not config's (1.5):
+    assert m.max() > 1.5 + 1e-6
+    # Symmetric (commutative species-pair hash)
+    assert np.max(np.abs(m - m.T)) < 1e-6
+
+
 def test_r_rest_is_deterministic_per_hash_modulus():
     """Same config + hash_modulus → same r_rest matrix (hash-determined)."""
     c1 = SimConfig(num_species=5)

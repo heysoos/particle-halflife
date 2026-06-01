@@ -45,6 +45,18 @@ from halflife.state import initialize_world, initialize_interaction_params, init
 from halflife.step import make_run_n_steps
 from halflife.renderer import Renderer
 from halflife.profiler import ProfileMetrics
+from halflife.chemistry import compute_r_rest_matrix
+
+
+def _sync_r_rest(params, config, physics):
+    """Rebuild the bond rest-length band from the LIVE physics radii so r_rest
+    tracks the fusion_radius / repulsion_radius sliders. InteractionParams is a
+    dynamic JAX arg, so swapping r_rest in is recompile-free; compute_r_rest_matrix
+    is O(num_species²) and only runs on slider/reset/reroll events. Keeps the
+    invariant: params.r_rest always reflects physics.fusion_radius / .repulsion_radius."""
+    return params._replace(
+        r_rest=compute_r_rest_matrix(config, physics.fusion_radius, physics.repulsion_radius)
+    )
 
 
 def parse_args():
@@ -95,6 +107,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
     state   = initialize_world(config, seed=seed)
     params  = initialize_interaction_params(config, seed=seed + 1)
     physics = initialize_physics_params(config)
+    params  = _sync_r_rest(params, config, physics)  # invariant + pre-warm the rebuild jit
 
     # Initialize profiler if enabled
     metrics = ProfileMetrics() if config.enable_profiling else None
@@ -299,7 +312,9 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
             print("Resetting...")
             state  = initialize_world(config, seed=seed)
             params = initialize_interaction_params(config, seed=seed + 1)
-            # physics intentionally NOT reset — slider values persist across resets
+            # physics intentionally NOT reset — slider values persist across resets,
+            # so re-sync r_rest to the persisted radii (init rebuilt it from config).
+            params = _sync_r_rest(params, config, physics)
             pending_state = state
             if not paused:
                 pending_state = run_n(pending_state, params, physics, steps_per_frame)
@@ -314,6 +329,8 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                 pending_state = state
             if reroll_kind in ('all', 'chemistry'):
                 params = initialize_interaction_params(config, seed=new_seed + 1)
+                # Keep r_rest on the persisted slider radii, not the config defaults.
+                params = _sync_r_rest(params, config, physics)
             if not paused and reroll_kind in ('all', 'particles'):
                 pending_state = run_n(pending_state, params, physics, steps_per_frame)
             print(f"Rerolled {reroll_kind} (offset {reroll_counter}, seed {new_seed})")
@@ -322,6 +339,10 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
         updates = renderer.get_physics_updates()
         if updates:
             physics = physics._replace(**{k: jnp.float32(v) for k, v in updates.items()})
+            # The fusion_radius / repulsion_radius sliders also define the r_rest
+            # band, so rebuild it (recompile-free) when either moves.
+            if 'fusion_radius' in updates or 'repulsion_radius' in updates:
+                params = _sync_r_rest(params, config, physics)
 
         # ── Async pipeline ────────────────────────────────────────────────────
         # Dispatch NEXT batch before blocking on current — GPU computes frame N+1
