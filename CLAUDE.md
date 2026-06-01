@@ -145,8 +145,9 @@ halflife-particle/
 │   ├── utils.py        ← hash_multiset(), find_free_slots(), boundary helpers
 │   ├── spatial.py      ← build_cell_list(), find_all_neighbors()
 │   ├── interactions.py ← InteractionParams, pairwise_force(), compute_all_forces()
-│   ├── chemistry.py    ← attempt_fusion(), apply_composite_decay(), _hash_to_partition(),
-│   │                     _hash_to_binding_energy(), _hash_to_valence()
+│   ├── chemistry.py    ← attempt_fusion(), attempt_ring_closure(), apply_composite_decay(),
+│   │                     compute_degree(), compute_composite_free_bonds(), _hash_to_partition(),
+│   │                     _hash_to_binding_energy(), _hash_to_valence(), _hash_to_rest_length()
 │   ├── energy.py       ← energy tracking and soft conservation
 │   ├── step.py         ← simulation_step() — single @jax.jit orchestrator
 │   ├── renderer.py     ← ModernGL + pygame visualization
@@ -180,7 +181,10 @@ WorldState
     ├── binding_energy (C,) float32
     ├── half_life    (C,) float32
     ├── age          (C,) float32
-    └── species_hash (C,) uint32   — commutative additive hash over member species
+    ├── species_hash (C,) uint32   — commutative additive hash over member species
+    ├── free_bonds   (C,) int32    — remaining bond capacity (Σ v_s − 2*edge_count)
+    ├── edges        (C, E_max, 2) int32 — bond particle-id pairs; -1 = unused
+    └── edge_count   (C,) int32    — number of valid edges (graph, not just tree)
 
 InteractionParams  (passed separately, not part of WorldState)
     ├── attraction       (S, S) float32 — signed attraction matrix
@@ -237,31 +241,51 @@ become new composites. Energy: `binding_energy * (1 - fission_cost)` is split eq
 between products as a momentum-conserving COM-axis kick. Species are conserved — fission
 never transmutes.
 
-## Valence & Free Bonds (hash-encoded saturation)
+## Valence & Free Bonds (edge-based saturation)
 
 Optional gate (`config.use_valence`, default True). Each species `s` gets a fixed
 valence `v_s ∈ [1, max_valence]`, hashed from the species index via `_hash_to_valence`
-(Fibonacci remix, decorrelated from BE). Valence is the number of "hands" a particle
-of that species can use to hold neighbors — molecular-valence analog (H=1, O=2, C=4 …).
+(Fibonacci remix, decorrelated from BE *and* from bond rest-length). Valence is the
+number of "hands" a particle of that species can use to hold neighbors —
+molecular-valence analog (H=1, O=2, C=4 …).
 
-Composites carry a `free_bonds: (C,) int32` field tracking remaining bond capacity
-under spanning-tree accounting:
+**Accounting is edge-based, not tree-based.** Composites carry an explicit edge list
+(`edges`, `edge_count`) — a real graph that may contain cycles, not just a spanning
+tree. Free bonds are derived from actual edge incidence (`degree`), at two levels:
 
 ```
-free_bonds(free particle s) = v_s
-free_bonds(composite n)     = Σ v_s_i  −  2 × (n − 1)
+degree[i]            = number of edges incident on particle i   (compute_degree)
+per-particle  free_bond[i] = v_{species[i]} − degree[i]
+per-composite free_bonds[c] = Σ (v_s[m] − degree[m]) = Σ v_s − 2 × edge_count[c]
 ```
 
-(An n-member composite has n−1 internal edges; each consumes one bond on each endpoint.)
+A free particle has `degree = 0`, so its free bonds are just `v_s`. The closed-form
+`Σ v_s − 2×(n−1)` only holds while a composite stays a tree (`edge_count = n−1`);
+once ring closure adds cycles, `edge_count > n−1` and the edge-count formula is the
+authoritative one. The `free_bonds: (C,)` field is a cache of this, refreshed via
+`compute_composite_free_bonds` and used as a cheap skip mask.
 
-Two gates:
+Three gates:
 
-- **Fusion**: a pair fuses iff both entities have `free_bonds ≥ 1`. The merged
-  composite's bond count becomes `free_bonds(i) + free_bonds(j) − 2`.
-- **Fission**: a product whose own member multiset gives `free_bonds < 0` is
-  structurally unsound (more edges required than the members offer) and **shatters**
-  into free particles rather than forming a sub-composite. The fission kick still
-  fires; particle conservation holds.
+- **Fusion** (`attempt_fusion`): proximity is the nearest member-member contact
+  within `fusion_radius`, not rep-to-rep. The two *contacting particles* `i` and `j`
+  (the nearest member-pair) must **each** have `free_bond ≥ 1` (`v_s − degree ≥ 1`) —
+  stricter than the old composite-level check. The new edge consumes one bond on each
+  endpoint, so a composite with spare bonds *elsewhere* still can't fuse through a
+  saturated contact member. The lowest-index "representative" is no longer a fusion
+  gate — it survives only as a stable per-entity key for candidate dedup and the
+  one-fusion-per-entity-per-step `claimed` bookkeeping.
+- **Ring closure** (`attempt_ring_closure`, Phase 6b): two members *of the same
+  composite* within `fusion_radius`, both with a spare per-particle bond, form one
+  extra internal edge (closing a ring), consuming 2 free bonds. Touches only
+  `edges`/`edge_count`/`degree`/`free_bonds` — never the member list or
+  `composite_id`. Gated by `allow_ring_closure AND bond_mode == "edges"` (skipped in
+  `star_spring`/off modes, where the edge array is physics-inert and firing it would
+  silently leak free bonds), rate-limited by `max_ring_closures_per_step`.
+- **Fission** (`apply_composite_decay`): a product whose own member multiset gives
+  `free_bonds < 0` is structurally unsound (more edges required than the members
+  offer) and **shatters** into free particles rather than forming a sub-composite.
+  The fission kick still fires; particle conservation holds.
 
 Toggled via Python `if config.use_valence:` since config is `static_argnums`, so XLA
 traces only the live branch — zero runtime cost when off. BE-threshold preference is
@@ -270,9 +294,9 @@ saturation on top.
 
 This *replaces* the earlier capacity-cap mechanic (commit `7ccad71`, since reverted):
 caps were a static per-multiset upper bound on each species count; valence is a
-dynamic free-bond counter on each composite. Caps had the unphysical property that
-a 2-particle composite could randomly roll a ceiling of [32, 32, 32]; valence makes
-small composites of low-v species *immediately* saturated, as in real molecules.
+dynamic free-bond counter driven by graph degree. Caps had the unphysical property
+that a 2-particle composite could randomly roll a ceiling of [32, 32, 32]; valence
+makes small composites of low-v species *immediately* saturated, as in real molecules.
 
 ## Visualization
 
@@ -318,19 +342,27 @@ Key experiment knobs:
 
 ```python
 config = SimConfig(
-    num_species=12,            # more species → richer chemistry / bigger hash bucket space
+    num_species=3,             # current default; more species → richer chemistry
     num_particles=5_000,       # total particle pool (fixed; all always alive)
     interaction_radius=8.0,    # force cutoff
-    fusion_radius=4.0,         # must be < interaction_radius
+    fusion_radius=1.5,         # nearest member-member contact gap; must be < interaction_radius
     fusion_threshold=0.6,      # min binding energy to fuse [0,1]
     half_life_min=1.0,
-    half_life_max=15.0,
+    half_life_max=100.0,       # current experiment runs long-lived composites
     hash_modulus=100_000_007,  # changes the "universe" / chemistry
     composite_size_decay_scale=0.05,  # bigger composites decay faster
 
     # Valence saturation (per-species free-bond gate, on by default)
     use_valence=True,
     max_valence=4,             # per-species valence drawn from [1, max_valence]
+
+    # Covalent bonds (edges mode) — sparse hash-derived springs between members
+    bond_mode="edges",         # "edges" | "star_spring" | "off"
+    k_bond=20.0,               # harmonic edge-spring stiffness
+    # bond rest length is hash-derived per species pair, spanning
+    # [repulsion_radius, fusion_radius] — no longer absolute config fields
+    allow_ring_closure=True,   # let same-composite members form extra (cyclic) edges
+    max_ring_closures_per_step=50,
 )
 ```
 
@@ -356,7 +388,7 @@ Spec: [`docs/superpowers/specs/2026-05-30-composite-diagnostic-design.md`](docs/
 
 | Preset name | What it changes from default `SimConfig` |
 |---|---|
-| `baseline` | (default config — `num_species=12, half_life_max=15.0`) |
+| `baseline` | legacy baseline, pinned to `num_species=12, half_life_max=15.0` (not the current config.py default, which is `num_species=3`) |
 | `current_experiment` | `num_species=3, half_life_max=100.0` (the user's running experiment) |
 | `valence_off` | `use_valence=False` |
 | `polymer_world` | `max_valence=2, num_species=2` |
