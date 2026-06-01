@@ -50,7 +50,6 @@ class CPUStateSnapshot(NamedTuple):
     species:             np.ndarray
     mass:                np.ndarray
     energy:              np.ndarray
-    age:                 np.ndarray
     comp_id:             np.ndarray
     comp_members:        np.ndarray
     comp_count:          np.ndarray
@@ -218,6 +217,23 @@ void main() {
     float ring = 1.0 - clamp(abs(r - 0.85) / 0.08, 0.0, 1.0);
     if (ring < 0.02) discard;
     fragColor = vec4(1.0, 1.0, 1.0, ring);
+}
+"""
+
+# Composite-member glow: warm amber filled disc, radially soft, rendered for
+# every member of the selected particle's composite. Vertex shader is shared
+# with HIGHLIGHT_VERTEX_SHADER (same camera uniforms, same u_size_px interface).
+GLOW_FRAGMENT_SHADER = """
+#version 330
+
+out vec4 fragColor;
+
+void main() {
+    float r = length(gl_PointCoord - vec2(0.5)) * 2.0;
+    // Soft filled disc: opaque at center, fades to 0 at edge
+    float alpha = (1.0 - smoothstep(0.5, 1.0, r)) * 0.55;
+    if (alpha < 0.01) discard;
+    fragColor = vec4(1.0, 0.65, 0.2, alpha);
 }
 """
 
@@ -509,6 +525,24 @@ class Renderer:
             [(self._highlight_vbo, '2f', 'in_position')],
         )
 
+        # ── Composite-member glow sprites ────────────────────────────────────
+        # Warm amber filled-disc point sprites drawn beneath the white ring
+        # whenever the selected particle belongs to a composite. One point per
+        # member; VBO sized for the maximum composite size. Vertex shader is
+        # shared with the highlight ring (same camera uniforms, u_size_px iface).
+        self._glow_prog = self.ctx.program(
+            vertex_shader=HIGHLIGHT_VERTEX_SHADER,
+            fragment_shader=GLOW_FRAGMENT_SHADER,
+        )
+        self._glow_prog['u_world_size'].value = (config.world_width, config.world_height)
+        self._glow_vbo = self.ctx.buffer(
+            reserve=config.max_composite_size * 2 * 4  # max_composite_size vec2 float32
+        )
+        self._glow_vao = self.ctx.vertex_array(
+            self._glow_prog,
+            [(self._glow_vbo, '2f', 'in_position')],
+        )
+
         # ── Render-settings dict ─────────────────────────────────────────────
         # Trail-related state lives here, separate from PhysicsParams. Defaults
         # match the slider defaults defined in Task 4. UI sliders write into
@@ -543,6 +577,7 @@ class Renderer:
             self.particle_prog,
             self.bond_prog,
             self.highlight_prog,
+            self._glow_prog,
             self.event_prog,
         ]
 
@@ -781,6 +816,7 @@ class Renderer:
             None,
             # ── Fusion chemistry ──────────────────────────────────────────────
             ("fusion_threshold",         "fuse thresh", _phys("fusion_threshold"),     "{:.3f}", None),
+            ("fusion_radius",            "fuse radius", _phys("fusion_radius"),        "{:.2f}", (0.5, float(self.config.interaction_radius))),
             ("binding_energy_scale",     "bind energy", _phys("binding_energy_scale"), "{:.3f}", None),
             None,
             # ── Particle dynamics ─────────────────────────────────────────────
@@ -979,14 +1015,14 @@ class Renderer:
         composites = state.composites
 
         # Single batched GPU→CPU transfer — one CUDA sync + one DMA instead of 13
-        (pos, vel, species, mass, p_energy, p_age, comp_id,
+        (pos, vel, species, mass, p_energy, comp_id,
          comp_members, comp_count, comp_alive, comp_species_hash,
          comp_binding_energy, comp_half_life, comp_age, comp_free_bonds,
          comp_edges, comp_edge_count,
          total_energy, step_count, sim_time) = jax.device_get((
             particles.position, particles.velocity,
             particles.species,
-            particles.mass,     particles.energy, particles.age,
+            particles.mass,     particles.energy,
             particles.composite_id,
             composites.members, composites.member_count, composites.alive,
             composites.species_hash,
@@ -1002,7 +1038,7 @@ class Renderer:
         # already on CPU at this point — no extra transfer cost.
         self._cpu_state = CPUStateSnapshot(
             positions=pos, velocities=vel, species=species,
-            mass=mass, energy=p_energy, age=p_age,
+            mass=mass, energy=p_energy,
             comp_id=comp_id,
             comp_members=comp_members, comp_count=comp_count,
             comp_alive=comp_alive, comp_species_hash=comp_species_hash,
@@ -1398,10 +1434,25 @@ class Renderer:
         if self._show_events and self._n_event_vertices > 0:
             self._event_vao.render(moderngl.POINTS, vertices=self._n_event_vertices)
 
-        # Selection highlight ring. Camera uniforms are already on the
-        # highlight program (pushed via self.camera at the top of render()).
+        # Composite-member glow + selection highlight ring. Camera uniforms are
+        # already on both programs (pushed via self.camera at the top of render()).
         if self._selected_idx >= 0 and self._cpu_state is not None:
-            sel_pos = self._cpu_state.positions[self._selected_idx].astype(np.float32)
+            cs = self._cpu_state
+            # Draw warm amber glow on every member of the selected particle's
+            # composite (if it belongs to one), beneath the white ring.
+            sel_cid = int(cs.comp_id[self._selected_idx])
+            if sel_cid >= 0:
+                n_members = int(cs.comp_count[sel_cid])
+                n_members = min(n_members, self.config.max_composite_size)
+                member_indices = cs.comp_members[sel_cid][:n_members]
+                member_pos = cs.positions[member_indices].astype(np.float32)
+                self._glow_vbo.write(member_pos.tobytes())
+                # Slightly larger than the ring (26 px) so the glow halos
+                # spread behind it; 34 px gives a visible warm halo.
+                self._glow_prog['u_size_px'].value = 34.0
+                self._glow_vao.render(moderngl.POINTS, vertices=n_members)
+
+            sel_pos = cs.positions[self._selected_idx].astype(np.float32)
             self._highlight_vbo.write(sel_pos.tobytes())
             # Constant screen-pixel diameter so the ring stays visible even
             # on tiny zoomed-out particles. ~26 px works at default windowing.
@@ -1528,6 +1579,9 @@ class Renderer:
         self._highlight_vbo.release()
         self._highlight_vao.release()
         self.highlight_prog.release()
+        self._glow_vbo.release()
+        self._glow_vao.release()
+        self._glow_prog.release()
         self._tonemap_vao.release()
         self.tonemap_prog.release()
         self.ctx.release()

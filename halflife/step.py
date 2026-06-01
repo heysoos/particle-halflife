@@ -351,11 +351,9 @@ def simulation_step(state: WorldState, params: InteractionParams,
     )
 
     # ── Phase 9: Increment Ages and Counters ──────────────────────────────────
-    new_age = state.particles.age + physics.dt
     new_comp_age = state.composites.age + physics.dt * state.composites.alive.astype(jnp.float32)
 
     final_state = state._replace(
-        particles=state.particles._replace(age=new_age),
         composites=state.composites._replace(age=new_comp_age),
         time=state.time + physics.dt,
         total_energy=current_energy,

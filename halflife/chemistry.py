@@ -819,7 +819,7 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
     M = config.max_composite_size
 
     E_max = config.e_max
-    fusion_r2 = config.fusion_radius ** 2
+    fusion_r2 = physics.fusion_radius ** 2
 
     # Bit layout for the per-entity dedup key (Step 2.5): the low INDEX_BITS hold
     # an initiator particle index, the remaining bits hold a quantized BE rank.
@@ -1326,7 +1326,7 @@ def attempt_ring_closure(state: WorldState, neighbors: jnp.ndarray,
     N = config.num_particles
     C = config.max_composites
     E_max = config.e_max
-    fusion_r2 = config.fusion_radius ** 2
+    fusion_r2 = physics.fusion_radius ** 2
 
     # ── Skip mask: only particles in composites with free_bonds ≥ 2 can host ─
     # a new ring edge. Composite-level free bonds = Σ free_bond[m] over members.

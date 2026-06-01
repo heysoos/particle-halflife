@@ -62,7 +62,6 @@ class HUDPainter:
         species_i = int(cs.species[i])
         mass_i    = float(cs.mass[i])
         energy_i  = float(cs.energy[i])
-        age_i     = float(cs.age[i])
         cid       = int(cs.comp_id[i])
 
         if config.use_valence:
@@ -81,7 +80,6 @@ class HUDPainter:
             'valence':   valence_i,
             'mass':      mass_i,
             'energy':    energy_i,
-            'age':       age_i,
             'composite': None,
         }
 
@@ -309,7 +307,7 @@ class HUDPainter:
         # absolute physical cap). When size_max is large, bins are
         # *widened* (bin_width > 1) so we never exceed MAX_BINS_HIST
         # bars — 1px bars + 1px gaps always fit inside chart_w.
-        MAX_BINS_HIST = 100
+        MAX_BINS_HIST = 25
         # hist[i] = count of composites with member_count == i+1, so the
         # largest live size = (highest non-zero index) + 1.
         nz = np.flatnonzero(r._stats_hist) if len(r._stats_hist) else np.array([], dtype=np.int32)
@@ -342,11 +340,17 @@ class HUDPainter:
         binned    = padded.reshape(n_bins, bin_width).sum(axis=1)
         max_count = max(1, int(binned.max()))
 
+        # Bar heights use a log1p scale: composite-size counts are wildly
+        # skewed (a huge size-1/size-2 spike dwarfs everything else), so a
+        # linear y-axis flattens all the larger-size bars to ~1px. log1p keeps
+        # small populations visible while still ordering by magnitude. max_count
+        # ≥ 1 ⇒ log1p(max_count) ≥ ln(2) > 0, so the divisor is always safe.
+        log_max = np.log1p(max_count)
         for b in range(n_bins):
             count = int(binned[b])
             if count == 0:
                 continue
-            bh = max(1, int(chart_h * count / max_count))
+            bh = max(1, int(chart_h * np.log1p(count) / log_max))
             bx = chart_x + b * (bar_w + 1)
             pygame.draw.rect(surface, (60, 140, 220, 200),
                              pygame.Rect(bx, chart_y + chart_h - bh, bar_w, bh))
@@ -490,7 +494,6 @@ class HUDPainter:
         kv("Speed",     f"{snap['speed']:.2f}")
         kv("Mass",      f"{snap['mass']:.2f}")
         kv("Energy",    f"{snap['energy']:.2f}")
-        kv("Age",       f"{snap['age']:.1f} s")
         kv("Composite", "free" if comp is None else f"#{comp['id']}",
            value_color=MUTED_FG if comp is None else VALUE_FG)
 

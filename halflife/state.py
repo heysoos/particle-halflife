@@ -34,7 +34,6 @@ class ParticleState(NamedTuple):
     species:      jnp.ndarray  # (N,)    int32   — species index [0, NUM_SPECIES)
     energy:       jnp.ndarray  # (N,)    float32 — kinetic + internal energy
     mass:         jnp.ndarray  # (N,)    float32 — particle mass
-    age:          jnp.ndarray  # (N,)    float32 — time since creation/last spawn
     composite_id: jnp.ndarray  # (N,)    int32   — composite index, -1 = free particle
 
 
@@ -149,7 +148,6 @@ def initialize_world(config: SimConfig, seed: int = 0) -> WorldState:
     mass = jnp.ones(N, dtype=jnp.float32)
     energy = 0.5 * mass * jnp.sum(vel ** 2, axis=-1)
 
-    age = jnp.zeros(N, dtype=jnp.float32)
     composite_id = jnp.full(N, -1, dtype=jnp.int32)
 
     particles = ParticleState(
@@ -158,7 +156,6 @@ def initialize_world(config: SimConfig, seed: int = 0) -> WorldState:
         species=species,
         energy=energy,
         mass=mass,
-        age=age,
         composite_id=composite_id,
     )
 
@@ -254,11 +251,11 @@ def initialize_interaction_params(config: SimConfig,
     # Hash-derived per-species-pair bond rest length. Symmetric by construction
     # (uses the commutative species-pair hash). Independent of `seed` — this
     # is part of the "universe" determined by config.hash_modulus, like valence.
-    from halflife.chemistry import _hash_to_rest_length  # local import: chemistry imports state
-    species_idx = jnp.arange(S, dtype=jnp.int32)
-    r_rest = jax.vmap(
-        lambda i: jax.vmap(lambda j: _hash_to_rest_length(i, j, config))(species_idx)
-    )(species_idx)  # (S, S)
+    from halflife.chemistry import compute_r_rest_matrix  # local import: chemistry imports state
+    # Init-time band uses the config radii; the runtime path (main.py) rebuilds
+    # this from the live PhysicsParams radii whenever the fusion_radius /
+    # repulsion_radius sliders move, so r_rest tracks them.
+    r_rest = compute_r_rest_matrix(config, config.fusion_radius, config.repulsion_radius)
 
     return InteractionParams(
         attraction=attraction,
@@ -279,6 +276,7 @@ class PhysicsParams(NamedTuple):
     damping:                  jnp.ndarray  # () float32 — velocity damping per step
     repulsion_strength:       jnp.ndarray  # () float32 — hard-core repulsion magnitude
     fusion_threshold:         jnp.ndarray  # () float32 — min binding energy to fuse [0,1]
+    fusion_radius:            jnp.ndarray  # () float32 — proximity gate for fusion (was static config.fusion_radius)
     binding_energy_scale:     jnp.ndarray  # () float32 — energy released on fusion
     repulsion_radius:         jnp.ndarray  # () float32 — inner hard-core repulsion radius
     r_cutoff_scale:           jnp.ndarray  # () float32 — multiplier on per-species r_cutoff
@@ -295,6 +293,7 @@ def initialize_physics_params(config: SimConfig) -> PhysicsParams:
         damping=jnp.float32(config.damping),
         repulsion_strength=jnp.float32(config.repulsion_strength),
         fusion_threshold=jnp.float32(config.fusion_threshold),
+        fusion_radius=jnp.float32(config.fusion_radius),
         binding_energy_scale=jnp.float32(config.binding_energy_scale),
         repulsion_radius=jnp.float32(config.repulsion_radius),
         r_cutoff_scale=jnp.float32(1.0),
