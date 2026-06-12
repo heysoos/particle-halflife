@@ -135,6 +135,12 @@ def main(argv=None):
     if args.platform:
         os.environ['JAX_PLATFORMS'] = args.platform
 
+    # On-disk XLA cache: repeat invocations with the same scenario/overrides
+    # skip the ~10-30s simulation_step compile. Imported lazily so it runs
+    # AFTER the JAX_PLATFORMS env override above takes effect.
+    from halflife.utils import enable_persistent_compilation_cache
+    enable_persistent_compilation_cache()
+
     overrides = _parse_overrides(args.override)
     cache_path = args.cache_path or _default_cache_path(
         args.scenario, args.steps, args.seed, args.sample_every, overrides,

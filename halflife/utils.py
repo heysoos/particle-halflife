@@ -7,9 +7,38 @@ Includes:
   - color helpers     — species index → RGB color
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+
+# ── Persistent Compilation Cache ─────────────────────────────────────────────
+
+def enable_persistent_compilation_cache(
+        cache_dir: str = "~/.cache/halflife-jax") -> None:
+    """
+    Turn on JAX's on-disk compilation cache so identical (config, code)
+    compiles are reused across processes and runs.
+
+    XLA compilation is CPU-bound and dominates cold-start wall time: a single
+    simulation_step compile is ~10-30s on GPU (PTX codegen + autotuning),
+    and every distinct SimConfig shape triggers a fresh one. With the cache,
+    only the first-ever compile of each variant pays; reruns load in
+    milliseconds. Biggest wins: pytest runs (each process recompiles every
+    config it touches), app restarts, and analysis CLI invocations.
+
+    The default cache dir lives on the WSL-native filesystem (~/.cache), NOT
+    /mnt/c — drvfs I/O would eat much of the benefit. The cache key includes
+    backend, jaxlib version, and XLA flags, so CPU/GPU entries coexist and
+    stale entries are never wrongly reused. Safe to delete the dir anytime.
+    """
+    path = os.path.expanduser(cache_dir)
+    os.makedirs(path, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", path)
+    # Default threshold is 1s; lower it so mid-size helper jits cache too.
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.5)
 
 
 # ── Free-Slot Finding ────────────────────────────────────────────────────────

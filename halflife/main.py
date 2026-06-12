@@ -46,6 +46,11 @@ from halflife.step import make_run_n_steps
 from halflife.renderer import Renderer
 from halflife.profiler import ProfileMetrics
 from halflife.chemistry import compute_r_rest_matrix
+from halflife.utils import enable_persistent_compilation_cache
+
+# On-disk XLA cache: app restarts with an unchanged config skip the ~10-30s
+# JIT warm-up entirely (cache hit loads in milliseconds). See utils.py.
+enable_persistent_compilation_cache()
 
 
 def _sync_r_rest(params, config, physics):

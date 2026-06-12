@@ -9,3 +9,6 @@ pygame               # Window + event handling
 
 # Utilities
 numpy                # CPU array operations, data transfer
+
+# Testing
+pytest-xdist         # parallel test workers (pytest -n 4; see CLAUDE.md "Fast test runs")
