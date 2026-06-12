@@ -115,6 +115,12 @@ def main(argv=None):
                    help="Full-snapshot interval (compact metrics every step regardless).")
     p.add_argument('--top-k',        type=int, default=30,
                    help="K for the top-K transition / compatibility matrices.")
+    p.add_argument('--windows',      type=int, default=None,
+                   help="Number of equal time windows for Tier 5 (default 5; "
+                        "mutually exclusive with --window-width).")
+    p.add_argument('--window-width', type=int, default=None,
+                   help="Fixed window width in steps for Tier 5 (mutually "
+                        "exclusive with --windows).")
     p.add_argument('--override',     type=str, default='',
                    help="Comma-separated config overrides: k1=v1,k2=v2")
     p.add_argument('--out',          type=str, default='',
@@ -131,6 +137,9 @@ def main(argv=None):
     p.add_argument('--no-cache',     action='store_true',
                    help="Don't save the run to cache (default: save, overwriting).")
     args = p.parse_args(argv)
+
+    if args.windows is not None and args.window_width is not None:
+        raise SystemExit("--windows and --window-width are mutually exclusive")
 
     if args.platform:
         os.environ['JAX_PLATFORMS'] = args.platform
@@ -176,7 +185,8 @@ def main(argv=None):
             cache_kb = os.path.getsize(cache_path) / 1024
             print(f"[diag] cached run to {cache_path}  ({cache_kb:.0f} KB)")
 
-    html = render_html(result, top_k=args.top_k)
+    html = render_html(result, top_k=args.top_k,
+                       windows=args.windows, window_width=args.window_width)
 
     out = args.out or _default_out(args.scenario)
     out_dir = os.path.dirname(out)
