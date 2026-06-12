@@ -62,3 +62,71 @@ def _window_index(step: int, windows: List[Tuple[int, int]]) -> Optional[int]:
     if windows and step == windows[-1][1]:
         return len(windows) - 1
     return None
+
+
+# ── Type identity ───────────────────────────────────────────────────────────
+
+def _stable_hash(obj) -> int:
+    """Deterministic 64-bit hash of a hashable structure (process-stable, unlike
+    Python's salted hash() for strings/bytes)."""
+    return int.from_bytes(
+        hashlib.blake2b(repr(obj).encode('utf-8'), digest_size=8).digest(),
+        'little',
+    )
+
+
+def composition_type_ids(snapshot) -> np.ndarray:
+    """Per-alive-composite composition type ids (= species_hash). uint64, repeats."""
+    return snapshot.species_hash[snapshot.alive].astype(np.uint64)
+
+
+def _wl_graph_hash(node_labels: List[int],
+                   adjacency: List[List[int]],
+                   rounds: int = 3) -> int:
+    """Weisfeiler-Lehman hash of a labeled undirected graph.
+
+    Each round replaces a node's label with a hash of (own label, sorted
+    multiset of neighbor labels); the graph hash is a hash of the sorted final
+    label multiset. Isomorphic labeled graphs hash equal; chain vs ring of the
+    same atoms hash differently. WL can rarely collide on non-isomorphic regular
+    graphs — accepted for this scale (see spec).
+    """
+    labels = [int(s) for s in node_labels]
+    for _ in range(rounds):
+        labels = [
+            _stable_hash((labels[v], tuple(sorted(labels[u] for u in adjacency[v]))))
+            for v in range(len(labels))
+        ]
+    return _stable_hash(tuple(sorted(labels)))
+
+
+def structure_type_ids(snapshot, particles_species: np.ndarray,
+                       rounds: int = 3) -> np.ndarray:
+    """Per-alive-composite structure type ids (WL hash of the bond graph).
+
+    particles_species: (num_particles,) int32 — species are constant over a run,
+    so the caller reconstructs them once (re-init world with the run seed).
+    A multi-member composite with edge_count == 0 (valence-off / star_spring,
+    where edges are physics-inert) falls back to a hash of its species multiset.
+    """
+    alive_idx = np.nonzero(snapshot.alive)[0]
+    out = np.empty(len(alive_idx), dtype=np.uint64)
+    for k, c in enumerate(alive_idx):
+        n = int(snapshot.member_count[c])
+        members = snapshot.members[c, :n]
+        members = members[members >= 0]
+        local = {int(pid): i for i, pid in enumerate(members)}
+        node_labels = [int(particles_species[pid]) for pid in members]
+        adjacency: List[List[int]] = [[] for _ in range(len(members))]
+        ec = int(snapshot.edge_count[c])
+        for e in range(ec):
+            a, b = int(snapshot.edges[c, e, 0]), int(snapshot.edges[c, e, 1])
+            if a in local and b in local:
+                adjacency[local[a]].append(local[b])
+                adjacency[local[b]].append(local[a])
+        if ec == 0 and len(members) > 1:
+            h = _stable_hash(('composition', tuple(sorted(node_labels))))
+        else:
+            h = _wl_graph_hash(node_labels, adjacency, rounds)
+        out[k] = np.uint64(h)
+    return out
