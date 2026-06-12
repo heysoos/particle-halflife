@@ -322,3 +322,87 @@ def plot_compatibility_matrix(
     cbar.set_label('merged BE', rotation=270, labelpad=10)
     cbar.ax.tick_params(labelsize=6.5)
     return _fig_to_base64(fig)
+
+
+# ── Tier 5: Open-endedness & temporal evolution ─────────────────────────────
+
+def plot_discovery_curves(steps, comp_cum, struct_cum, total_comp_events: int) -> str:
+    """Cumulative distinct-types vs step, composition + structure overlaid."""
+    fig = Figure(figsize=(5.5, 2.6), constrained_layout=True)
+    ax = fig.subplots()
+    ax.plot(steps, comp_cum, color=_C_PRIMARY, lw=1.6, label='composition')
+    ax.plot(steps, struct_cum, color=_C_ACCENT, lw=1.6, label='structure')
+    ax.axhline(total_comp_events, color=_C_SECONDARY, lw=0.9, ls='--',
+               label=f'all composition types (events): {total_comp_events}')
+    ax.set_xlabel('step'); ax.set_ylabel('distinct types (cumulative)')
+    ax.set_title('Type discovery curve')
+    ax.grid(True); ax.legend(loc='upper left')
+    return _fig_to_base64(fig)
+
+
+def plot_novelty_rate(window_labels, comp_counts, struct_counts) -> str:
+    """Grouped bars: new types first seen per window, both axes."""
+    fig = Figure(figsize=(5.5, 2.6), constrained_layout=True)
+    ax = fig.subplots()
+    x = np.arange(len(window_labels))
+    ax.bar(x - 0.2, comp_counts, width=0.4, color=_C_PRIMARY, label='composition')
+    ax.bar(x + 0.2, struct_counts, width=0.4, color=_C_ACCENT, label='structure')
+    ax.set_xticks(x); ax.set_xticklabels(window_labels, fontsize=6.5)
+    ax.set_ylabel('new types'); ax.set_title('Novelty rate per window')
+    ax.grid(True, axis='y'); ax.legend()
+    return _fig_to_base64(fig)
+
+
+def _plot_hill_panel(ax, steps, hill, title):
+    ax.plot(steps, hill['q0'], color=_C_SECONDARY, lw=1.4, label='q=0 richness')
+    ax.plot(steps, hill['q1'], color=_C_PRIMARY, lw=1.4, label='q=1 Shannon')
+    ax.plot(steps, hill['q2'], color=_C_TERTIARY, lw=1.4, label='q=2 Simpson')
+    ax.set_xlabel('step'); ax.set_ylabel('effective # types')
+    ax.set_title(title); ax.grid(True); ax.legend(fontsize=6.5)
+
+
+def plot_hill_diversity(steps, comp_hill, struct_hill) -> str:
+    """Two side-by-side panels: alive-type diversity for each axis."""
+    fig = Figure(figsize=(5.5, 2.6), constrained_layout=True)
+    ax1, ax2 = fig.subplots(1, 2)
+    _plot_hill_panel(ax1, steps, comp_hill, 'Composition diversity')
+    _plot_hill_panel(ax2, steps, struct_hill, 'Structure diversity')
+    return _fig_to_base64(fig)
+
+
+def plot_turnover_grid(comp_turnover, struct_turnover, window_labels) -> str:
+    """2×2 heatmaps: {Jaccard, Bray-Curtis} × {composition, structure}."""
+    fig = Figure(figsize=(5.5, 5.2), constrained_layout=True)
+    axes = fig.subplots(2, 2)
+    panels = [
+        (axes[0, 0], comp_turnover['jaccard'],      'Composition · Jaccard'),
+        (axes[0, 1], struct_turnover['jaccard'],    'Structure · Jaccard'),
+        (axes[1, 0], comp_turnover['bray_curtis'],  'Composition · Bray-Curtis'),
+        (axes[1, 1], struct_turnover['bray_curtis'],'Structure · Bray-Curtis'),
+    ]
+    short = [l.split('\n')[0] for l in window_labels]
+    for ax, M, title in panels:
+        im = ax.imshow(np.nan_to_num(M, nan=0.0), cmap='viridis', vmin=0.0, vmax=1.0)
+        ax.set_xticks(range(len(window_labels)))
+        ax.set_yticks(range(len(window_labels)))
+        ax.set_xticklabels(short, fontsize=6.5)
+        ax.set_yticklabels(short, fontsize=6.5)
+        ax.set_title(title, fontsize=8)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    return _fig_to_base64(fig)
+
+
+def plot_window_size_facets(per_window_hist, window_labels) -> str:
+    """Overlaid composite-size distributions, one line per window."""
+    fig = Figure(figsize=(5.5, 2.6), constrained_layout=True)
+    ax = fig.subplots()
+    cmap = plt.get_cmap('plasma')
+    n = len(per_window_hist)
+    for i, (h, label) in enumerate(zip(per_window_hist, window_labels)):
+        sizes = np.arange(1, len(h) + 1)
+        ax.plot(sizes, h, lw=1.3, color=cmap(i / max(n - 1, 1)),
+                label=label.split('\n')[0])
+    ax.set_xlabel('composite size'); ax.set_ylabel('mean count')
+    ax.set_yscale('symlog'); ax.set_title('Size distribution by window')
+    ax.grid(True); ax.legend(fontsize=6.5)
+    return _fig_to_base64(fig)

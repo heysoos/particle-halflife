@@ -231,3 +231,28 @@ def test_per_window_size_hist_means_rows():
     out = oe.per_window_size_hist(per_step, windows)
     assert np.allclose(out[0], [0, 3, 0])
     assert np.allclose(out[1], [0, 0, 7])
+
+
+def test_tier5_plot_builders_return_base64():
+    from halflife.analysis import plots
+    steps = np.array([100, 200, 300])
+    win_labels = ['W1\n0-150', 'W2\n150-300']
+
+    a = plots.plot_discovery_curves(
+        steps, np.array([1, 2, 3]), np.array([1, 1, 2]), total_comp_events=5)
+    b = plots.plot_novelty_rate(win_labels, np.array([2, 1]), np.array([1, 1]))
+    c = plots.plot_hill_diversity(
+        steps,
+        {'q0': np.array([1., 2., 3.]), 'q1': np.array([1., 2., 3.]), 'q2': np.array([1., 2., 3.])},
+        {'q0': np.array([1., 1., 2.]), 'q1': np.array([1., 1., 2.]), 'q2': np.array([1., 1., 2.])},
+    )
+    d = plots.plot_turnover_grid(
+        {'jaccard': np.zeros((2, 2)), 'bray_curtis': np.zeros((2, 2))},
+        {'jaccard': np.zeros((2, 2)), 'bray_curtis': np.zeros((2, 2))},
+        win_labels,
+    )
+    e = plots.plot_window_size_facets(
+        [np.array([0, 3, 0]), np.array([0, 0, 7])], win_labels)
+
+    for img in (a, b, c, d, e):
+        assert isinstance(img, str) and len(img) > 100   # non-empty base64
