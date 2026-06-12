@@ -100,12 +100,16 @@ def observed_pair_compat_matrix(
     H = hashes.astype(np.int64)
     merged = (H[:, None] + H[None, :]) % config.hash_modulus
 
-    be = np.zeros((K, K), dtype=np.float32)
-    for i in range(K):
-        for j in range(K):
-            be[i, j] = float(_hash_to_binding_energy(
-                jnp.uint32(int(merged[i, j])), config, physics
-            ))
+    # _hash_to_binding_energy is fully elementwise (uint32 arithmetic), so the
+    # whole (K, K) matrix computes in ONE JAX call. The previous per-cell
+    # double loop dispatched K² scalar JAX calls — 215s at K≈958 on a 15k-step
+    # run with long half-lives — and size_pair_compat_matrix pays it again.
+    # merged ∈ [0, hash_modulus) and hash_modulus < 2³², so uint32 is lossless;
+    # array vs scalar uint32 ops wrap identically, so this is bit-for-bit equal
+    # to the loop (verified on the 15k cache).
+    be = np.asarray(
+        _hash_to_binding_energy(jnp.asarray(merged, dtype=jnp.uint32), config, physics)
+    ).astype(np.float32)
 
     passes_be = be >= float(physics.fusion_threshold)
 
