@@ -26,3 +26,4 @@ tests/reports/
 build/
 dist/
 *.egg-info/
+.superpowers/
