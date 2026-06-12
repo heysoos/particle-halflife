@@ -176,3 +176,25 @@ def total_composition_types_from_events(events) -> int:
     mask = events.product_sizes >= 2
     vals = events.product_hashes[mask]
     return int(np.unique(vals).size)
+
+
+# ── Diversity ───────────────────────────────────────────────────────────────
+
+def hill_diversity(type_id_arrays: List[np.ndarray]) -> Dict[str, np.ndarray]:
+    """Per-snapshot Hill numbers of the currently-alive type distribution.
+
+    Abundance of a type = number of alive composites of that type (each
+    composite is one individual). q0 = richness, q1 = exp(Shannon),
+    q2 = inverse-Simpson. Empty snapshots → 0.
+    """
+    n = len(type_id_arrays)
+    q0 = np.zeros(n); q1 = np.zeros(n); q2 = np.zeros(n)
+    for i, ids in enumerate(type_id_arrays):
+        if ids.size == 0:
+            continue
+        _, counts = np.unique(ids, return_counts=True)
+        p = counts / counts.sum()
+        q0[i] = counts.size
+        q1[i] = np.exp(-np.sum(p * np.log(p)))
+        q2[i] = 1.0 / np.sum(p * p)
+    return {'q0': q0, 'q1': q1, 'q2': q2}

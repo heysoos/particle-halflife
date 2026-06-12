@@ -168,3 +168,26 @@ def test_total_composition_types_from_events_counts_distinct_products():
     )
     # Distinct product hashes among size>=2 products: {5, 7, 9} → 3.
     assert oe.total_composition_types_from_events(ev) == 3
+
+
+def test_hill_diversity_uniform_three_types():
+    # 3 distinct types, one composite each → q0=q1=q2=3 (perfectly even).
+    sets = [np.array([1, 2, 3], np.uint64)]
+    h = oe.hill_diversity(sets)
+    assert h['q0'][0] == 3.0
+    assert abs(h['q1'][0] - 3.0) < 1e-9
+    assert abs(h['q2'][0] - 3.0) < 1e-9
+
+
+def test_hill_diversity_skewed():
+    # Type 1 dominates (8) vs type 2 (rare, 2): richness=2 but effective < 2.
+    sets = [np.array([1] * 8 + [2] * 2, np.uint64)]
+    h = oe.hill_diversity(sets)
+    assert h['q0'][0] == 2.0
+    assert 1.0 < h['q1'][0] < 2.0
+    assert h['q2'][0] < h['q1'][0]   # inverse-Simpson penalizes dominance more
+
+
+def test_hill_diversity_empty_snapshot_is_zero():
+    h = oe.hill_diversity([np.array([], np.uint64)])
+    assert h['q0'][0] == 0.0 and h['q1'][0] == 0.0 and h['q2'][0] == 0.0
