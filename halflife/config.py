@@ -178,7 +178,10 @@ class SimConfig:
     # event tuples (source/product slot/hash/size) for the analysis pipeline.
     # Static-arg: when False, the emission code path is dead-code-eliminated
     # before JIT compilation — bit-for-bit the same kernel as before. The
-    # halflife.analysis runner sets this True; the live app leaves it False.
+    # halflife.analysis runner sets this True, and since 2026-06-12 the live
+    # app (main.py build_config) also turns it on to drive the renderer's
+    # event sprites from real events (+3.0% step cost measured at 5k
+    # particles). Headless/test configs keep the False default.
     emit_events: bool = False
 
     # ── Rendering ────────────────────────────────────────────────────────────

@@ -42,7 +42,7 @@ import pygame
 
 from halflife.config import SimConfig
 from halflife.state import initialize_world, initialize_interaction_params, initialize_physics_params
-from halflife.step import make_run_n_steps
+from halflife.step import make_run_n_steps, make_run_n_steps_with_events
 from halflife.renderer import Renderer
 from halflife.profiler import ProfileMetrics
 from halflife.chemistry import compute_r_rest_matrix
@@ -90,7 +90,27 @@ def build_config(args) -> SimConfig:
     if args.height    is not None: kwargs['world_height']       = args.height
     kwargs['enable_profiling'] = args.enable_profiling
     kwargs['cc_fusion_event_logging'] = args.enable_profiling
+    # The live app runs with kernel event emission ON so the renderer's event
+    # sprites come from real ReactionEvents (correct fusion/fission semantics)
+    # instead of diffing composite alive-masks across frames. Measured cost:
+    # +3.0% per step (2026-06-12).
+    kwargs['emit_events'] = True
     return SimConfig(**kwargs)
+
+
+def _make_runner(config: SimConfig):
+    """Build the per-frame step runner with a uniform (state, events) return.
+
+    With config.emit_events on, the runner yields real per-step ReactionEvent
+    batches (stacked along a leading step axis) for the renderer's event
+    sprites; otherwise events is None and sprite admission simply skips."""
+    if config.emit_events:
+        return make_run_n_steps_with_events(config)
+    plain = make_run_n_steps(config)
+
+    def runner(state, params, physics, n_steps):
+        return plain(state, params, physics, n_steps), None
+    return runner
 
 
 def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
@@ -122,7 +142,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
     # JIT-compile via make_run_n_steps (first call triggers compilation)
     print("JIT-compiling simulation step... (this takes ~10-30 seconds first time)")
     t0 = time.time()
-    run_n = make_run_n_steps(config)
+    run_n = _make_runner(config)
     # Warm up with a single step
     _ = run_n(state, params, physics, 1)
     jax.block_until_ready(_)
@@ -145,11 +165,14 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
 
     print("Running. Controls: Space=pause, +/-=speed, B=composite mode, M=bond mode, R=reset, Q=quit")
 
-    # Async pipeline: pre-dispatch first batch so GPU starts immediately
+    # Async pipeline: pre-dispatch first batch so GPU starts immediately.
+    # pending_events rides alongside pending_state: the stacked per-step
+    # ReactionEvent batch produced by the same run_n call (or None).
     pending_state = state
+    pending_events = None
     state_before_step = state  # Track for fusion detection
     if not paused:
-        pending_state = run_n(pending_state, params, physics, steps_per_frame)
+        pending_state, pending_events = run_n(pending_state, params, physics, steps_per_frame)
 
     # Reroll counter: bumps each click so successive rerolls draw fresh seeds.
     # Reset (R-key / Reset button) does NOT bump this — Reset returns to the
@@ -302,7 +325,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
                     # sliders so the right stiffness knob (k_bond or spring_k)
                     # is exposed, and dirties the HUD so the badge repaints.
                     renderer.set_bond_mode(new_mode, config)
-                    run_n = make_run_n_steps(config)
+                    run_n = _make_runner(config)
 
                 elif event.key == pygame.K_r:
                     reset_requested = True
@@ -321,8 +344,9 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
             # so re-sync r_rest to the persisted radii (init rebuilt it from config).
             params = _sync_r_rest(params, config, physics)
             pending_state = state
+            pending_events = None
             if not paused:
-                pending_state = run_n(pending_state, params, physics, steps_per_frame)
+                pending_state, pending_events = run_n(pending_state, params, physics, steps_per_frame)
 
         if reroll_kind is not None:
             reroll_counter += 1
@@ -332,12 +356,13 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
             if reroll_kind in ('all', 'particles'):
                 state = initialize_world(config, seed=new_seed)
                 pending_state = state
+                pending_events = None
             if reroll_kind in ('all', 'chemistry'):
                 params = initialize_interaction_params(config, seed=new_seed + 1)
                 # Keep r_rest on the persisted slider radii, not the config defaults.
                 params = _sync_r_rest(params, config, physics)
             if not paused and reroll_kind in ('all', 'particles'):
-                pending_state = run_n(pending_state, params, physics, steps_per_frame)
+                pending_state, pending_events = run_n(pending_state, params, physics, steps_per_frame)
             print(f"Rerolled {reroll_kind} (offset {reroll_counter}, seed {new_seed})")
 
         # ── Consume slider updates (before next dispatch) ─────────────────────
@@ -354,16 +379,19 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
         # while CPU renders frame N. This hides simulation latency.
         t0_sim = time.perf_counter()
         if not paused and not reset_requested:
-            next_pending = run_n(pending_state, params, physics, steps_per_frame)
+            next_pending, next_events = run_n(pending_state, params, physics, steps_per_frame)
         else:
-            next_pending = pending_state
+            next_pending, next_events = pending_state, None
         _t_sim.append(time.perf_counter() - t0_sim)
 
         # ── Render ────────────────────────────────────────────────────────────
         # renderer.update() triggers the GPU→CPU transfer for pending_state.
         # Meanwhile the GPU is already working on next_pending.
         t0_update = time.perf_counter()
-        renderer.update(pending_state)
+        renderer.update(pending_state, events=pending_events)
+        # Events are consumed exactly once — clear so paused frames (which
+        # re-render the same pending_state) don't re-admit the same sprites.
+        pending_events = None
         _t_update.append(time.perf_counter() - t0_update)
 
         n_alive    = config.num_particles
@@ -377,6 +405,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
         # Advance pipeline
         if not paused:
             pending_state = next_pending
+            pending_events = next_events
 
         # Record metrics if profiling enabled (Python level, outside JIT)
         if metrics is not None and config.enable_profiling:

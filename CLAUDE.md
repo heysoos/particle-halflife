@@ -316,8 +316,15 @@ makes small composites of low-v species *immediately* saturated, as in real mole
   - **Merged mode**: single large point at center of mass
 - **HUD overlay**: pygame RGBA surface uploaded each frame as an OpenGL texture on a
   fullscreen quad. Buttons on the left edge; key hints at the bottom.
-- **Event sprites**: expanding ring point sprites at fusion (gold), fission (cyan),
-  spawn (green), decay (red) sites. Age tracked in sim-time; capped at 200.
+- **Event sprites** (rebuilt 2026-06-12): expanding ring point sprites sourced from the
+  kernels' real `ReactionEvent` batches (the live app runs `emit_events=True`;
+  `make_run_n_steps_with_events` returns the stacked per-step events alongside the
+  state). Gold = fusion (min-image midpoint of the two contact particles), cyan =
+  fission (member COM of the parent slot), red = full dissolution (both fission
+  products size 1). Age tracked in sim-time, birth staggered by step index within
+  the frame batch. Sprite pool is a 200-row ring buffer (oldest overwritten —
+  admission never stalls). Replaced the old comp_alive frame-diff detector, which
+  missed parent-slot-reusing fissions and burst-oscillated when the pool saturated.
 - **Stats panel** (toggle): FPS, step, sim time, alive, composites, energy,
   composite-size histogram.
 - **Async overlap**: `simulation_step(N+1)` dispatched before rendering frame N
@@ -462,10 +469,13 @@ across the two scenarios is the core diagnostic move:
 
 ### Live-app cost
 
-**Zero.** The diagnostic kernel emission is gated by `SimConfig.emit_events` (default `False`,
-`static_argnums`). When the live app runs with the default config, the emit branch is
-dead-code-eliminated before JIT — the compiled kernel is bit-for-bit unchanged from the
-pre-pipeline version.
+The diagnostic kernel emission is gated by `SimConfig.emit_events` (default `False`,
+`static_argnums`); when False the emit branch is dead-code-eliminated before JIT — the
+compiled kernel is bit-for-bit unchanged from the pre-pipeline version. **Since
+2026-06-12 the live app (main.py `build_config`) deliberately sets `emit_events=True`**
+to drive the renderer's event sprites from real events — measured cost +0.056 ms/step
+(+3.0%) at 5k particles including the host transfer. Headless/test configs keep the
+zero-cost False default.
 
 ### Testing the pipeline itself
 

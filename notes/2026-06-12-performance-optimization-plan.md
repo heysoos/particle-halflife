@@ -274,3 +274,36 @@ Proposed fixes (not yet implemented):
 3. Decide on findings A/B/C (science calls).
 4. Tier 3: parallel fusion → decay compaction → ring closure, each validated with the
    `halflife.analysis` diagnostic against a baseline cache before merging.
+
+## Event-sprite rebuild — BUILT (2026-06-12, same day)
+
+The "right" fix above is implemented:
+
+- `step.py`: new `make_run_n_steps_with_events(config)` — same scan runner,
+  but the body's per-step ReactionEvent is a scan output, so each frame
+  returns `(final_state, events)` with arrays shaped `(steps_per_frame, E, …)`,
+  E = min(max_fusions, N) + min(max_fissions, C). Measured earlier at
+  +0.056 ms/step (+3.0%) at 5k including host transfer.
+- `main.py`: `build_config` now sets `emit_events=True` for the live app;
+  `_make_runner` normalizes both runners to a `(state, events)` return. The
+  async pipeline carries `pending_events` beside `pending_state`; events are
+  passed to `renderer.update(state, events=...)` exactly once and cleared, so
+  paused frames can't re-admit sprites.
+- `renderer.py`: the `_prev_comp_alive` diff detector is gone. Sprites come
+  from event kinds — gold = fusion (midpoint of the two contact particles,
+  min-image), cyan = fission (frame-end member COM of the parent slot, which
+  fission re-packs with product 0's members), red = full dissolution (both
+  fission products size 1). Birth times are staggered by step index within
+  the frame batch. The sprite pool is a fixed 200-row ring buffer
+  (`_admit_event_sprites`): unconditional admission, oldest overwritten —
+  the zero-admission oscillation cannot occur at any event rate. Rate
+  counters / sparklines now use true kernel counts instead of slot-diff
+  proxies. Sim-reset is handled: sprites with birth > current sim time
+  (time rewound to 0) read age < 0 and are hidden.
+
+Verified: `/tmp/verify_event_sprites.py` (CPU) — runner shapes, scan-stacked
+events bit-identical to per-step calls, fusion/fission sprite positions
+finite + in-bounds over 40 frames of real events, ring wraparound/oversize/
+expiry semantics. `tests/test_analysis_events.py` + `tests/test_step.py`:
+20 passed. Visual confirmation (steady non-bursty sprites, cyan fissions
+visible) pending user run.

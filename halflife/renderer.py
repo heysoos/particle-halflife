@@ -28,7 +28,8 @@ import moderngl
 import jax
 
 from halflife.config import SimConfig
-from halflife.state import WorldState, get_species_colors, initialize_physics_params
+from halflife.state import WorldState, ReactionEvent, get_species_colors, initialize_physics_params
+from halflife.analysis.events import KIND_FUSION, KIND_FISSION
 from halflife.profiler import ProfileMetrics
 from halflife.render.widgets import Slider
 from halflife.render.camera import Camera
@@ -589,7 +590,16 @@ class Renderer:
         )
         self._n_event_vertices = 0
         # Each event: (x, y, r, g, b, birth_sim_time, lifetime)
-        self._events = []
+        # Sprite pool is a fixed-size RING BUFFER — new sprites overwrite the
+        # oldest, so admission never stalls. The previous list-based pool
+        # stopped admitting while full, which made sprites appear in bursts
+        # with period ≈ sprite lifetime (saturation oscillation, diagnosed
+        # 2026-06-12). birth_sim_time = -inf marks a never-written row
+        # (treated as expired by the VBO build).
+        self._event_ring = np.zeros((self._event_max, 7), dtype=np.float32)
+        self._event_ring[:, 5] = -np.inf
+        self._event_ring[:, 6] = 1.0   # avoid div-by-zero in the age compute
+        self._event_ring_ptr = 0
 
         # ── Color palette ─────────────────────────────────────────────────────
         self.species_colors = get_species_colors(config)
@@ -723,8 +733,6 @@ class Renderer:
         # all other UI changes (toggles, slider drags, button label flips)
         # explicitly set dirty=True via the mutator that caused them.
         self._hud_dirty = True
-
-        self._prev_comp_alive = None
 
         self._stats_alive    = 0
         self._stats_free     = 0
@@ -1005,10 +1013,46 @@ class Renderer:
 
     # ── Per-frame update ──────────────────────────────────────────────────────
 
-    def update(self, state: WorldState):
+    def _admit_event_sprites(self, xy: np.ndarray, rgb: np.ndarray,
+                             birth: np.ndarray, lifetime: float) -> None:
+        """Write event sprites into the ring-buffer pool, overwriting oldest.
+
+        Admission is unconditional — the pool never refuses an event, so the
+        sprite stream can't saturate-and-stall the way the old budgeted list
+        did (zero-admission frames until a batch expired → bursts with period
+        ≈ sprite lifetime). If a single frame brings more events than the
+        pool holds, only the newest _event_max survive: graceful degradation.
+
+        xy: (n, 2) world positions; rgb: (n, 3); birth: (n,) sim times.
+        """
+        n = len(xy)
+        if n == 0:
+            return
+        cap = self._event_max
+        if n >= cap:
+            xy, rgb, birth = xy[-cap:], rgb[-cap:], birth[-cap:]
+            rows = np.arange(cap)
+            self._event_ring_ptr = 0
+            n = cap
+        else:
+            rows = (self._event_ring_ptr + np.arange(n)) % cap
+            self._event_ring_ptr = int((self._event_ring_ptr + n) % cap)
+        self._event_ring[rows, 0:2] = xy
+        self._event_ring[rows, 2:5] = rgb
+        self._event_ring[rows, 5]   = birth
+        self._event_ring[rows, 6]   = lifetime
+
+    def update(self, state: WorldState, events: Optional[ReactionEvent] = None):
         """
         Transfer simulation state to GPU buffers for rendering.
         Called once per frame before render().
+
+        events: stacked per-step ReactionEvent batch from this frame's
+        run_n call (arrays shaped (steps_per_frame, E, ...)), or None when
+        no new steps ran (paused) / emit_events is off. Drives the event
+        sprites and the fusion/fission rate counters. The caller must pass
+        each batch exactly once — re-passing it would re-admit the same
+        sprites.
         """
         config = self.config
         particles  = state.particles
@@ -1278,58 +1322,97 @@ class Renderer:
                 else:
                     self._stats_hist = np.zeros(config.max_composite_size, dtype=np.int32)
 
-        # ── Event detection ───────────────────────────────────────────────────
+        # ── Event sprites (from kernel ReactionEvents) ────────────────────────
+        # Sprites are sourced from the real per-step fusion/fission events
+        # emitted by the chemistry kernels (config.emit_events). The previous
+        # approach diffed comp_alive across frames, which — since binary
+        # hash-fission reuses the parent's composite slot — missed typical
+        # fissions entirely, rendered product-1's fresh slot GOLD as a
+        # "fusion", and rendered comp+comp-absorbed slots CYAN as "fissions".
         current_sim_time  = self._stats_sim_time
         comp_lifetime_secs = 50.0 * config.dt
-        part_lifetime_secs = 20.0 * config.dt
 
-        # Expire old events
-        self._events = [
-            ev for ev in self._events
-            if current_sim_time - ev[5] < ev[6]
-        ]
+        n_fusion = n_fission = 0
+        if events is not None:
+            # Small dedicated transfer: the event arrays live on device until
+            # here (a few KB per frame; the big state transfer above already
+            # paid the sync).
+            ev_kind, ev_src, ev_prod_sizes = jax.device_get(
+                (events.kind, events.source_slots, events.product_sizes)
+            )
+            T = ev_kind.shape[0]   # steps in this frame's batch
+            # Birth time staggered by step index so multi-step frames spread
+            # their rings over the batch's time span instead of one pulse.
+            step_birth = current_sim_time - (
+                T - 1 - np.arange(T, dtype=np.float32)
+            ) * config.dt
 
-        if self._show_events and self._prev_comp_alive is not None:
-            new_comps  = ~self._prev_comp_alive & comp_alive
-            dead_comps = self._prev_comp_alive  & ~comp_alive
+            fu = ev_kind == KIND_FUSION    # (T, E)
+            fi = ev_kind == KIND_FISSION
+            n_fusion  = int(fu.sum())
+            n_fission = int(fi.sum())
 
-            budget = max(0, self._event_max - len(self._events))
+            if self._show_events:
+                # Fusion (gold). The event's source_slots are the two
+                # contacting PARTICLE ids — sprite at their min-image
+                # midpoint, using frame-end positions (drift within the
+                # batch is a few dt of motion; cosmetic).
+                if n_fusion:
+                    t_idx = np.nonzero(fu)[0]
+                    ij = ev_src[fu]                      # (n, 2) particle ids
+                    pa = pos[ij[:, 0]]
+                    d  = pos[ij[:, 1]] - pa
+                    self._wrap_min_image(d)
+                    mid = pa + 0.5 * d
+                    if config.boundary_mode == "periodic":
+                        mid[:, 0] = np.mod(mid[:, 0], config.world_width)
+                        mid[:, 1] = np.mod(mid[:, 1], config.world_height)
+                    cols = np.broadcast_to(
+                        np.array([1.0, 0.85, 0.0], dtype=np.float32),
+                        (n_fusion, 3))
+                    self._admit_event_sprites(
+                        mid, cols, step_birth[t_idx], comp_lifetime_secs)
 
-            # Fusion events (gold)
-            for c in np.where(new_comps)[0][:min(40, budget // 3)]:
-                n       = comp_count[c]
-                mems    = comp_members[c, :n]
-                valid_m = mems[mems >= 0]
-                if len(valid_m) > 0:
-                    com = self._periodic_com(pos[valid_m])
-                    self._events.append(
-                        (float(com[0]), float(com[1]),
-                         1.0, 0.85, 0.0, current_sim_time, comp_lifetime_secs)
-                    )
+                # Fission (cyan; red when the composite fully dissolved into
+                # free particles, i.e. both products are size 1). The event's
+                # source_slots[0] is the parent COMPOSITE slot; fission packs
+                # product 0's members into that slot even when the product
+                # doesn't survive as a composite, so the slot's frame-end
+                # member COM marks the fission site. (A slot reused by a
+                # later same-frame reaction can misplace the ring — rare and
+                # cosmetic.)
+                if n_fission:
+                    t_idx = np.nonzero(fi)[0]
+                    c  = ev_src[fi][:, 0]                # (n,) composite slots
+                    mb = comp_members[c]                 # (n, M)
+                    vm = mb >= 0
+                    has_m = vm.any(axis=1)               # members are densely
+                    safe  = np.where(vm, mb, 0)          # packed from slot 0
+                    gpos  = pos[safe]                    # (n, M, 2)
+                    ref   = gpos[:, 0, :]
+                    rel   = gpos - ref[:, None, :]
+                    self._wrap_min_image(rel)
+                    com = ref + (rel * vm[:, :, None]).sum(1) / np.maximum(
+                        vm.sum(1), 1)[:, None]
+                    if config.boundary_mode == "periodic":
+                        com[:, 0] = np.mod(com[:, 0], config.world_width)
+                        com[:, 1] = np.mod(com[:, 1], config.world_height)
+                    dissolved = (ev_prod_sizes[fi] <= 1).all(axis=1)
+                    cols = np.where(
+                        dissolved[:, None],
+                        np.array([1.0, 0.25, 0.2], dtype=np.float32),
+                        np.array([0.0, 1.0, 1.0], dtype=np.float32),
+                    ).astype(np.float32)
+                    self._admit_event_sprites(
+                        com[has_m], cols[has_m], step_birth[t_idx][has_m],
+                        comp_lifetime_secs)
 
-            # Fission events (cyan)
-            for c in np.where(dead_comps)[0][:min(40, budget // 3)]:
-                n       = comp_count[c]
-                mems    = comp_members[c, :n]
-                valid_m = mems[mems >= 0]
-                if len(valid_m) > 0:
-                    com = self._periodic_com(pos[valid_m])
-                    self._events.append(
-                        (float(com[0]), float(com[1]),
-                         0.0, 1.0, 1.0, current_sim_time, comp_lifetime_secs)
-                    )
-
-            # Hard cap
-            self._events = self._events[-self._event_max:]
-
-        # Accumulate event counts (composite-level only; free particles don't decay)
-        if self._prev_comp_alive is not None:
-            n_fusion = int(np.sum(~self._prev_comp_alive & comp_alive))
-            n_decay  = int(np.sum(self._prev_comp_alive  & ~comp_alive))
+        # Accumulate event counts (true kernel counts, not slot-diff proxies)
+        if events is not None:
             self._fusion_total += n_fusion
-            self._decay_total  += n_decay
+            self._decay_total  += n_fission
             self._event_history.append(
-                (self._stats_sim_time, n_fusion, n_decay)
+                (self._stats_sim_time, n_fusion, n_fission)
             )
             recent = [e for e in self._event_history
                       if e[0] >= self._stats_sim_time - 0.5]
@@ -1346,19 +1429,23 @@ class Renderer:
         self._spark_fusion.append(self._fusion_rate)
         self._spark_decay.append(self._decay_rate)
 
-        self._prev_comp_alive = comp_alive.copy()
-
         # ── Build event VBO ───────────────────────────────────────────────────
+        # Live sprites = ring rows whose age ∈ [0, 1). Expiry is implicit
+        # (no list filtering): expired rows just stop being uploaded until
+        # overwritten.
         self._n_event_vertices = 0
-        if self._show_events and self._events:
-            ev_data = []
-            for (x, y, r, g, b, bt, lt) in self._events:
-                age = float(np.clip((current_sim_time - bt) / max(lt, 1e-8), 0.0, 1.0))
-                ev_data.append([x, y, r, g, b, age])
-            ev_arr = np.array(ev_data, dtype=np.float32)
-            n_bytes = min(ev_arr.nbytes, self._event_max * 6 * 4)
-            self._event_vbo.write(ev_arr.flatten().tobytes()[:n_bytes])
-            self._n_event_vertices = len(ev_data)
+        if self._show_events:
+            birth = self._event_ring[:, 5]
+            age = (current_sim_time - birth) / np.maximum(
+                self._event_ring[:, 6], 1e-8)
+            live = (age >= 0.0) & (age < 1.0)
+            n_live = int(live.sum())
+            if n_live:
+                out = np.empty((n_live, 6), dtype=np.float32)
+                out[:, 0:5] = self._event_ring[live, 0:5]
+                out[:, 5]   = age[live]
+                self._event_vbo.write(out.tobytes())
+                self._n_event_vertices = n_live
 
         # ── Inspector snapshot ────────────────────────────────────────────────
         # Reads from the cached arrays stashed at the top of this method.
