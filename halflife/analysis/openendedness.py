@@ -198,3 +198,52 @@ def hill_diversity(type_id_arrays: List[np.ndarray]) -> Dict[str, np.ndarray]:
         q1[i] = np.exp(-np.sum(p * np.log(p)))
         q2[i] = 1.0 / np.sum(p * p)
     return {'q0': q0, 'q1': q1, 'q2': q2}
+
+
+# ── Turnover & size facets ──────────────────────────────────────────────────
+
+def window_turnover(type_id_arrays: List[np.ndarray],
+                    snapshot_steps: List[int],
+                    windows: List[Tuple[int, int]]) -> Dict[str, np.ndarray]:
+    """Pairwise window dissimilarity over aggregated type composition.
+
+    jaccard:     1 - |A∩B| / |A∪B| on presence/absence type sets.
+    bray_curtis: Σ|a_k - b_k| / Σ(a_k + b_k) on per-window summed abundance.
+    Empty-vs-empty window pairs → NaN (rendered as a neutral cell).
+    """
+    nW = len(windows)
+    win_ab: List[Dict[int, int]] = [dict() for _ in range(nW)]
+    for ids, step in zip(type_id_arrays, snapshot_steps):
+        wi = _window_index(step, windows)
+        if wi is None or ids.size == 0:
+            continue
+        u, c = np.unique(ids, return_counts=True)
+        d = win_ab[wi]
+        for t, cnt in zip(u.tolist(), c.tolist()):
+            d[t] = d.get(t, 0) + int(cnt)
+
+    jac = np.full((nW, nW), np.nan)
+    bc = np.full((nW, nW), np.nan)
+    for i in range(nW):
+        for j in range(nW):
+            a, b = win_ab[i], win_ab[j]
+            union = set(a) | set(b)
+            if not union:
+                continue
+            inter = set(a) & set(b)
+            jac[i, j] = 1.0 - len(inter) / len(union)
+            num = sum(abs(a.get(t, 0) - b.get(t, 0)) for t in union)
+            den = sum(a.get(t, 0) + b.get(t, 0) for t in union)
+            bc[i, j] = (num / den) if den else np.nan
+    return {'jaccard': jac, 'bray_curtis': bc}
+
+
+def per_window_size_hist(per_step_metrics: Dict[str, np.ndarray],
+                         windows: List[Tuple[int, int]]) -> List[np.ndarray]:
+    """Mean composite-size histogram within each window (from per-step metrics)."""
+    hist = per_step_metrics['size_histogram']   # (n_steps, S)
+    out = []
+    for (start, end) in windows:
+        seg = hist[start:end]
+        out.append(seg.mean(axis=0) if len(seg) else np.zeros(hist.shape[1]))
+    return out

@@ -191,3 +191,43 @@ def test_hill_diversity_skewed():
 def test_hill_diversity_empty_snapshot_is_zero():
     h = oe.hill_diversity([np.array([], np.uint64)])
     assert h['q0'][0] == 0.0 and h['q1'][0] == 0.0 and h['q2'][0] == 0.0
+
+
+def test_window_turnover_identical_windows_zero():
+    # Two windows with identical type composition → 0 dissimilarity off-diagonal.
+    sets = [np.array([1, 2], np.uint64), np.array([1, 2], np.uint64)]
+    steps = [100, 400]
+    windows = [(0, 300), (300, 600)]
+    t = oe.window_turnover(sets, steps, windows)
+    assert t['jaccard'].shape == (2, 2)
+    assert t['jaccard'][0, 1] == 0.0
+    assert t['bray_curtis'][0, 1] == 0.0
+
+
+def test_window_turnover_disjoint_windows_one():
+    # Completely different types between windows → Jaccard = 1.
+    sets = [np.array([1, 1], np.uint64), np.array([9, 9], np.uint64)]
+    steps = [100, 400]
+    windows = [(0, 300), (300, 600)]
+    t = oe.window_turnover(sets, steps, windows)
+    assert t['jaccard'][0, 1] == 1.0
+    assert t['bray_curtis'][0, 1] == 1.0
+
+
+def test_window_turnover_diagonal_is_self_zero():
+    sets = [np.array([1, 2], np.uint64), np.array([2, 3], np.uint64)]
+    steps = [100, 400]
+    windows = [(0, 300), (300, 600)]
+    t = oe.window_turnover(sets, steps, windows)
+    assert t['jaccard'][0, 0] == 0.0 and t['jaccard'][1, 1] == 0.0
+
+
+def test_per_window_size_hist_means_rows():
+    per_step = {'size_histogram': np.array([
+        [0, 2, 0], [0, 4, 0],          # window 0 (steps 0-1) → mean [0,3,0]
+        [0, 0, 6], [0, 0, 8],          # window 1 (steps 2-3) → mean [0,0,7]
+    ], dtype=np.float32)}
+    windows = [(0, 2), (2, 4)]
+    out = oe.per_window_size_hist(per_step, windows)
+    assert np.allclose(out[0], [0, 3, 0])
+    assert np.allclose(out[1], [0, 0, 7])
