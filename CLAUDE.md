@@ -423,6 +423,8 @@ When the user's `current_experiment` knobs change, update the preset in `halflif
 | `--seed S` | `0` | RNG seed |
 | `--sample-every K` | `100` | Full-snapshot interval. Compact metrics are emitted every step regardless. |
 | `--top-k N` | `30` | K for the top-K transition / compatibility matrices |
+| `--windows N` | `5` | Tier 5 time-window count (mutually exclusive with `--window-width`) |
+| `--window-width W` | none | Tier 5 fixed window width in steps (mutually exclusive with `--windows`) |
 | `--override "k1=v1,k2=v2"` | none | Per-run config overrides (e.g. `"num_species=5,fusion_radius=3.0"`) |
 | `--out PATH` | auto | Output path (default: `tests/reports/diag_<scenario>_<ts>.html`) |
 | `--platform cpu\|gpu` | auto | Force JAX platform. Use `cpu` for tiny test runs, `gpu` for real diagnosis |
@@ -459,6 +461,14 @@ across the two scenarios is the core diagnostic move:
 - High-BE cell in Tier 4b but cold in Tier 3 Matrix 2 → those composites *could* fuse
   but never met (kinetic problem) OR were valence-saturated in practice
 - Hatched-out cells in Tier 4a/b → valence-blocked regardless of BE
+
+The **Tier 5** open-endedness section quantifies novelty accumulation over the run on
+two type axes — composition (`species_hash`) and structure (Weisfeiler-Lehman bond-graph
+hash). It shows the cumulative type-discovery curve, per-window novelty rate, Hill-number
+diversity, window-to-window turnover (Jaccard / Bray-Curtis), and per-window size facets.
+All of it is host-side post-processing on the cached `RunResult`, so
+`--from-cache --windows N` re-renders a different windowing instantly. Resolved at
+`sample_every` cadence; structure metrics are only meaningful in `bond_mode="edges"` runs.
 
 ### Cost
 
