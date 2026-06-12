@@ -154,7 +154,10 @@ def test_apply_composite_decay_emits_fission_events():
     result = apply_composite_decay(state, config, physics)
     assert len(result) == 2, f"expected (state, events), got {len(result)}-tuple"
     new_state, events = result
-    assert events.kind.shape == (config.max_composites,)
+    # Fission events come from the compacted fission batch (2026-06-12), so
+    # the leading dim is the fission budget, not the full composite pool.
+    expected_f = min(config.max_fissions_per_step, config.max_composites)
+    assert events.kind.shape == (expected_f,)
 
     # Some composites should have died (half-life is 0.1-0.5 vs dt=physics.dt).
     n_died = int(state.composites.alive.sum()) - int(new_state.composites.alive.sum())
@@ -170,7 +173,9 @@ def test_apply_composite_decay_emits_fission_events():
 
 
 def test_simulation_step_returns_events_when_enabled():
-    """simulation_step with emit_events=True returns (state, events). E_max = max_fusions + max_composites."""
+    """simulation_step with emit_events=True returns (state, events).
+    E = min(max_fusions, N) + min(max_fissions, C) — both event batches are
+    budget-sized (2026-06-12), not pool-sized."""
     import dataclasses
     from halflife.step import simulation_step
     config = dataclasses.replace(_tiny_config(), emit_events=True)
@@ -181,7 +186,8 @@ def test_simulation_step_returns_events_when_enabled():
     result = simulation_step(state, params, config, physics)
     assert isinstance(result, tuple) and len(result) == 2
     new_state, events = result
-    expected_e = config.max_fusions_per_step + config.max_composites
+    expected_e = (min(config.max_fusions_per_step, config.num_particles)
+                  + min(config.max_fissions_per_step, config.max_composites))
     assert events.kind.shape == (expected_e,), f"expected ({expected_e},), got {events.kind.shape}"
 
 

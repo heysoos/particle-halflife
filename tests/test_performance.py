@@ -157,12 +157,13 @@ def benchmark_fusion_only():
     neighbors = neighbors_jit(state.particles.position, cl, config)
     neighbors.block_until_ready()
 
+    # attempt_fusion now returns (state, degree); benchmark unpacks the state.
     fusion_jit = jax.jit(attempt_fusion, static_argnums=(3,))
 
     state_holder = [state]
 
     def one_call():
-        state_holder[0] = fusion_jit(state, neighbors, params, config, physics)
+        state_holder[0] = fusion_jit(state, neighbors, params, config, physics)[0]
         state_holder[0].particles.composite_id.block_until_ready()
 
     mean_ms, std_ms = _time_fn(one_call, n_warmup=3, n_bench=50)
@@ -278,13 +279,28 @@ def benchmark_per_phase_breakdown():
     print(f"\nbenchmark_per_phase_breakdown  "
           f"(particles={config.num_particles}, composites={n_composites}):")
 
-    # JIT each phase
+    # JIT each phase. Mirrors the live simulation_step composition: edge-mode
+    # bond forces, the per-particle degree cache, fusion (now returning
+    # (state, degree)), ring closure, decay.
+    from halflife.step import compute_edge_bond_forces
+    from halflife.chemistry import (attempt_ring_closure, compute_degree,
+                                    _species_valences)
+
     build_jit   = jax.jit(build_cell_list,       static_argnums=(1,))
     nb_jit      = jax.jit(find_all_neighbors,    static_argnums=(2,))
     forces_jit  = jax.jit(compute_all_forces,    static_argnums=(4,))
     bond_jit    = jax.jit(compute_bond_forces,   static_argnums=(1,))
-    fusion_jit  = jax.jit(attempt_fusion,        static_argnums=(3,))
+    edge_jit    = jax.jit(compute_edge_bond_forces, static_argnums=(2,))
+    degree_jit  = jax.jit(compute_degree,        static_argnums=(1,))
     decay_jit   = jax.jit(apply_composite_decay, static_argnums=(1,))
+
+    sv = _species_valences(config)
+    fusion_jit = jax.jit(
+        lambda s, nbr, p, ph, deg: attempt_fusion(
+            s, nbr, p, config, ph, degree=deg, species_valences=sv))
+    ring_jit = jax.jit(
+        lambda s, nbr, p, ph, deg: attempt_ring_closure(
+            s, nbr, p, config, ph, degree=deg, species_valences=sv))
 
     @jax.jit
     def energy_phase(s):
@@ -298,6 +314,8 @@ def benchmark_per_phase_breakdown():
     cl_fixed.particle_ids.block_until_ready()
     nb_fixed = nb_jit(particles.position, cl_fixed, config)
     nb_fixed.block_until_ready()
+    degree_fixed = degree_jit(state.composites, config)
+    degree_fixed.block_until_ready()
 
     # Warm up all JITs
     for _ in range(3):
@@ -305,9 +323,14 @@ def benchmark_per_phase_breakdown():
         nb_jit(particles.position, cl_fixed, config).block_until_ready()
         forces_jit(particles.position, particles.species,
                    nb_fixed, params, config, physics).block_until_ready()
-        if config.use_bond_forces:
+        if config.bond_mode == "edges":
+            edge_jit(state, params, config, physics).block_until_ready()
+        elif config.bond_mode == "star_spring" and config.use_bond_forces:
             bond_jit(state, config, physics).block_until_ready()
-        fusion_jit(state, nb_fixed, params, config, physics).particles.composite_id.block_until_ready()
+        fusion_jit(state, nb_fixed, params, physics,
+                   degree_fixed)[0].particles.composite_id.block_until_ready()
+        ring_jit(state, nb_fixed, params, physics,
+                 degree_fixed)[0].composites.edge_count.block_until_ready()
         decay_jit(state, config, physics).particles.composite_id.block_until_ready()
         energy_phase(state).particles.velocity.block_until_ready()
         step_fn(state, params, config, physics).particles.position.block_until_ready()
@@ -328,15 +351,23 @@ def benchmark_per_phase_breakdown():
        lambda: forces_jit(particles.position, particles.species,
                           nb_fixed, params, config, physics)
                          .block_until_ready())
-    if config.use_bond_forces:
+    if config.bond_mode == "edges":
+        _t("4. compute_edge_bond_forces",
+           lambda: edge_jit(state, params, config, physics).block_until_ready())
+    elif config.bond_mode == "star_spring" and config.use_bond_forces:
         _t("4. compute_bond_forces",
            lambda: bond_jit(state, config, physics).block_until_ready())
-    _t("5. attempt_fusion",
-       lambda: fusion_jit(state, nb_fixed, params, config, physics)
-                         .particles.composite_id.block_until_ready())
-    _t("6. apply_composite_decay",
+    _t("5. compute_degree",
+       lambda: degree_jit(state.composites, config).block_until_ready())
+    _t("6. attempt_fusion",
+       lambda: fusion_jit(state, nb_fixed, params, physics,
+                          degree_fixed)[0].particles.composite_id.block_until_ready())
+    _t("6b. attempt_ring_closure",
+       lambda: ring_jit(state, nb_fixed, params, physics,
+                        degree_fixed)[0].composites.edge_count.block_until_ready())
+    _t("7. apply_composite_decay",
        lambda: decay_jit(state, config, physics).particles.composite_id.block_until_ready())
-    _t("7. energy_conservation",
+    _t("8. energy_conservation",
        lambda: energy_phase(state).particles.velocity.block_until_ready())
 
     full_ms, full_std = _time_fn(

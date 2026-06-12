@@ -111,7 +111,8 @@ def run_diagnostic(
     per_step_metrics = {k: np.concatenate(v, axis=0) for k, v in all_metrics.items()}
 
     # Concatenate event chunks across (chunk_idx, step, slot) → flat.
-    # Each chunk's events has shape (chunk, E, ...) where E = max_fusions + max_composites.
+    # Each chunk's events has shape (chunk, E, ...) where
+    # E = min(max_fusions, N) + min(max_fissions, C) (budget-sized batches).
     # Filter sentinels per-chunk to keep memory down, then concatenate.
     filtered_chunks = []
     for chunk_events in all_events_per_chunk:

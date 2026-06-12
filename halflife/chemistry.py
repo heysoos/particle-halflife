@@ -420,6 +420,12 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
     along the COM-vs-COM axis (product 0 → +direction, product 1 → -direction).
     Each product's members all get the same kick (the product moves as a unit).
 
+    Perf: per-fission work runs over a compacted batch of at most
+    config.max_fissions_per_step fissioning composites, not all C slots.
+    Fissions beyond the budget defer to the next step (the composite stays
+    alive and re-rolls). When emit_events is on, the fission ReactionEvent
+    batch has leading dim min(max_fissions_per_step, C) accordingly.
+
     Args:
         state:   WorldState
         config:  SimConfig (static)
@@ -441,15 +447,30 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
     decay_prob = 1.0 - jnp.exp(-physics.dt * ln2 / (composites.half_life + 1e-10))
     fissions = composites.alive & (rand < decay_prob)  # (C,) bool
 
-    # Pre-allocate fresh composite slots for product 1 of each fissioning composite.
-    free_slots = find_free_slots(composites.alive, C)  # (C,) int32
+    # ── Compact fissioning composites to a fixed batch (perf, 2026-06-12) ───
+    # The heavy per-fission work below (hash-partition argsort over M, product
+    # COMs, the (·, M) per-member kick grid) used to run for ALL C slots every
+    # step even though only a handful actually fission (~15/step steady state
+    # at num_species=3; ≤14 observed at 12 species). Gather the fissioning
+    # slots into a (K_f,) batch and run the heavy math only there. Fissions
+    # beyond the budget are deferred: the composite stays alive, unchanged,
+    # and simply re-rolls its decay next step.
+    K_f = min(config.max_fissions_per_step, C)
+    fission_rank = jnp.cumsum(fissions.astype(jnp.int32)) - 1  # rank among fissioning
+    selected = fissions & (fission_rank < K_f)
+    cand = jnp.where(selected, jnp.arange(C, dtype=jnp.int32), C)
+    fiss_idx = jnp.sort(cand)[:K_f]      # (K_f,) fissioning slot ids, C = padding
+    fiss_valid = fiss_idx < C            # (K_f,)
+    safe_fiss = jnp.minimum(fiss_idx, C - 1)
 
-    # Assign each fissioning composite a "fission rank" via cumsum so it
-    # picks free_slots[rank] as its product-1 target.
-    fission_rank = jnp.cumsum(fissions.astype(jnp.int32)) - 1  # (C,) — -1 for non-fissioning
+    # Pre-allocate fresh composite slots for product 1 of each fissioning
+    # composite: the k-th selected fission takes free_slots[k]. No collision
+    # with parents — parents are alive, find_free_slots only returns dead slots.
+    free_slots = find_free_slots(composites.alive, K_f)  # (K_f,) int32
 
-    # ── Per-composite: compute partition assignment and COMs ────────────────
-    def per_composite(c):
+    # ── Per-fission: compute partition assignment and COMs ──────────────────
+    def per_fission(k):
+        c = safe_fiss[k]
         n = composites.member_count[c]
         h = composites.species_hash[c]
         assignment = _hash_to_partition(h, n, config)  # (M,) ∈ {-1, 0, 1}
@@ -476,23 +497,22 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
         com0 = ref + jnp.sum(rels * in_p0[:, None].astype(jnp.float32), axis=0) / (n0 + 1e-8)
         com1 = ref + jnp.sum(rels * in_p1[:, None].astype(jnp.float32), axis=0) / (n1 + 1e-8)
 
-        rank = fission_rank[c]
-        target_p1 = free_slots[jnp.clip(rank, 0, C - 1)]
+        target_p1 = free_slots[k]
 
         return assignment, com0, com1, target_p1, n0.astype(jnp.int32), n1.astype(jnp.int32)
 
-    all_assignment, all_com0, all_com1, all_target_p1, all_n0, all_n1 = jax.vmap(per_composite)(
-        jnp.arange(C, dtype=jnp.int32)
+    all_assignment, all_com0, all_com1, all_target_p1, all_n0, all_n1 = jax.vmap(per_fission)(
+        jnp.arange(K_f, dtype=jnp.int32)
     )
-    # Shapes: (C, M), (C, 2), (C, 2), (C,), (C,), (C,)
+    # Shapes: (K_f, M), (K_f, 2), (K_f, 2), (K_f,), (K_f,), (K_f,)
 
     # ── Compact each product's members & compute its hash ───────────────────
     # Runs before per_member so that the cap-validity check below has the
     # product hashes available; per_member then consults the validity flags
     # when deciding whether each member rejoins a composite or goes free.
-    def per_product(c):
-        does_fission = fissions[c]
-        assignment = all_assignment[c]
+    def per_product(k):
+        c = safe_fiss[k]
+        assignment = all_assignment[k]
         member_ids = composites.members[c]
         n = composites.member_count[c]
 
@@ -524,7 +544,7 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
         return members_p0, count_p0, h_p0, members_p1, count_p1, h_p1
 
     p0_members, p0_count, p0_hash, p1_members, p1_count, p1_hash = jax.vmap(per_product)(
-        jnp.arange(C, dtype=jnp.int32)
+        jnp.arange(K_f, dtype=jnp.int32)
     )
 
     # ── Build per-product spanning-tree edges ────────────────────────────────
@@ -579,22 +599,23 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
         p0_valid = p0_free_bonds >= 0
         p1_valid = p1_free_bonds >= 0
     else:
-        p0_valid = jnp.ones(C, dtype=bool)
-        p1_valid = jnp.ones(C, dtype=bool)
+        p0_valid = jnp.ones(K_f, dtype=bool)
+        p1_valid = jnp.ones(K_f, dtype=bool)
 
     # ── Update each member particle's composite_id and velocity ────────────
-    def per_member(c, m):
-        does_fission = fissions[c]
+    def per_member(k, m):
+        c = safe_fiss[k]
+        does_fission = fiss_valid[k]
         n = composites.member_count[c]
         member_id = composites.members[c, m]
         valid = does_fission & (m < n) & (member_id >= 0)
 
-        a = all_assignment[c, m]
-        com0 = all_com0[c]
-        com1 = all_com1[c]
-        n0 = all_n0[c]
-        n1 = all_n1[c]
-        target_p1 = all_target_p1[c]
+        a = all_assignment[k, m]
+        com0 = all_com0[k]
+        com1 = all_com1[k]
+        n0 = all_n0[k]
+        n1 = all_n1[k]
+        target_p1 = all_target_p1[k]
 
         # Direction along COM-COM axis (min-image).
         d = com0 - com1
@@ -626,8 +647,8 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
         # Composite-formation flags incorporate structural free-bond validity.
         # When valence is off, p0_valid/p1_valid are all-True, so behavior is
         # unchanged from the no-saturation baseline.
-        forms_p0 = (n0 >= 2) & p0_valid[c]
-        forms_p1 = (n1 >= 2) & p1_valid[c]
+        forms_p0 = (n0 >= 2) & p0_valid[k]
+        forms_p1 = (n1 >= 2) & p1_valid[k]
 
         # New composite_id:
         #   a==0 and forms_p0 → c (reuse parent slot)
@@ -648,9 +669,9 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
         return member_id, valid, new_cid, kick
 
     pid_grid, valid_grid, cid_grid, kick_grid = jax.vmap(
-        lambda c: jax.vmap(lambda m: per_member(c, m))(jnp.arange(M, dtype=jnp.int32))
-    )(jnp.arange(C, dtype=jnp.int32))
-    # Shapes: (C, M), (C, M), (C, M), (C, M, 2)
+        lambda k: jax.vmap(lambda m: per_member(k, m))(jnp.arange(M, dtype=jnp.int32))
+    )(jnp.arange(K_f, dtype=jnp.int32))
+    # Shapes: (K_f, M), (K_f, M), (K_f, M), (K_f, M, 2)
 
     flat_pid   = pid_grid.reshape(-1)
     flat_valid = valid_grid.reshape(-1)
@@ -673,7 +694,7 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
     # ── Write product 0 into parent slot c (in place) ──
     # AND with p0_valid so structurally unsound products leave the parent slot
     # dead (its members already got composite_id=-1 above), reclaiming the slot.
-    p0_alive = fissions & (p0_count >= 2) & p0_valid
+    p0_alive = fiss_valid & (p0_count >= 2) & p0_valid
 
     # Half-life from BE + size penalty. Same formula as fusion_scan_body.
     # Take both args explicitly so both can be vmapped (closing over p0_count
@@ -689,22 +710,27 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
     p0_be_all = jax.vmap(lambda h: _hash_to_binding_energy(h, config, physics))(p0_hash)
     p0_hl_all = jax.vmap(_hl_from_be_and_n)(p0_be_all, p0_count)
 
-    new_alive = jnp.where(fissions, p0_alive, composites.alive)
-    new_members = jnp.where(fissions[:, None], p0_members, composites.members)
-    new_member_count = jnp.where(fissions, p0_count, composites.member_count)
-    new_species_hash = jnp.where(fissions, p0_hash, composites.species_hash)
-    new_binding_energy = jnp.where(fissions, p0_be_all, composites.binding_energy)
-    new_half_life = jnp.where(fissions, p0_hl_all, composites.half_life)
-    new_free_bonds = jnp.where(fissions, p0_free_bonds, composites.free_bonds)
+    # Scatter product-0 results into the parent slots (padding rows route to
+    # OOB index C and drop) — replaces the old full-(C,)-array jnp.where
+    # selects, which forced every field to be materialized at (C, ...) even
+    # for a handful of fissions.
+    fiss_drop = jnp.where(fiss_valid, fiss_idx, C)
+    new_alive = composites.alive.at[fiss_drop].set(p0_alive, mode='drop')
+    new_members = composites.members.at[fiss_drop].set(p0_members, mode='drop')
+    new_member_count = composites.member_count.at[fiss_drop].set(p0_count, mode='drop')
+    new_species_hash = composites.species_hash.at[fiss_drop].set(p0_hash, mode='drop')
+    new_binding_energy = composites.binding_energy.at[fiss_drop].set(p0_be_all, mode='drop')
+    new_half_life = composites.half_life.at[fiss_drop].set(p0_hl_all, mode='drop')
+    new_free_bonds = composites.free_bonds.at[fiss_drop].set(p0_free_bonds, mode='drop')
     # Reset age on the parent slot (it's now a fresh product).
-    new_age = jnp.where(fissions, jnp.float32(0.0), composites.age)
-    new_edges = jnp.where(fissions[:, None, None], p0_edges, composites.edges)
-    new_edge_count = jnp.where(fissions, p0_edge_count_all, composites.edge_count)
+    new_age = composites.age.at[fiss_drop].set(jnp.float32(0.0), mode='drop')
+    new_edges = composites.edges.at[fiss_drop].set(p0_edges, mode='drop')
+    new_edge_count = composites.edge_count.at[fiss_drop].set(p0_edge_count_all, mode='drop')
 
-    # ── Write product 1 into all_target_p1[c] when fissions[c] AND p1_count[c] >= 2 ──
+    # ── Write product 1 into all_target_p1[k] when valid AND p1_count[k] >= 2 ──
     # AND with p1_valid so structurally unsound products are not written to a
     # fresh composite slot (the free slot remains available for next step).
-    p1_writes = fissions & (p1_count >= 2) & p1_valid
+    p1_writes = fiss_valid & (p1_count >= 2) & p1_valid
 
     p1_be_all = jax.vmap(lambda h: _hash_to_binding_energy(h, config, physics))(p1_hash)
     p1_hl_all = jax.vmap(_hl_from_be_and_n)(p1_be_all, p1_count)
@@ -748,39 +774,39 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
         velocity=new_velocity,
     )
 
-    # ── Per-composite event emission (output only; gated by config) ─────────
-    # Event kind=2 (fission) for every composite where `fissions[c]` is True.
-    # source_slots = (c, -1); product_slots = (c, target_p1[c]).
+    # ── Per-fission event emission (output only; gated by config) ───────────
+    # Event kind=2 (fission) for every selected fission in the compacted
+    # batch — leading dim is min(max_fissions_per_step, C), not C.
+    # source_slots = (c, -1); product_slots = (c, target_p1[k]).
     # source_hash/size = the parent composite at slot c BEFORE the state update.
-    # product_hashes = (p0_hash[c], p1_hash[c]); product_sizes = (p0_count[c], p1_count[c]).
+    # product_hashes = (p0_hash[k], p1_hash[k]); product_sizes = (p0_count[k], p1_count[k]).
     # Slot 0 of products may be a shattered free particle (count=1, hash=0);
     # slot 1 likewise. Either or both being product_size==1 is legal.
     if config.emit_events:
-        c_arr = jnp.arange(C, dtype=jnp.int32)
-        ev_kind = jnp.where(fissions, jnp.int32(KIND_FISSION), jnp.int32(KIND_NONE))
+        ev_kind = jnp.where(fiss_valid, jnp.int32(KIND_FISSION), jnp.int32(KIND_NONE))
         ev_src_slots = jnp.stack([
-            jnp.where(fissions, c_arr, jnp.int32(-1)),
-            jnp.full((C,), -1, dtype=jnp.int32),
+            jnp.where(fiss_valid, fiss_idx, jnp.int32(-1)),
+            jnp.full((K_f,), -1, dtype=jnp.int32),
         ], axis=1)
         ev_src_hashes = jnp.stack([
-            jnp.where(fissions, composites.species_hash, jnp.uint32(0)),
-            jnp.zeros((C,), dtype=jnp.uint32),
+            jnp.where(fiss_valid, composites.species_hash[safe_fiss], jnp.uint32(0)),
+            jnp.zeros((K_f,), dtype=jnp.uint32),
         ], axis=1)
         ev_src_sizes = jnp.stack([
-            jnp.where(fissions, composites.member_count, jnp.int32(0)),
-            jnp.zeros((C,), dtype=jnp.int32),
+            jnp.where(fiss_valid, composites.member_count[safe_fiss], jnp.int32(0)),
+            jnp.zeros((K_f,), dtype=jnp.int32),
         ], axis=1)
         ev_prod_slots = jnp.stack([
-            jnp.where(fissions, c_arr, jnp.int32(-1)),
-            jnp.where(fissions, all_target_p1, jnp.int32(-1)),
+            jnp.where(fiss_valid, fiss_idx, jnp.int32(-1)),
+            jnp.where(fiss_valid, all_target_p1, jnp.int32(-1)),
         ], axis=1)
         ev_prod_hashes = jnp.stack([
-            jnp.where(fissions, p0_hash, jnp.uint32(0)),
-            jnp.where(fissions, p1_hash, jnp.uint32(0)),
+            jnp.where(fiss_valid, p0_hash, jnp.uint32(0)),
+            jnp.where(fiss_valid, p1_hash, jnp.uint32(0)),
         ], axis=1)
         ev_prod_sizes = jnp.stack([
-            jnp.where(fissions, p0_count, jnp.int32(0)),
-            jnp.where(fissions, p1_count, jnp.int32(0)),
+            jnp.where(fiss_valid, p0_count, jnp.int32(0)),
+            jnp.where(fiss_valid, p1_count, jnp.int32(0)),
         ], axis=1)
         events = ReactionEvent(
             kind=ev_kind,
@@ -804,6 +830,260 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
 
 
 # ── Fusion ───────────────────────────────────────────────────────────────────
+
+def _fusion_apply_matching(state, particles, composites, key, subkey,
+                           all_reps, all_entity_hash, all_entity_cnt,
+                           all_partners, all_be, all_hashes, all_merged_counts,
+                           degree, species_valences,
+                           config: SimConfig, physics: PhysicsParams):
+    """
+    Parallel conflict resolution + batched apply for attempt_fusion
+    (fusion_mode="matching").
+
+    Inputs are the Step 1-2.5 products of attempt_fusion: after the per-entity
+    dedup, each entity has at most one outgoing proposal (its best member-level
+    candidate, identified by initiator particle i with all_partners[i] = j ≥ 0).
+
+    Mutual-best handshake: entity A's proposal to entity B is accepted iff B's
+    proposal targets A. Because each entity has exactly one outgoing proposal,
+    mutual pairs are node-disjoint — no entity can appear in two accepted
+    fusions — so the whole batch applies in one parallel pass with disjoint
+    scatter targets, replacing the sequential `claimed` scan. Candidates whose
+    handshake fails (A's best is B but B's best is C) simply retry next step,
+    the same kind of one-step deferral the max_fusions budget already imposes.
+
+    Merged-composite math (member/edge compaction, hash, BE, half-life,
+    free bonds) is identical to fusion_scan_body, just vmapped over the K
+    accepted pairs instead of run once per scan iteration.
+
+    Note one intentional difference from the scan path: the scan blocked ALL
+    fusions once `comp_count` reached max_composites (even comp+comp mergers,
+    which reduce the count). Here only free+free pairs are blocked when no
+    free composite slot exists; mergers into existing slots always proceed.
+
+    Returns (new_state, final_degree, events) — events shaped like the scan
+    path's stacked output (leading dim = max_fusions_per_step) so step.py's
+    event-log concatenation is shape-compatible in both modes. The caller
+    gates whether events are returned on config.emit_events; when discarded,
+    XLA DCEs the event-build code.
+    """
+    N = config.num_particles
+    M = config.max_composite_size
+    C = config.max_composites
+    E_max = config.e_max
+    # Effective batch width. min() with N because the budget-selection sort
+    # below slices an (N,) array — with N < max_fusions (tiny test worlds) the
+    # slice yields (N,) and every downstream (K,) array must agree. The scan
+    # path's scan_indices has the same effective length, so event-log shapes
+    # stay consistent between modes.
+    K = min(config.max_fusions_per_step, N)
+
+    idx_n = jnp.arange(N, dtype=jnp.int32)
+
+    # ── Entity-level proposal table, keyed by rep ────────────────────────────
+    # Step 2.5 guarantees ≤1 winner per entity, so these scatters never race.
+    winner_valid = all_partners >= 0
+    safe_partner = jnp.where(winner_valid, all_partners, 0)
+    drop_rep = jnp.where(winner_valid, all_reps, N)
+    # out_init[r] = winning initiator particle of entity rep r (-1 = none)
+    out_init = jnp.full(N, -1, dtype=jnp.int32).at[drop_rep].set(
+        idx_n, mode='drop')
+    # out_rep[r] = rep of the entity that r proposes to (-1 = none)
+    out_rep = jnp.full(N, -1, dtype=jnp.int32).at[drop_rep].set(
+        all_reps[safe_partner], mode='drop')
+
+    # ── Handshake: keep pairs that chose each other ──────────────────────────
+    safe_out = jnp.where(out_rep >= 0, out_rep, 0)
+    mutual = (out_rep >= 0) & (out_rep[safe_out] == idx_n)
+    # Canonical root = lower rep of the pair, so each pair is counted once.
+    # The root's own proposal supplies the contact particles and merged
+    # properties (hash/BE/size are symmetric in the pair, so the direction
+    # only picks which contact edge is recorded).
+    is_root = mutual & (idx_n < out_rep)
+
+    # ── Budget selection: fair random sample of up to K pairs ────────────────
+    # Same shuffled-cumsum trick as the scan path so no index bias.
+    perm = jax.random.permutation(subkey, N)
+    rooted = is_root[perm]
+    cums = jnp.cumsum(rooted.astype(jnp.int32))
+    sel = jnp.where(rooted & (cums <= K), perm, N)
+    pair_roots = jnp.sort(sel)[:K]  # (K,) rep ids, N = padding
+
+    valid_pair = pair_roots < N
+    safe_root = jnp.minimum(pair_roots, N - 1)
+    init_i = out_init[safe_root]
+    safe_i = jnp.where(valid_pair & (init_i >= 0), init_i, 0)
+    j = jnp.where(valid_pair, all_partners[safe_i], jnp.int32(-1))
+    safe_j = jnp.where(j >= 0, j, 0)
+    can_fuse = valid_pair & (init_i >= 0) & (j >= 0)
+
+    be_eff = all_be[safe_i]
+    h = all_hashes[safe_i]
+    mc = all_merged_counts[safe_i]
+
+    # Entity slots (pre-fusion state is authoritative: pairs are disjoint, so
+    # no sequential composite_id updates are needed mid-batch).
+    i_is_free = particles.composite_id[safe_i] < 0
+    j_is_free = particles.composite_id[safe_j] < 0
+    ci = jnp.clip(particles.composite_id[safe_i], 0, C - 1)
+    cj = jnp.clip(particles.composite_id[safe_j], 0, C - 1)
+
+    # ── Target slots ─────────────────────────────────────────────────────────
+    # free+free → fresh slot (rank-th free slot), comp+free → the comp's slot,
+    # comp+comp → min slot wins, max slot is absorbed (killed).
+    free_comp_slots = find_free_slots(composites.alive, K)  # (min(K, C),) int32
+    n_slots = free_comp_slots.shape[0]  # find_free_slots returns (min(K, C),)
+    is_newslot = can_fuse & i_is_free & j_is_free
+    slot_rank = jnp.cumsum(is_newslot.astype(jnp.int32)) - 1
+    fresh = free_comp_slots[jnp.clip(slot_rank, 0, n_slots - 1)]
+    # find_free_slots pads with -1 when the pool is exhausted → block the pair.
+    # slot_rank < n_slots also guards the C < K case, where an unclipped rank
+    # would silently re-read the last slot and alias two pairs to one target.
+    fresh_ok = (slot_rank >= 0) & (slot_rank < n_slots) & (fresh >= 0)
+    can_fuse = can_fuse & (~(i_is_free & j_is_free) | fresh_ok)
+
+    target = jnp.where(
+        i_is_free,
+        jnp.where(j_is_free, fresh, cj),
+        jnp.where(j_is_free, ci, jnp.minimum(ci, cj)),
+    )
+    absorbed = jnp.where(can_fuse & ~i_is_free & ~j_is_free,
+                         jnp.maximum(ci, cj), jnp.int32(-1))
+
+    # ── Energy-based half-life (same formula as fusion_scan_body) ────────────
+    t = jnp.clip(
+        (be_eff - physics.fusion_threshold) / (1.0 - physics.fusion_threshold + 1e-8),
+        0.0, 1.0
+    )
+    hl_base = config.half_life_min + (config.half_life_max - config.half_life_min) * t
+    size_penalty = 1.0 + config.composite_size_decay_scale * jnp.maximum(
+        0.0, mc.astype(jnp.float32) - 2.0
+    )
+    hl_eff = hl_base / size_penalty
+
+    # ── Per-pair merged members / edges (same math as fusion_scan_body) ──────
+    def merge_pair(k):
+        # i-side members
+        i_members = jnp.where(
+            i_is_free[k],
+            jnp.full(M, -1, dtype=jnp.int32).at[0].set(safe_i[k]),
+            composites.members[ci[k]],
+        )
+        # j-side members
+        j_members = jnp.where(
+            j_is_free[k],
+            jnp.full(M, -1, dtype=jnp.int32).at[0].set(safe_j[k]),
+            composites.members[cj[k]],
+        )
+        # Concat into (2M,); compact valid IDs to front using cumsum.
+        # would_overflow in check_neighbor guarantees cnt_i + cnt_j <= M.
+        mm = jnp.concatenate([i_members, j_members])
+        vmask = mm >= 0
+        pos = jnp.cumsum(vmask.astype(jnp.int32)) - 1
+        outp = jnp.where(vmask, pos, M)  # invalid → OOB
+        merged_members = jnp.full(M, -1, dtype=jnp.int32).at[outp].set(
+            mm, mode='drop')
+
+        # Merged edge list: i-edges + j-edges + the new contact edge
+        # (safe_i, safe_j) — the actual nearest member-pair, as in the scan.
+        i_edges = jnp.where(i_is_free[k],
+                            jnp.full((E_max, 2), -1, dtype=jnp.int32),
+                            composites.edges[ci[k]])
+        j_edges = jnp.where(j_is_free[k],
+                            jnp.full((E_max, 2), -1, dtype=jnp.int32),
+                            composites.edges[cj[k]])
+        new_edge = jnp.array([safe_i[k], safe_j[k]], dtype=jnp.int32)[None, :]
+        eraw = jnp.concatenate([i_edges, j_edges, new_edge], axis=0)
+        evalid = eraw[:, 0] >= 0
+        epos = jnp.cumsum(evalid.astype(jnp.int32)) - 1
+        eout = jnp.where(evalid, epos, E_max)
+        merged_edges = jnp.full((E_max, 2), -1, dtype=jnp.int32).at[eout].set(
+            eraw, mode='drop')
+        merged_edge_count = jnp.sum(evalid.astype(jnp.int32))
+
+        # free_bonds = Σ v_s − 2·edge_count over the merged member list
+        mvalid = merged_members >= 0
+        msp = particles.species[jnp.where(mvalid, merged_members, 0)]
+        sum_v = jnp.sum(jnp.where(mvalid, species_valences[msp], 0))
+        merged_free_bonds = sum_v - jnp.int32(2) * merged_edge_count
+        return merged_members, merged_edges, merged_edge_count, merged_free_bonds
+
+    merged_members, merged_edges, merged_edge_counts, merged_free_bonds = jax.vmap(
+        merge_pair)(jnp.arange(K, dtype=jnp.int32))
+    # Shapes: (K, M), (K, E_max, 2), (K,), (K,)
+
+    # ── Batched composite writes ─────────────────────────────────────────────
+    # Targets are distinct across accepted pairs (entity-disjoint matching ⇒
+    # disjoint slots; fresh slots unique by rank), so scatter order is moot.
+    drop_target = jnp.where(can_fuse, target, C)        # invalid → OOB, dropped
+    drop_absorbed = jnp.where(absorbed >= 0, absorbed, C)
+
+    new_alive = composites.alive.at[drop_target].set(True, mode='drop')
+    new_alive = new_alive.at[drop_absorbed].set(False, mode='drop')
+    new_composites = composites._replace(
+        members=composites.members.at[drop_target].set(merged_members, mode='drop'),
+        alive=new_alive,
+        binding_energy=composites.binding_energy.at[drop_target].set(be_eff, mode='drop'),
+        half_life=composites.half_life.at[drop_target].set(hl_eff, mode='drop'),
+        member_count=composites.member_count.at[drop_target].set(mc, mode='drop'),
+        species_hash=composites.species_hash.at[drop_target].set(h, mode='drop'),
+        free_bonds=composites.free_bonds.at[drop_target].set(merged_free_bonds, mode='drop'),
+        edges=composites.edges.at[drop_target].set(merged_edges, mode='drop'),
+        edge_count=composites.edge_count.at[drop_target].set(merged_edge_counts, mode='drop'),
+    )
+
+    # ── composite_id for all merged members ─────────────────────────────────
+    # The merged member list already contains both sides' members, so one
+    # scatter covers free+free, comp+free, and comp+comp (absorbed members
+    # included). Invalid rows route to OOB index N and drop.
+    flat_pids = jnp.where(
+        (merged_members >= 0) & can_fuse[:, None], merged_members, N
+    ).reshape(-1)
+    new_composite_id = particles.composite_id.at[flat_pids].set(
+        jnp.repeat(target, M), mode='drop')
+
+    # ── Degree update for the two new edge endpoints ─────────────────────────
+    final_degree = degree.at[jnp.where(can_fuse, safe_i, N)].add(1, mode='drop')
+    final_degree = final_degree.at[jnp.where(can_fuse, safe_j, N)].add(1, mode='drop')
+
+    # ── Event batch (same per-event fields as the scan path) ─────────────────
+    ev_i = jnp.where(can_fuse, safe_i, 0)
+    ev_j = jnp.where(can_fuse, safe_j, 0)
+    events = ReactionEvent(
+        kind=jnp.where(can_fuse, jnp.int32(KIND_FUSION), jnp.int32(KIND_NONE)),
+        source_slots=jnp.stack([
+            jnp.where(can_fuse, safe_i, jnp.int32(-1)),
+            jnp.where(can_fuse, safe_j, jnp.int32(-1)),
+        ], axis=1),
+        source_hashes=jnp.stack([
+            jnp.where(can_fuse, all_entity_hash[ev_i], jnp.uint32(0)),
+            jnp.where(can_fuse, all_entity_hash[ev_j], jnp.uint32(0)),
+        ], axis=1),
+        source_sizes=jnp.stack([
+            jnp.where(can_fuse, all_entity_cnt[ev_i], jnp.int32(0)),
+            jnp.where(can_fuse, all_entity_cnt[ev_j], jnp.int32(0)),
+        ], axis=1),
+        product_slots=jnp.stack([
+            jnp.where(can_fuse, target, jnp.int32(-1)),
+            jnp.full((K,), -1, dtype=jnp.int32),
+        ], axis=1),
+        product_hashes=jnp.stack([
+            jnp.where(can_fuse, h, jnp.uint32(0)),
+            jnp.zeros((K,), dtype=jnp.uint32),
+        ], axis=1),
+        product_sizes=jnp.stack([
+            jnp.where(can_fuse, mc, jnp.int32(0)),
+            jnp.zeros((K,), dtype=jnp.int32),
+        ], axis=1),
+    )
+
+    new_state = state._replace(
+        particles=particles._replace(composite_id=new_composite_id),
+        composites=new_composites,
+        rng_key=key,
+    )
+    return new_state, final_degree, events
+
 
 def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
                    params: InteractionParams, config: SimConfig,
@@ -993,6 +1273,21 @@ def attempt_fusion(state: WorldState, neighbors: jnp.ndarray,
         & ((my_rep_best & INDEX_MASK) == jnp.arange(N, dtype=jnp.int32))
     )
     all_partners = jnp.where(is_winner, all_partners, jnp.int32(-1))
+
+    # ── Step 3 (matching mode): parallel mutual-best matching ──────────────────
+    # Static dispatch on config.fusion_mode — XLA traces only the live branch.
+    # See _fusion_apply_matching for the algorithm; the sequential scan below
+    # is the legacy path ("scan"), kept for A/B comparison and rollback.
+    if config.fusion_mode == "matching":
+        new_state, final_degree, events = _fusion_apply_matching(
+            state, particles, composites, key, subkey,
+            all_reps, all_entity_hash, all_entity_cnt,
+            all_partners, all_be, all_hashes, all_merged_counts,
+            degree, species_valences, config, physics,
+        )
+        if config.emit_events:
+            return new_state, final_degree, events
+        return new_state, final_degree
 
     # ── Step 3: Conflict resolution via sequential scan ────────────────────────
     max_fusions = config.max_fusions_per_step
@@ -1338,16 +1633,25 @@ def attempt_ring_closure(state: WorldState, neighbors: jnp.ndarray,
     Touches ONLY edges, edge_count, and degree — no member-list / composite_id
     changes.
 
-    Gated by config.allow_ring_closure AND config.bond_mode == "edges". In
-    star_spring / off modes the edges array is physics-inert, so firing ring
-    closure there would silently consume free_bonds and starve subsequent
-    legitimate fusions — preserving the legacy mode's dynamics requires
-    skipping it entirely.
+    Conflict resolution follows config.fusion_mode: "matching" pairs mutual
+    nearest neighbors and applies all closures in one batched pass;
+    "scan" is the legacy sequential greedy scan.
+
+    Gated by config.allow_ring_closure AND config.bond_mode == "edges" AND
+    config.use_valence. In star_spring / off modes the edges array is
+    physics-inert, so firing ring closure there would silently consume
+    free_bonds and starve subsequent legitimate fusions — preserving the
+    legacy mode's dynamics requires skipping it entirely. With use_valence
+    off, ring closure is skipped because the mechanic is *defined* by
+    free-bond accounting ("both members have a spare hand"); running it
+    anyway made max_valence leak into valence-off dynamics (caught by
+    test_valence_off_unchanged, 2026-06-12).
 
     Returns:
         (new_state, new_degree)
     """
-    if not config.allow_ring_closure or config.bond_mode != "edges":
+    if (not config.allow_ring_closure or config.bond_mode != "edges"
+            or not config.use_valence):
         return state, degree
 
     particles = state.particles
@@ -1372,7 +1676,10 @@ def attempt_ring_closure(state: WorldState, neighbors: jnp.ndarray,
                   (particle_free_bonds >= 1)  # (N,)
 
     # ── Find best ring partner per particle ─────────────────────────────────
-    def find_ring_partner(i):
+    # require_j_gt_i is a static Python bool: the legacy scan considers each
+    # pair once via the (j > i) filter; the matching path needs symmetric
+    # proposals (i→j AND j→i) so the mutual handshake below can fire.
+    def find_ring_partner(i, require_j_gt_i=True):
         nbrs = neighbors[i]
         i_attempt = can_attempt[i]
         cid_i = particles.composite_id[i]
@@ -1381,7 +1688,7 @@ def attempt_ring_closure(state: WorldState, neighbors: jnp.ndarray,
         def check(j):
             valid = (
                 (j >= 0) & (j != i) &
-                (j > i)  # consider each pair once
+                ((j > i) if require_j_gt_i else jnp.bool_(True))  # consider each pair once (scan path)
                 & can_attempt[j]
                 & (particles.composite_id[j] == cid_i)  # same composite
             )
@@ -1397,6 +1704,83 @@ def attempt_ring_closure(state: WorldState, neighbors: jnp.ndarray,
         partners, dists = jax.vmap(check)(nbrs)
         best_idx = jnp.argmin(dists)
         return jnp.where(i_attempt, partners[best_idx], jnp.int32(-1))
+
+    # ── Matching mode: mutual-nearest handshake + batched edge append ───────
+    # Same parallelization as _fusion_apply_matching, but at particle level:
+    # a pair closes a ring iff each particle's nearest eligible same-composite
+    # partner is the other. Mutual pairs are particle-disjoint, so the input
+    # `degree` is exact for the valence recheck (no sequential carry needed)
+    # and all edge appends can scatter in one pass. Losers retry next step.
+    if config.fusion_mode == "matching":
+        idx_n = jnp.arange(N, dtype=jnp.int32)
+        all_partners = jax.vmap(
+            lambda i: find_ring_partner(i, require_j_gt_i=False))(idx_n)  # (N,)
+        safe_p = jnp.where(all_partners >= 0, all_partners, 0)
+        mutual = (all_partners >= 0) & (all_partners[safe_p] == idx_n)
+        is_root = mutual & (idx_n < all_partners)  # canonical: count pairs once
+
+        # Budget: fair random sample of up to R pairs (same trick as fusion).
+        R = min(config.max_ring_closures_per_step, N)
+        perm = jax.random.permutation(subkey, N)
+        rooted = is_root[perm]
+        cums = jnp.cumsum(rooted.astype(jnp.int32))
+        sel = jnp.where(rooted & (cums <= R), perm, N)
+        pair_i = jnp.sort(sel)[:R]  # (R,) root particle ids, N = padding
+
+        valid_pair = pair_i < N
+        safe_i = jnp.minimum(pair_i, N - 1)
+        j = jnp.where(valid_pair, all_partners[safe_i], jnp.int32(-1))
+        safe_j = jnp.where(j >= 0, j, 0)
+        can_close = valid_pair & (j >= 0)
+
+        cid = jnp.clip(particles.composite_id[safe_i], 0, C - 1)
+
+        # Dedup: is (safe_i, safe_j) already in edges[cid]? (Catches e.g. the
+        # contact edge a fusion created earlier this same step.)
+        def has_edge(k):
+            ce = composites.edges[cid[k]]  # (E_max, 2)
+            return jnp.any(
+                ((ce[:, 0] == safe_i[k]) & (ce[:, 1] == safe_j[k])) |
+                ((ce[:, 0] == safe_j[k]) & (ce[:, 1] == safe_i[k]))
+            )
+        already = jax.vmap(has_edge)(jnp.arange(R, dtype=jnp.int32))
+        can_close = can_close & ~already
+
+        # Per-particle valence recheck against the (post-fusion) input degree.
+        # Pairs are particle-disjoint, so no within-batch compounding is
+        # possible — the static check is exact, unlike the scan's live carry.
+        free_i = species_valences[particles.species[safe_i]] - degree[safe_i]
+        free_j = species_valences[particles.species[safe_j]] - degree[safe_j]
+        can_close = can_close & (free_i >= 1) & (free_j >= 1)
+
+        # Slot assignment: multiple accepted pairs in the SAME composite must
+        # land in consecutive edge slots. rank_in_cid = how many earlier
+        # accepted pairs share this cid (O(R²) mask, R ≤ 16 — trivial).
+        k_idx = jnp.arange(R, dtype=jnp.int32)
+        same_cid_before = (
+            (cid[:, None] == cid[None, :])
+            & can_close[:, None] & can_close[None, :]
+            & (k_idx[None, :] < k_idx[:, None])
+        )
+        rank_in_cid = jnp.sum(same_cid_before, axis=1)
+        slot = composites.edge_count[cid] + rank_in_cid
+        can_close = can_close & (slot < E_max)  # no append past a full edge buffer
+
+        # Batched writes: flat-index edge scatter, counted appends, degree.
+        flat_idx = jnp.where(can_close, cid * E_max + slot, C * E_max)  # OOB → drop
+        new_pair = jnp.stack([safe_i, safe_j], axis=1)  # (R, 2)
+        edges_flat = composites.edges.reshape(-1, 2).at[flat_idx].set(
+            new_pair, mode='drop')
+        drop_cid = jnp.where(can_close, cid, C)
+        new_composites = composites._replace(
+            edges=edges_flat.reshape(C, E_max, 2),
+            edge_count=composites.edge_count.at[drop_cid].add(1, mode='drop'),
+            free_bonds=composites.free_bonds.at[drop_cid].add(-2, mode='drop'),
+        )
+        new_degree = degree.at[jnp.where(can_close, safe_i, N)].add(1, mode='drop')
+        new_degree = new_degree.at[jnp.where(can_close, safe_j, N)].add(1, mode='drop')
+
+        return state._replace(composites=new_composites, rng_key=key), new_degree
 
     all_partners = jax.vmap(find_ring_partner)(jnp.arange(N, dtype=jnp.int32))  # (N,)
 

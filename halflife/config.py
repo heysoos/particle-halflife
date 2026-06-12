@@ -111,8 +111,33 @@ class SimConfig:
     max_valence: int = 4
 
     # ── Performance Caps ─────────────────────────────────────────────────────
-    # Fusion scan length — set to num_particles to ensure all candidates are processed
-    max_fusions_per_step: int = 200  # = num_particles
+    # Fusion scan length. Each unit costs ~45µs of sequential scan per step
+    # (launch-bound), so this is the single biggest throughput knob. Measured
+    # steady-state demand (2026-06-12, emit_events over 800 steps) is ~4.7
+    # fusions/step with p99=15; only the first ~50 condensation steps burst
+    # higher (max 186). Excess candidates simply retry next step, so a low cap
+    # just spreads the initial condensation over a few more steps.
+    max_fusions_per_step: int = 64
+    # Chemistry conflict-resolution mode (static field; one-time JAX retrace
+    # per mode). Gates BOTH fusion and ring closure:
+    #   "matching" — parallel mutual-best matching + one batched apply.
+    #                A pair fuses (or ring-closes) iff each side's best
+    #                candidate is the other ("handshake"); the pair set is
+    #                node-disjoint by construction so the whole batch applies
+    #                in a single vmapped pass. Unmatched candidates retry next
+    #                step. Replaces the sequential scans whose ~45µs/iteration
+    #                of launch-bound kernels were the single biggest per-step
+    #                cost (2026-06-12).
+    #   "scan"     — legacy sequential greedy scans over shuffled candidates.
+    fusion_mode: str = "matching"
+    # Fission batch width. apply_composite_decay runs its heavy per-fission
+    # work (hash-partition argsort over M, product COMs, the per-member kick
+    # grid) over a compacted (K, ...) batch instead of all max_composites
+    # slots. Measured steady-state demand is ~15 fissions/step at
+    # num_species=3 (≤14 observed at 12 species), so 64 is conservative.
+    # Fissions beyond the budget defer: the composite stays alive and
+    # re-rolls its decay next step.
+    max_fissions_per_step: int = 64
     # Enable spring bond forces between composite members (expensive; off by default)
     use_bond_forces: bool = True
     # Stiffness of the composite-member spring (used by step.py when
@@ -141,7 +166,8 @@ class SimConfig:
     # Ring closure: allow intra-composite fusion when both members still have
     # per-particle free bonds (degree[i] < v_{species[i]}).
     allow_ring_closure: bool = True
-    max_ring_closures_per_step: int = 50
+    # Same sequential-scan cost model as max_fusions_per_step (~45µs/unit).
+    max_ring_closures_per_step: int = 16
 
     # ── Profiling / Instrumentation ──────────────────────────────────────────
     enable_profiling: bool = False
@@ -184,5 +210,11 @@ class SimConfig:
 
     @property
     def e_max(self) -> int:
-        """Maximum edges per composite: enough for any all-bonds-used graph."""
-        return (self.max_composite_size * self.max_valence) // 2
+        """Maximum edges per composite: enough for any all-bonds-used graph.
+
+        Floored at max_composite_size - 1 so a path-spanning tree always fits
+        even at max_valence=1 (where M*v/2 would be too small to hold the
+        tree edges fusion creates, silently dropping bonds).
+        """
+        return max(self.max_composite_size - 1,
+                   (self.max_composite_size * self.max_valence) // 2)

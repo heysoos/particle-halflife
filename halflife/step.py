@@ -363,10 +363,12 @@ def simulation_step(state: WorldState, params: InteractionParams,
     # ── Event log assembly (output only) ─────────────────────────────────────
     # fusion_events:  ReactionEvent of shape (max_fusions_per_step, ...) from
     #                 attempt_fusion (Task 2)
-    # fission_events: ReactionEvent of shape (max_composites, ...) from
-    #                 apply_composite_decay (Task 3)
+    # fission_events: ReactionEvent of shape (min(max_fissions_per_step,
+    #                 max_composites), ...) from apply_composite_decay (Task 3;
+    #                 budget-sized since the 2026-06-12 fission compaction)
     # Concatenate along the leading axis so downstream consumers see one
-    # padded ReactionEvent per step with E = max_fusions + max_composites.
+    # padded ReactionEvent per step with
+    # E = min(max_fusions, N) + min(max_fissions, C).
     if config.emit_events:
         from halflife.state import ReactionEvent
         events = ReactionEvent(

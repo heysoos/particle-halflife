@@ -955,10 +955,16 @@ def test_ring_closure_adds_edge_between_same_composite_members():
     # and each chain endpoint has per-particle free bonds = 3 - 1 = 2 >= 1.
     # Species 0 has valence=1, which would make the 3-edge chain over-bonded
     # (composite_free_bonds = -2), blocking ring closure.
+    # Geometry note (2026-06-12): particle 3 sits at (5,6) so that 0 and 3
+    # are each other's MUTUAL nearest eligible partner — unambiguous under
+    # both fusion_mode="matching" (mutual-nearest handshake) and "scan"
+    # (shuffle order). The previous (6,6) placement made 3's nearest be 1,
+    # so matching mode legitimately closed (1,3) instead and the hard-coded
+    # (0,3) assertion failed on a tie-breaking artifact.
     pos = np.array([[5.0, 5.0],   # 0
                     [6.5, 5.0],   # 1
                     [7.5, 6.0],   # 2
-                    [6.0, 6.0]]   # 3 — within fusion_radius of 0
+                    [5.0, 6.0]]   # 3 — within fusion_radius of 0, nearest to 0
                    + [[50.0+i, 50.0] for i in range(6)], dtype=np.float32)
     species = np.ones(10, dtype=np.int32)  # species 1 has valence=3 (not 1)
     composite_id = np.array([0, 0, 0, 0, -1, -1, -1, -1, -1, -1], dtype=np.int32)
