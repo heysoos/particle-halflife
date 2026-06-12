@@ -47,6 +47,10 @@ def test_full_pipeline_produces_html_with_all_sections():
     assert '<h2>Tier 2' in html
     assert '<h2>Tier 3' in html
     assert '<h2>Tier 4' in html
+    # Tier 5 — open-endedness section present and fully substituted.
+    assert 'Tier 5' in html
+    assert 'Type discovery' in html or 'discovery' in html
+    assert '{img_oe_' not in html        # no leftover format placeholders
     # Plot images present (base64 PNG prefix).
     assert 'data:image/png;base64,' in html
     # Headline stats rendered (label text from the stat grid).
