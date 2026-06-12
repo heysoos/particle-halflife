@@ -130,3 +130,49 @@ def structure_type_ids(snapshot, particles_species: np.ndarray,
             h = _wl_graph_hash(node_labels, adjacency, rounds)
         out[k] = np.uint64(h)
     return out
+
+
+# ── Time-resolved novelty ───────────────────────────────────────────────────
+
+def discovery_curve(type_id_arrays: List[np.ndarray],
+                    snapshot_steps: List[int]) -> Tuple[np.ndarray, np.ndarray]:
+    """Cumulative count of distinct type ids ever seen up to each snapshot."""
+    seen = set()
+    cum = []
+    for ids in type_id_arrays:
+        seen.update(ids.tolist())
+        cum.append(len(seen))
+    return np.asarray(snapshot_steps), np.asarray(cum, dtype=np.int64)
+
+
+def _first_appearance(type_id_arrays: List[np.ndarray],
+                      snapshot_steps: List[int]) -> Dict[int, int]:
+    """Map each type id to the step of the first snapshot it appears in."""
+    first: Dict[int, int] = {}
+    for ids, step in zip(type_id_arrays, snapshot_steps):
+        for t in ids.tolist():
+            first.setdefault(t, step)
+    return first
+
+
+def novelty_rate(type_id_arrays: List[np.ndarray],
+                 snapshot_steps: List[int],
+                 windows: List[Tuple[int, int]]) -> np.ndarray:
+    """Count of types whose first snapshot-appearance falls in each window."""
+    first = _first_appearance(type_id_arrays, snapshot_steps)
+    counts = np.zeros(len(windows), dtype=np.int64)
+    for step in first.values():
+        wi = _window_index(step, windows)
+        if wi is not None:
+            counts[wi] += 1
+    return counts
+
+
+def total_composition_types_from_events(events) -> int:
+    """Distinct composite product hashes (size >= 2) across the complete event
+    stream — the true total incl. types born and gone between snapshots."""
+    if events.product_hashes.size == 0:
+        return 0
+    mask = events.product_sizes >= 2
+    vals = events.product_hashes[mask]
+    return int(np.unique(vals).size)

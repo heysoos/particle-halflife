@@ -126,3 +126,45 @@ def test_structure_edgeless_multimember_falls_back_to_composition():
     snap, species = _snap_two_composites([], [], [2, 2, 2, 2, 2, 2])
     ids = oe.structure_type_ids(snap, species)
     assert ids[0] == ids[1]
+
+
+def test_discovery_curve_is_cumulative_distinct():
+    # 3 snapshots: {A}, {A,B}, {A,B,C} → cumulative 1, 2, 3.
+    sets = [np.array([10], np.uint64),
+            np.array([10, 20], np.uint64),
+            np.array([10, 20, 30], np.uint64)]
+    steps = [100, 200, 300]
+    s, cum = oe.discovery_curve(sets, steps)
+    assert s.tolist() == [100, 200, 300]
+    assert cum.tolist() == [1, 2, 3]
+
+
+def test_discovery_curve_no_double_count():
+    sets = [np.array([10, 10], np.uint64), np.array([10], np.uint64)]
+    _, cum = oe.discovery_curve(sets, [100, 200])
+    assert cum.tolist() == [1, 1]
+
+
+def test_novelty_rate_bins_first_appearance_by_window():
+    # A,B first seen in window 0 (steps 100,200); C in window 1 (step 400).
+    sets = [np.array([10], np.uint64), np.array([10, 20], np.uint64),
+            np.array([10, 20, 30], np.uint64)]
+    steps = [100, 200, 400]
+    windows = [(0, 300), (300, 600)]
+    counts = oe.novelty_rate(sets, steps, windows)
+    assert counts.tolist() == [2, 1]
+
+
+def test_total_composition_types_from_events_counts_distinct_products():
+    from halflife.state import ReactionEvent
+    ev = ReactionEvent(
+        kind=np.array([1, 1, 2], np.int32),
+        source_slots=np.zeros((3, 2), np.int32),
+        source_hashes=np.zeros((3, 2), np.uint32),
+        source_sizes=np.zeros((3, 2), np.int32),
+        product_slots=np.zeros((3, 2), np.int32),
+        product_hashes=np.array([[5, 0], [5, 0], [7, 9]], np.uint32),
+        product_sizes=np.array([[3, 1], [3, 1], [2, 2]], np.int32),
+    )
+    # Distinct product hashes among size>=2 products: {5, 7, 9} → 3.
+    assert oe.total_composition_types_from_events(ev) == 3
