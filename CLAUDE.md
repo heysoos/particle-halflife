@@ -273,15 +273,25 @@ Three gates:
   stricter than the old composite-level check. The new edge consumes one bond on each
   endpoint, so a composite with spare bonds *elsewhere* still can't fuse through a
   saturated contact member. The lowest-index "representative" is no longer a fusion
-  gate — it survives only as a stable per-entity key for candidate dedup and the
-  one-fusion-per-entity-per-step `claimed` bookkeeping.
+  gate — it survives only as a stable per-entity key for candidate dedup and conflict
+  resolution. Conflict resolution is governed by `config.fusion_mode` (2026-06-12):
+  `"matching"` (default) accepts a pair iff the two entities are each other's best
+  candidate (mutual handshake) and applies the whole node-disjoint batch in one
+  vmapped pass; `"scan"` is the legacy sequential greedy scan with
+  one-fusion-per-entity-per-step `claimed` bookkeeping. Ring closure follows the
+  same mode (mutual-nearest pairs in matching mode). Fission runs its heavy
+  per-composite work over a compacted batch of at most `max_fissions_per_step`
+  fissioning slots; excess fissions defer one step.
 - **Ring closure** (`attempt_ring_closure`, Phase 6b): two members *of the same
   composite* within `fusion_radius`, both with a spare per-particle bond, form one
   extra internal edge (closing a ring), consuming 2 free bonds. Touches only
   `edges`/`edge_count`/`degree`/`free_bonds` — never the member list or
-  `composite_id`. Gated by `allow_ring_closure AND bond_mode == "edges"` (skipped in
-  `star_spring`/off modes, where the edge array is physics-inert and firing it would
-  silently leak free bonds), rate-limited by `max_ring_closures_per_step`.
+  `composite_id`. Gated by `allow_ring_closure AND bond_mode == "edges" AND
+  use_valence` (skipped in `star_spring`/off modes, where the edge array is
+  physics-inert and firing it would silently leak free bonds; skipped with valence
+  off because the mechanic is defined by free-bond accounting and running it anyway
+  let `max_valence` leak into valence-off dynamics), rate-limited by
+  `max_ring_closures_per_step`.
 - **Fission** (`apply_composite_decay`): a product whose own member multiset gives
   `free_bonds < 0` is structurally unsound (more edges required than the members
   offer) and **shatters** into free particles rather than forming a sub-composite.
@@ -478,6 +488,17 @@ JAX_PLATFORMS=cpu .venv/bin/pytest tests/test_analysis_events.py tests/test_anal
 - **GPU contention with live sim**: integration tests in `test_chemistry.py` default to GPU. If
   the user has the live sim running, force CPU with `JAX_PLATFORMS=cpu pytest ...` — otherwise
   pytest can hang for an hour fighting for SM time.
+- **Fast test runs (2026-06-12)**: test wall-time is dominated by per-process XLA compiles and
+  Python-dispatched step loops at tiny N — the GPU sits mostly idle either way. Two fixes, both
+  measured on the chemistry suite:
+  - `tests/conftest.py` enables JAX's persistent compilation cache (`~/.cache/halflife-jax`,
+    WSL-native FS) so reruns skip recompiles. Also wired into `main.py` and the analysis CLI —
+    app restarts and repeat diagnostics skip the 10-30s warm-up.
+  - Parallelize with workers: `XLA_PYTHON_CLIENT_PREALLOCATE=false pytest -n 4` on GPU →
+    278s → 129s (2.15×). The prealloc env var is REQUIRED with `-n`: by default each JAX
+    process grabs 75% of VRAM and the workers OOM each other. Do NOT use CPU + `-n 8`:
+    each worker's XLA spawns threads on all 16 cores and oversubscription makes it
+    SLOWER (349s) than 4 GPU workers.
 - **Diagnostic scripts**: live in `/tmp/` as throwaways. They need explicit
   `sys.path.insert(0, "/mnt/.../halflife-particle")` (not `dirname(__file__)`) since they're
   outside the project root.
