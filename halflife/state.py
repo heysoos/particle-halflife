@@ -284,6 +284,8 @@ class PhysicsParams(NamedTuple):
     k_bond:                   jnp.ndarray  # () float32 — harmonic edge-spring stiffness (edges mode)
     r_rest_scale:             jnp.ndarray  # () float32 — uniform multiplier on bond rest length (edges mode)
     k_angle:                  jnp.ndarray  # () float32 — angle-locking stiffness (edges mode)
+    disruption_scale:         jnp.ndarray  # () float32 — liquid-drop Coulomb-analog constant (0 = legacy hard-core-only fissility)
+    cohesion_hl_scale:        jnp.ndarray  # () float32 — per-member cohesion for max stability (runtime; was config.cohesion_hl_scale)
     attraction_scale:         jnp.ndarray  # () float32 — global attraction magnitude multiplier
     dt:                       jnp.ndarray  # () float32 — integration timestep
 
@@ -302,6 +304,8 @@ def initialize_physics_params(config: SimConfig) -> PhysicsParams:
         k_bond=jnp.float32(config.k_bond),
         r_rest_scale=jnp.float32(1.0),
         k_angle=jnp.float32(config.k_angle),
+        disruption_scale=jnp.float32(config.disruption_scale),
+        cohesion_hl_scale=jnp.float32(config.cohesion_hl_scale),
         attraction_scale=jnp.float32(1.0),
         dt=jnp.float32(config.dt),
     )

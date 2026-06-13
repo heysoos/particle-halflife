@@ -96,7 +96,14 @@ class SimConfig:
     # Static field — changing it retraces once.
     stability_mode: str = "liquid_drop"
     surface_energy_coeff: float = 0.5   # a_s — cohesion penalty × n^(2/3)
-    cohesion_hl_scale: float = 1.0      # per-member cohesion needed for max stability
+    cohesion_hl_scale: float = 5.0      # per-member cohesion needed for max stability (≈⟨E_b⟩ so t_coh is a real gradient, not saturated at 1)
+    # Long-range Coulomb-analog disruption: E_coulomb = disruption_scale·n²/R_g.
+    # Grows super-linearly with size (R_g ∝ √n for a compact blob), so fissility
+    # x climbs with n and big/compact composites fission at a tunable critical
+    # size. 0 → legacy hard-core-only fissility (backward-compatible). Runtime-
+    # tunable via PhysicsParams ("disrupt k" slider). Final default tuned with
+    # the diagnostic (see spec §6).
+    disruption_scale: float = 0.5
     fissility_exponent: float = 1.0     # sharpness of the collapse as x → 1
     composite_size_decay_scale: float = 0.05   # size penalty on composite half-life (legacy mode + creation-time placeholder values)
 
