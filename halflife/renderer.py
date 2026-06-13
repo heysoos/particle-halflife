@@ -806,6 +806,9 @@ class Renderer:
                 # linear range lets the user tighten (<1) or loosen (>1) all
                 # bonds uniformly without changing the per-pair structure.
                 ("r_rest_scale", "bond length", _phys("r_rest_scale"), "{:.2f}", (0.3, 2.0)),
+                # angle-locking stiffness (VSEPR/harmonic); only bites when
+                # config.angle_mode != "off", which the live app defaults to vsepr.
+                ("k_angle",      "angle k",     _phys("k_angle"),      "{:.1f}", None),
             ]
         elif bond_mode == "star_spring":
             bond_slots = [

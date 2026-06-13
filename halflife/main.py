@@ -95,6 +95,10 @@ def build_config(args) -> SimConfig:
     # instead of diffing composite alive-masks across frames. Measured cost:
     # +3.0% per step (2026-06-12).
     kwargs['emit_events'] = True
+    # The live app shows angle-locking (VSEPR) so bonded geometry holds real
+    # molecular angles instead of floppy chains. Headless/test configs keep the
+    # zero-cost "off" default. Gated on bond_mode == "edges" in simulation_step.
+    kwargs['angle_mode'] = 'vsepr'
     return SimConfig(**kwargs)
 
 
