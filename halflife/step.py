@@ -413,6 +413,12 @@ def simulation_step(state: WorldState, params: InteractionParams,
         forces = forces + bond_forces
     # bond_mode == "off" → no bond force added
 
+    # Angle-locking forces (VSEPR / harmonic) — geometry of bonded members.
+    # Gated on edges mode (the angle list derives from the edge graph) and the
+    # static angle_mode, so XLA traces only the live branch — zero cost when off.
+    if config.angle_mode != "off" and config.bond_mode == "edges":
+        forces = forces + compute_angle_forces(state, config, physics)
+
     # ── Phase 4: Integration (Euler) ──────────────────────────────────────────
     new_vel = particles.velocity + (forces / particles.mass[:, None]) * physics.dt
     new_vel = new_vel * physics.damping

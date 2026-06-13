@@ -266,3 +266,30 @@ def test_harmonic_relaxes_degree2_to_theta0():
     u = pos[1] - pos[2]; w = pos[3] - pos[2]
     theta = np.degrees(np.arccos(np.clip(u@w/(np.linalg.norm(u)*np.linalg.norm(w)), -1, 1)))
     assert abs(theta - theta0) < 12
+
+
+# ── Task 7: gated wiring into simulation_step ────────────────────────────────
+
+def test_off_mode_vs_vsepr_step_differs():
+    """angle_mode='off' ⇒ pre-feature integration (free particles & bonded members
+    move identically to a no-kernel run); 'vsepr' ⇒ the bonded members diverge."""
+    from halflife.step import simulation_step
+    from halflife.state import initialize_interaction_params
+    # bonded chain 1-2-3 bent at 90° → an angle triple exists at center 2.
+    state, c_off = _world_with_edges(
+        [(1, 2), (2, 3)],
+        positions={2: (5.0, 5.0), 1: (6.0, 5.0), 3: (5.0, 6.0)},
+    )
+    params = initialize_interaction_params(c_off, seed=0)
+    out_off = simulation_step(state, params, c_off, initialize_physics_params(c_off))
+
+    c_on = dataclasses.replace(c_off, angle_mode="vsepr")
+    out_on = simulation_step(state, params, c_on, initialize_physics_params(c_on))
+
+    p_off = np.asarray(out_off.particles.position)
+    p_on = np.asarray(out_on.particles.position)
+    # vsepr must move the bonded members (kernel is live)…
+    assert not np.allclose(p_off[[1, 2, 3]], p_on[[1, 2, 3]], atol=1e-6)
+    # …but free particles (no triples) are untouched by angle mode.
+    assert np.allclose(p_off[5], p_on[5], atol=1e-6)
+    assert np.all(np.isfinite(p_on))
