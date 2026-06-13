@@ -829,6 +829,9 @@ class Renderer:
             ("fusion_threshold",         "fuse thresh", _phys("fusion_threshold"),     "{:.3f}", None),
             ("fusion_radius",            "fuse radius", _phys("fusion_radius"),        "{:.2f}", (0.5, float(self.config.interaction_radius))),
             ("binding_energy_scale",     "bind energy", _phys("binding_energy_scale"), "{:.3f}", None),
+            # Liquid-drop stability knobs (only bite in stability_mode="liquid_drop").
+            ("disruption_scale",         "disrupt k",   _phys("disruption_scale"),     "{:.2f}", None),
+            ("cohesion_hl_scale",        "cohesion",    _phys("cohesion_hl_scale"),    "{:.2f}", None),
             None,
             # ── Particle dynamics ─────────────────────────────────────────────
             ("dt",                       "dt",          _phys("dt"),                   "{:.4f}", (0.001, 0.1)),
@@ -849,7 +852,9 @@ class Renderer:
         # fits the available vertical space, with a floor that keeps the label
         # clear of the handle below it. The panel bg height tracks
         # _slider_content_h, so it follows automatically.
-        _MIN_ROW_H, _MIN_GAP = 30, 8
+        _MIN_ROW_H, _MIN_GAP = 28, 8   # 28px keeps the label clear of the handle
+                                       # below it while fitting the edges panel
+                                       # (14 sliders) into a 720px window.
         n_rows = sum(1 for s in slider_specs if s is not None)
         n_gaps = sum(1 for s in slider_specs if s is None)
         # Panel bottom = slider_start_y + content_h + 6 (see hud._draw_slider_panel);
