@@ -128,6 +128,32 @@ _HTML_TEMPLATE = """\
     display: inline-block;
   }}
 
+  /* Captioned-figure grid (Tier 5): each cell is an explanatory caption
+     stacked above its plot, so every figure is self-describing. */
+  .capfig {{ display: flex; flex-direction: column; }}
+  .capfig .cap {{
+    font-size: 0.82em;
+    color: #555;
+    line-height: 1.45;
+    margin: 0 0 0.35em 0;
+  }}
+  .capfig .cap strong {{ color: #333; }}
+  .capfig img {{
+    width: 100%;
+    height: auto;
+    border: 1px solid #eee;
+    border-radius: 3px;
+  }}
+  /* Inline formula chips for metric definitions. */
+  .eqn {{
+    font-family: "DejaVu Serif", Georgia, serif;
+    font-style: italic;
+    background: #f5f5f7;
+    padding: 0.05em 0.35em;
+    border-radius: 3px;
+    white-space: nowrap;
+  }}
+
   /* Pure-CSS radio toggle. Hide the inputs themselves; style the labels
      as a button-strip; use :checked + sibling-combinator to reveal the
      matching view. */
@@ -206,17 +232,37 @@ _HTML_TEMPLATE = """\
 </div>
 
 <h2>Tier 1 — Macroscopic time series</h2>
+<p class="note">The big-picture state of the composite population over the run.</p>
 <div class="plot-grid">
-  <img src="data:image/png;base64,{img_size_trajectory}">
-  <img src="data:image/png;base64,{img_size_dist}">
-  <img src="data:image/png;base64,{img_free_particle}">
+  <div class="capfig">
+    <p class="cap"><strong>Composite size trajectory.</strong> Top: largest (blue) and mean (orange) composite size at each step — the headline "are big structures forming?" signal. Bottom: number of alive composites. A max size pinned at <code>max_composite_size</code> means the buffer cap, not the chemistry, is limiting growth.</p>
+    <img src="data:image/png;base64,{img_size_trajectory}">
+  </div>
+  <div class="capfig">
+    <p class="cap"><strong>Size distribution over time.</strong> Heatmap of the composite-size histogram (y = size, x = step, color = how many composites of that size exist). Reveals whether the population is dominated by dimers or develops a spread of larger structures, and when.</p>
+    <img src="data:image/png;base64,{img_size_dist}">
+  </div>
+  <div class="capfig">
+    <p class="cap"><strong>Free-particle fraction.</strong> Share of particles not bound into any composite, over time. High = a dilute gas (little is condensing); low = most matter is locked into composites. The condensation transition shows up as the early drop.</p>
+    <img src="data:image/png;base64,{img_free_particle}">
+  </div>
 </div>
 
 <h2>Tier 2 — Valence / edge structure</h2>
+<p class="note">Bond-level structure: how saturated particles are and how many edges/rings the composites carry.</p>
 <div class="plot-grid">
-  <img src="data:image/png;base64,{img_degree_sat}">
-  <img src="data:image/png;base64,{img_free_bonds}">
-  <img src="data:image/png;base64,{img_edges_rings}">
+  <div class="capfig">
+    <p class="cap"><strong>Degree saturation.</strong> Fraction of particles whose bond count (graph degree) equals their species valence — i.e. they have no free bonds left. A high value means the chemistry is valence-limited: particles can't form new bonds even when partners are nearby.</p>
+    <img src="data:image/png;base64,{img_degree_sat}">
+  </div>
+  <div class="capfig">
+    <p class="cap"><strong>Composite free-bonds distribution.</strong> Heatmap over time of how many spare bonds (<span class="eqn">Σ v<sub>s</sub> − 2·edges</span>) alive composites have. Mass concentrated at 0 means composites are saturated and can't grow further by fusion.</p>
+    <img src="data:image/png;base64,{img_free_bonds}">
+  </div>
+  <div class="capfig">
+    <p class="cap"><strong>Total edges and rings.</strong> Summed over all alive composites: total bonds (blue) and rings (orange = edges beyond a spanning tree, i.e. cycles). Rising rings indicate cyclic/closed structures forming rather than just trees and chains.</p>
+    <img src="data:image/png;base64,{img_edges_rings}">
+  </div>
 </div>
 
 <h2>Tier 3 — Chemical network (empirical)</h2>
@@ -270,17 +316,29 @@ _HTML_TEMPLATE = """\
 </div>
 
 <h2>Tier 5 — Open-endedness &amp; temporal evolution</h2>
-<p class="note">Two type axes: <strong>composition</strong> (species multiset) and <strong>structure</strong> (bond-graph topology, Weisfeiler-Lehman hash). Time-resolved at snapshot cadence ({sample_every} steps); {n_windows} windows.</p>
-<p class="note">A discovery curve that keeps climbing and sustained per-window novelty/turnover indicate ongoing open-endedness; a plateau means the chemistry has closed. Structure metrics are only meaningful in <code>bond_mode="edges"</code> runs.</p>
+<p class="note">Does the simulation keep producing novelty over time, or has the chemistry closed? Every metric below is computed on <strong>two type axes</strong>: <strong>composition</strong> — a composite's species multiset, via the commutative <code>species_hash</code> (a 6-carbon chain and a 6-carbon ring are the <em>same</em> composition type); and <strong>structure</strong> — its bond-graph topology, via a Weisfeiler–Lehman hash over the edge list (chain ≠ ring of the same atoms). Comparing the two tells you whether novelty comes from new <em>recipes</em> or new <em>arrangements</em> of known recipes. All curves are resolved at snapshot cadence ({sample_every} steps) and sliced into {n_windows} time windows. Structure metrics are only meaningful when <code>bond_mode="edges"</code>.</p>
 
-<h3>5a–c, 5e: discovery, novelty, diversity, size by window</h3>
 <div class="plot-grid">
-  <img src="data:image/png;base64,{img_oe_discovery}">
-  <img src="data:image/png;base64,{img_oe_novelty}">
-  <img src="data:image/png;base64,{img_oe_diversity}">
-  <img src="data:image/png;base64,{img_oe_size_facets}">
+  <div class="capfig">
+    <p class="cap"><strong>5a · Type discovery curve.</strong> Cumulative count of <em>distinct type ids ever seen</em> up to each step, one line per axis. This is the defining open-endedness test: a curve that <strong>keeps climbing</strong> means new types are still appearing; a <strong>plateau</strong> means the system has exhausted its reachable chemistry. The dashed line is the true total of composition types from the complete per-step event stream (it catches short-lived types that are born and gone between snapshots, which the curve undercounts).</p>
+    <img src="data:image/png;base64,{img_oe_discovery}">
+  </div>
+  <div class="capfig">
+    <p class="cap"><strong>5b · Novelty rate per window.</strong> Number of types whose <em>first appearance</em> falls in each window — the per-window slope of 5a. Bars that <strong>decay toward zero</strong> mean exploration is petering out; bars that <strong>stay positive</strong> mean the system keeps inventing. Composition vs structure bars side by side show which axis is driving the novelty.</p>
+    <img src="data:image/png;base64,{img_oe_novelty}">
+  </div>
+  <div class="capfig">
+    <p class="cap"><strong>5c · Living diversity (Hill numbers).</strong> Effective number of <em>currently-alive</em> types at each step, where a type's abundance is how many alive composites carry it. Three orders: <span class="eqn">q=0</span> richness (raw count of distinct types), <span class="eqn">q=1 = exp(−Σ p<sub>i</sub> ln p<sub>i</sub>)</span> (Shannon, weights types by evenness), <span class="eqn">q=2 = 1 / Σ p<sub>i</sub>²</span> (inverse-Simpson, penalizes dominance hardest). A low q=1 with a high q=0 means many types exist but a few dominate the population. This is a <em>standing-stock</em> measure — distinct from 5a's cumulative count.</p>
+    <img src="data:image/png;base64,{img_oe_diversity}">
+  </div>
+  <div class="capfig">
+    <p class="cap"><strong>5e · Size distribution by window.</strong> Mean composite-size histogram within each window, overlaid (one line per window, dark→bright = early→late). Shows whether the run grows larger structures over time or stays small — the structural-complexity axis. The y-axis is symlog so both the many small composites and the rare large ones are visible. A right-shifting peak over successive windows = growing complexity.</p>
+    <img src="data:image/png;base64,{img_oe_size_facets}">
+  </div>
 </div>
-<h3>5d: Window-to-window turnover</h3>
+
+<h3>5d · Window-to-window turnover</h3>
+<p class="note">Pairwise dissimilarity of type composition between windows — how much the type ecosystem reshuffles over time. A system can be diverse <em>and</em> static; this is what catches the difference. <strong>0 = identical composition, 1 = completely disjoint.</strong> Two complementary measures, each shown for both axes (the 2×2 grid): <strong>Jaccard</strong> on presence/absence, <span class="eqn">1 − |A∩B| / |A∪B|</span> (did the <em>set</em> of types change?); <strong>Bray–Curtis</strong> on abundances, <span class="eqn">Σ|a<sub>i</sub>−b<sub>i</sub>| / Σ(a<sub>i</sub>+b<sub>i</sub>)</span> (did the <em>amounts</em> change?). Bright off-diagonal cells = sustained turnover; a dark block of adjacent windows = a stable regime. The diagonal is self-comparison and always 0.</p>
 <div class="matrix-wrap"><img src="data:image/png;base64,{img_oe_turnover}"></div>
 
 <footer>
