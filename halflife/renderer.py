@@ -842,6 +842,25 @@ class Renderer:
         slider_row_h   = self._slider_row_h
         group_gap      = self._slider_group_gap
 
+        # Fit-to-window: the slider count varies with bond_mode (edges adds the
+        # most rows), and at the default 38px row height the edges panel runs off
+        # the bottom of a 720px window — the last slider (angle k) was clipped.
+        # Shrink the per-row pitch (and group gap) uniformly so the whole panel
+        # fits the available vertical space, with a floor that keeps the label
+        # clear of the handle below it. The panel bg height tracks
+        # _slider_content_h, so it follows automatically.
+        _MIN_ROW_H, _MIN_GAP = 30, 8
+        n_rows = sum(1 for s in slider_specs if s is not None)
+        n_gaps = sum(1 for s in slider_specs if s is None)
+        # Panel bottom = slider_start_y + content_h + 6 (see hud._draw_slider_panel);
+        # leave an 8px margin to the window edge.
+        avail = self.config.window_height - 14 - slider_start_y
+        needed = n_rows * slider_row_h + n_gaps * group_gap
+        if needed > avail:
+            scale = avail / needed
+            slider_row_h = max(_MIN_ROW_H, slider_row_h * scale)
+            group_gap    = max(_MIN_GAP, group_gap * scale)
+
         self._sliders = []
         row_y = slider_start_y
         for spec in slider_specs:
