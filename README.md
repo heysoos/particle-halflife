@@ -290,6 +290,18 @@ rand < 1 - exp(-dt × ln2 / half_life)
 Free particles do not decay — chemistry only acts on composite structure. Particle
 species are conserved across the whole run.
 
+**Live half-life (`stability_mode="liquid_drop"`).** Each step recomputes every
+composite's `half_life` from a nuclear liquid-drop competition between **cohesion**
+(`E_coh = Σ bond E_b − surface·n^(2/3)`) and **disruption** (`E_dis`), with fissility
+`x = E_dis / (2·E_coh)` collapsing the half-life as `x → 1`. Disruption is the sum of
+a short-range hard-core term and a **long-range Coulomb analog**
+`E_coulomb = disruption_scale · n² / R_g` (uniform unit "charge" per member; `R_g` =
+periodic radius of gyration). Because `R_g ∝ √n` for a compact blob, `E_coulomb` grows
+*super-linearly* with size — so compact composites fission past a tunable critical size,
+while extended/stringy shapes (large `R_g`) stay stable. `disruption_scale = 0` recovers
+the legacy hard-core-only law. Both `disruption_scale` and `cohesion_hl_scale` are live
+sliders.
+
 **Binary fission** (`apply_composite_decay`): the multiset hash is fed through
 `_hash_to_partition`, which assigns each member to product 0 or product 1 via a
 deterministic per-slot key sort + hash-derived pivot. Both products are guaranteed

@@ -300,17 +300,33 @@ initial 2.0) caps every composite at a dimer.
   nuclear liquid-drop competition:
   - **Cohesion** `E_coh = Σ bond E_b − surface_energy_coeff · n^(2/3)` (aggregate bond
     dissociation energy minus a surface-tension penalty).
-  - **Disruption** `E_rep` = the composite's internal hard-core repulsion PE — the
-    "Coulomb" analog — accumulated for free by the force pass (`compute_all_forces` now
-    returns `(forces, rep_pe)`; `rep_pe[i]` is particle `i`'s same-composite hard-core PE,
-    summed per composite and halved since each pair is counted from both endpoints).
-  - **Fissility** `x = E_rep / (2·E_coh)`; the half-life is
+  - **Disruption** `E_dis = E_coulomb + E_rep` (the "Coulomb" analog):
+    - `E_coulomb = disruption_scale · n² / R_g` (2026-06-13) — a **long-range** monopole
+      self-energy (uniform unit "charge" per member), where `R_g` is the composite's
+      periodic min-image radius of gyration (`compute_radius_of_gyration`). For a compact
+      blob `R_g ∝ √n`, so `E_coulomb/E_coh ∝ √n` **grows super-linearly with size** — this
+      is the term that actually makes big composites fission at a tunable critical size,
+      and it is **shape-aware** (extended/stringy composites have large `R_g` → low
+      disruption → stay stable). This is the real liquid-drop Coulomb mechanism that the
+      old short-range `E_rep` alone lacked (without it, fissility never grew with `n`, so
+      half-lives pinned at `hl_max` and composites grew to the `max_composite_size` buffer).
+    - `E_rep` = the composite's internal **hard-core** repulsion PE — the short-range
+      "over-crammed" term — accumulated for free by the force pass (`compute_all_forces`
+      returns `(forces, rep_pe)`; `rep_pe[i]` is particle `i`'s same-composite hard-core PE,
+      summed per composite and halved since each pair is counted from both endpoints).
+  - **Fissility** `x = E_dis / (2·E_coh)`; the half-life is
     `hl_min + (hl_max − hl_min) · t_coh · clip(1 − x, 0, 1)^fissility_exponent`, with
-    `t_coh = clip(E_coh / (cohesion_hl_scale · n), 0, 1)`. Big / crammed / weakly-bonded
-    composites get short half-lives and fission fast; this **replaces** the ad-hoc
-    `composite_size_decay_scale` size penalty as the principled "big/repulsive things
-    fission" law. The hash-BE → half-life value written at fusion/fission time is now just
-    an initial placeholder until the first step overwrites it.
+    `t_coh = clip(E_coh / (cohesion_hl_scale · n), 0, 1)`. Big / compact / crammed /
+    weakly-bonded composites get short half-lives and fission fast; this **replaces** the
+    ad-hoc `composite_size_decay_scale` size penalty as the principled "big/repulsive
+    things fission" law. The hash-BE → half-life value written at fusion/fission time is
+    now just an initial placeholder until the first step overwrites it.
+  - **Runtime knobs** (2026-06-13): `disruption_scale` and `cohesion_hl_scale` are
+    `PhysicsParams` scalars (live "disrupt k" / "cohesion" sliders), not static config —
+    dial the critical size without recompiling. `disruption_scale = 0` reduces `E_dis` to
+    the legacy hard-core-only `E_rep` (backward-compatible). `cohesion_hl_scale`'s default
+    was raised `1.0 → 5.0` (≈⟨E_b⟩) so `t_coh` is a real gradient instead of saturating at
+    1 (bond quality now modulates half-life, not just size).
 - **`"legacy"`** — the original fixed hash-BE → half-life formula (with the
   `composite_size_decay_scale` size penalty), set once at creation and never rewritten.
   `composite_size_decay_scale` is now legacy-mode-only (plus the placeholder values).
@@ -480,7 +496,8 @@ config = SimConfig(
     # Composite stability (liquid-drop fissility law; "legacy" = fixed hash-BE hl)
     stability_mode="liquid_drop",
     surface_energy_coeff=0.5,      # a_s — cohesion penalty × n^(2/3)
-    cohesion_hl_scale=1.0,         # per-member cohesion for max stability
+    cohesion_hl_scale=5.0,         # per-member cohesion for max stability (runtime slider; ≈⟨E_b⟩ so t_coh isn't saturated)
+    disruption_scale=0.5,          # Coulomb-analog: E_coulomb = disruption_scale·n²/R_g (runtime slider; 0 = legacy hard-core only)
     fissility_exponent=1.0,        # sharpness of the collapse as x → 1
     composite_size_decay_scale=0.05,  # legacy-mode hl size penalty + placeholder values
 
