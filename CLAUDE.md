@@ -258,6 +258,37 @@ kinetically/thermally via bond scission. Species are conserved — fission never
 The shared back half (member/edge compaction, fragment hashes, COM kick, slot writes,
 event emission) is factored into `_apply_binary_splits`, reused by chemical bond scission.
 
+## Chemical Bond Scission (per-bond breaking)
+
+The **second** breaking channel (orthogonal to half-life fission). Half-life fission is
+"nuclear" (whole-body, stochastic); scission is "chemical" (one bond at a time, driven
+by local strain). It makes the harmonic edge spring a **finite** well: every edge carries
+a hash-derived dissociation energy `E_b = _hash_to_bond_energy(s_i, s_j)` (per species
+pair, in `[0, bond_energy_scale]`, decorrelated from BE/valence/rest-length via a fourth
+Fibonacci stream). `apply_bond_scission` (step Phase 6c, between ring closure and decay)
+runs every step in `bond_mode="edges"`:
+
+- **Kinetic break:** stretch strain `0.5·k_bond·max(r − r_rest, 0)² ≥ E_b` → the bond
+  snaps deterministically. Only *stretch* counts; compression never breaks a bond.
+- **Thermal break:** below threshold, Arrhenius probability
+  `P = 1 − exp(−dt · ν0 · exp(−(E_b − strain)/kT))` with `ν0 = bond_break_attempt_rate`,
+  `kT = bond_temperature` (kT → 0 disables thermal cleanly).
+
+**At most one bond per composite breaks per step** (the most-overstretched breaking edge),
+and at most `max_scissions_per_step` composites break per step (excess defers a step). A
+broken **bridge** splits the composite into its two connected halves (`reachable_mask` over
+the remaining edges → fragment labels → `_apply_binary_splits` with **zero kick** — the
+snapped spring just stops pulling, pairwise forces take over). A broken **ring** edge only
+removes the edge (everything stays reachable → product 1 is empty → product 0, the whole
+composite minus the edge, is written back). Scission emits `KIND_FISSION` events, so the
+analysis pipeline (`transitions.py`) treats them as fission transitions and skips the
+empty size-0 product of a ring break.
+
+`bond_energy_scale` is deliberately set ABOVE the natural equilibrium-bond strain band
+(measured mean ~0.25, p99 ~2.3 at `k_bond=20`) so the kinetic channel snaps only genuinely
+overstretched bonds, not normal equilibrium bonds — a scale near the strain band (the
+initial 2.0) caps every composite at a dimer.
+
 ## Valence & Free Bonds (edge-based saturation)
 
 Optional gate (`config.use_valence`, default True). Each species `s` gets a fixed
@@ -401,6 +432,13 @@ config = SimConfig(
     # [repulsion_radius, fusion_radius] — no longer absolute config fields
     allow_ring_closure=True,   # let same-composite members form extra (cyclic) edges
     max_ring_closures_per_step=50,
+
+    # Chemical bond scission (per-bond kinetic + thermal breaking; edges mode)
+    enable_bond_scission=True,
+    bond_energy_scale=10.0,        # E_b ceiling; sits above the natural strain band
+    bond_temperature=1.0,          # kT for the Arrhenius thermal channel (0 = off)
+    bond_break_attempt_rate=0.1,   # ν0 attempt frequency
+    max_scissions_per_step=32,
 )
 ```
 
