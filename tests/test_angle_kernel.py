@@ -120,3 +120,34 @@ def test_neighbor_list_branch_and_ring():
     nbrs = build_neighbor_list(state.composites, c)
     assert _nbr_set(nbrs, 4) == {5, 6}
     assert _nbr_set(nbrs, 5) == {4, 6}
+
+
+# ── Task 4: angle (triple) list ──────────────────────────────────────────────
+
+def test_angle_list_counts():
+    from halflife.step import build_neighbor_list, build_angle_list
+    # degree-2 center → 1 triple; degree-3 center → 3 triples (C(3,2))
+    state, c = _world_with_edges([(1, 2), (2, 3)])
+    nbrs = build_neighbor_list(state.composites, c)
+    angles = build_angle_list(nbrs, c)                 # (N, P_max, 3)
+    P = c.max_valence * (c.max_valence - 1) // 2
+    assert angles.shape == (c.num_particles, P, 3)
+    # particle 2 is the only valid center
+    rows2 = np.asarray(angles[2])
+    valid2 = rows2[(rows2[:, 0] >= 0)]
+    assert valid2.shape[0] == 1                        # one triple
+    assert set(valid2[0][[0, 2]]) == {1, 3}            # neighbors are 1,3
+    assert valid2[0][1] == 2                           # center is 2
+
+    state, c = _world_with_edges([(0, 1), (0, 2), (0, 3)])
+    nbrs = build_neighbor_list(state.composites, c)
+    angles = build_angle_list(nbrs, c)
+    rows0 = np.asarray(angles[0])
+    assert rows0[(rows0[:, 0] >= 0)].shape[0] == 3     # C(3,2) = 3 triples
+
+
+def test_angle_list_free_particle_empty():
+    from halflife.step import build_neighbor_list, build_angle_list
+    state, c = _world_with_edges([(1, 2), (2, 3)])
+    angles = build_angle_list(build_neighbor_list(state.composites, c), c)
+    assert np.all(np.asarray(angles[6]) == -1)         # free particle, no triples

@@ -26,6 +26,7 @@ Multi-step (no Python overhead):
 """
 
 import functools
+import itertools
 from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
@@ -238,6 +239,31 @@ def build_neighbor_list(composites, config: SimConfig) -> jnp.ndarray:
     # src_s==N (OOB row) and col>=V both dropped.
     nbrs = nbrs.at[src_s, col].set(dst_s, mode='drop')
     return nbrs
+
+
+def build_angle_list(nbrs: jnp.ndarray, config: SimConfig) -> jnp.ndarray:
+    """
+    Enumerate angle triples (i, j, k) — center j with neighbors i, k — from the
+    per-particle neighbor list. (N, P_max, 3) int32, -1 padded.
+
+    P_max = C(max_valence, 2); the column-pair list is generated in Python from
+    the static max_valence, so the enumeration unrolls at trace time. A triple is
+    invalid (all -1) if either neighbor column is -1.
+    """
+    N = config.num_particles
+    V = config.max_valence
+    pairs = list(itertools.combinations(range(V), 2))      # static, P_max entries
+    cols_p = jnp.asarray([p for p, _ in pairs], dtype=jnp.int32)
+    cols_q = jnp.asarray([q for _, q in pairs], dtype=jnp.int32)
+
+    j_idx = jnp.arange(N, dtype=jnp.int32)
+    i_ids = nbrs[:, cols_p]                                 # (N, P)
+    k_ids = nbrs[:, cols_q]                                 # (N, P)
+    j_ids = jnp.broadcast_to(j_idx[:, None], i_ids.shape)   # (N, P)
+
+    angles = jnp.stack([i_ids, j_ids, k_ids], axis=-1)      # (N, P, 3)
+    invalid = (i_ids < 0) | (k_ids < 0)
+    return jnp.where(invalid[..., None], jnp.int32(-1), angles)
 
 
 # ── Composite Size Statistics ─────────────────────────────────────────────────
