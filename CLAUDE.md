@@ -385,6 +385,38 @@ dynamic free-bond counter driven by graph degree. Caps had the unphysical proper
 that a 2-particle composite could randomly roll a ceiling of [32, 32, 32]; valence
 makes small composites of low-v species *immediately* saturated, as in real molecules.
 
+## Angle Locking (VSEPR / harmonic bond geometry)
+
+Without an angular term the edge springs only set bond *lengths*, so composites are
+floppy — bonds pivot freely and structures collapse into long chains. `config.angle_mode`
+adds a force between a composite's bonds so geometry holds real molecular angles
+(`compute_angle_forces`, step.py, applied just before integration, gated on
+`angle_mode != "off" AND bond_mode == "edges"` — the off path is dead-code-eliminated, so
+zero cost when off; the live app `main.py` defaults to `vsepr`, headless/tests stay `off`):
+
+- **`"vsepr"`** — bond directions repel via a chord-Coulomb law `U = k_angle/|û_i − û_k|`
+  (the Thomson problem on a circle), so the bonds **spread evenly** to an emergent
+  `2π/degree` rest angle (degree-2 → 180°, degree-3 → 120° Y, degree-4 → 90° cross). The
+  rest angle *emerges* from repulsion rather than being prescribed, so it is **not
+  frustrated** at degree ≥ 3 (4 vectors can't be pairwise-90° in 2D, but they *can* settle
+  to even spacing). This is the general-purpose "un-floppy the chains" mode.
+- **`"harmonic"`** — pulls `cos θ` toward `cos θ0` where θ0 is a hash-derived per-**central-
+  species** rest angle (`_hash_to_rest_angle`, Fibonacci stream `0x85EBCA77 >> 15`,
+  decorrelated from BE / valence / rest-length / bond-energy; mapped into
+  `[theta_min_deg, theta_max_deg]`). A smooth cosine form (no atan2, no cusp at 180°).
+  Intended for **degree ≤ 2** (prescribed bent low-valence shapes, water-analog); it
+  over-determines at degree ≥ 3 (more angle constraints than 2D DOFs).
+
+Mechanics shared by both: a per-particle neighbor list (`build_neighbor_list`, argsort +
+segmented-rank, no scan) and an angle-triple list `(N, C(max_valence,2), 3)`
+(`build_angle_list`, center j with neighbor pair i,k) are recomputed from the edge graph
+each step — **no changes to fusion / fission / ring-closure**. Each triple force is purely
+**tangential** (rotates bonds, never stretches them) and conserves linear & angular
+momentum (`F_j = −(F_i + F_k)`), with min-image displacement matching
+`compute_edge_bond_forces`. Stiffness is the runtime-tunable `PhysicsParams.k_angle`
+(seeded from `config.k_angle`, exposed as the "angle k" slider in edges mode). The angle
+potential is **not** part of `energy.py` conservation tracking (v1 scope).
+
 ## Visualization
 
 - **Particles**: point sprites colored by species (HSV), sized by log(mass), brightness by speed
@@ -474,6 +506,13 @@ config = SimConfig(
     bond_temperature=1.0,          # kT for the Arrhenius thermal channel (0 = off)
     bond_break_attempt_rate=0.1,   # ν0 attempt frequency
     max_scissions_per_step=32,
+
+    # Angle-locking (bond geometry; edges mode). Default "off" headless/tests;
+    # the live app (main.py) sets "vsepr". See "Angle Locking" below.
+    angle_mode="off",          # "off" | "vsepr" | "harmonic"
+    k_angle=10.0,              # angle stiffness; seeds runtime PhysicsParams.k_angle
+    theta_min_deg=90.0,        # harmonic θ0 band floor
+    theta_max_deg=180.0,       # harmonic θ0 band ceiling
 )
 ```
 

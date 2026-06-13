@@ -146,11 +146,39 @@ particle's up to `max_neighbors` neighbors from the cell list.
 #### PhysicsParams (runtime-tunable)
 
 A small set of scalars — `dt`, `damping`, `repulsion_strength`, `repulsion_radius`,
-`fusion_threshold`, `binding_energy_scale`, `r_cutoff_scale`, `spring_k`,
-`attraction_scale` — live in a separate `PhysicsParams` NamedTuple that's passed to
-the simulation as a *regular* (non-static) JAX argument. Changing them does not
+`fusion_threshold`, `binding_energy_scale`, `r_cutoff_scale`, `spring_k`, `k_bond`,
+`k_angle`, `attraction_scale` — live in a separate `PhysicsParams` NamedTuple that's
+passed to the simulation as a *regular* (non-static) JAX argument. Changing them does not
 trigger XLA recompilation. The on-screen **Params** panel exposes them as live
 sliders; defaults are sourced from `SimConfig` via `initialize_physics_params(config)`.
+
+#### Angle Locking (bond geometry)
+
+The edge springs (`bond_mode="edges"`) set bond *lengths* only, leaving bonded geometry
+floppy — so composites collapse into long chains. `config.angle_mode` adds an angular
+force between a composite's bonds (`compute_angle_forces`, applied just before
+integration, gated on `angle_mode != "off" AND bond_mode == "edges"`; the live app
+defaults to `vsepr`, headless/tests stay `off`). For each angle triple (center `j`,
+neighbor bonds `û_i`, `û_k` with `cos θ = û_i · û_k`):
+
+```
+vsepr     (chord-Coulomb repulsion; emergent even spreading, 2π/degree):
+  U   = k_angle / d ,  d = |û_i − û_k| = 2 sin(θ/2)
+  F_i = (k_angle / L_ji) · (w − û_i (û_i·w)) / (d² + ε)^1.5 ,  w = û_i − û_k
+  F_j = −(F_i + F_k)
+
+harmonic  (pull cos θ toward a hash-derived θ0(central species)):
+  U   = ½ k_angle (cos θ − cos θ0)²
+  F_i = −k_angle (cos θ − cos θ0) · (û_k − cos θ · û_i) / L_ji
+  F_j = −(F_i + F_k)
+```
+
+Both laws are purely **tangential** (rotate bonds, never stretch them) and conserve
+linear & angular momentum per triple. `vsepr` gives degree-2 → 180°, degree-3 → 120° Y,
+degree-4 → 90° cross with no degree-≥3 frustration (the rest angle emerges from
+repulsion); `harmonic` prescribes a per-central-species bent angle θ0 (water-analog,
+degree ≤ 2). The neighbor and angle-triple lists are rebuilt from the edge graph each
+step; the angle potential is not tracked by `energy.py` (v1).
 
 ---
 
