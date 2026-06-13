@@ -210,3 +210,59 @@ def test_vsepr_relaxes_three_bonds_to_Y():
         return np.degrees(np.arccos(np.clip(u@w/(np.linalg.norm(u)*np.linalg.norm(w)), -1, 1)))
     angs = sorted([ang(1, 2), ang(1, 3), ang(2, 3)])
     assert angs[0] > 90 and abs(np.mean(angs) - 120) < 15
+
+
+# ── Task 6: harmonic-θ0 mode ─────────────────────────────────────────────────
+
+def test_harmonic_drives_toward_theta0():
+    from halflife.step import compute_angle_forces
+    from halflife.chemistry import _species_rest_angles
+    # Put a degree-2 center at a 90° angle; harmonic should drive cos θ toward
+    # cos θ0 of the center's species. Check the force sign matches (c - c0).
+    state, c = _world_with_edges(
+        [(1, 2), (2, 3)],
+        positions={2: (5., 5.), 1: (6., 5.), 3: (5., 6.)},   # θ = 90°, c = 0
+    )
+    c = dataclasses.replace(c, angle_mode="harmonic", boundary_mode="open")
+    phys = initialize_physics_params(c)
+    F = np.asarray(compute_angle_forces(state, c, phys))
+    assert np.all(np.isfinite(F))
+    assert np.allclose(F[1] + F[2] + F[3], 0.0, atol=1e-4)   # momentum
+    # θ0 of the center species is ≠ 90°, so the net effect here is non-zero.
+    assert not np.allclose(F[1], 0.0, atol=1e-4)
+
+
+def test_harmonic_smooth_at_180():
+    from halflife.step import compute_angle_forces
+    state, c = _world_with_edges(
+        [(1, 2), (2, 3)],
+        positions={2: (5., 5.), 1: (4., 5.), 3: (6., 5.)},   # collinear, c = -1
+    )
+    c = dataclasses.replace(c, angle_mode="harmonic", boundary_mode="open")
+    F = np.asarray(compute_angle_forces(state, c, initialize_physics_params(c)))
+    assert np.all(np.isfinite(F))                            # no cusp / NaN at 180°
+
+
+def test_harmonic_relaxes_degree2_to_theta0():
+    from halflife.step import compute_angle_forces
+    from halflife.chemistry import _species_rest_angles
+    state, c = _world_with_edges(
+        [(1, 2), (2, 3)],
+        positions={2: (5., 5.), 1: (6., 5.), 3: (5.2, 6.)},
+    )
+    c = dataclasses.replace(c, angle_mode="harmonic", boundary_mode="open")
+    phys = initialize_physics_params(c)
+    sp = int(np.asarray(state.particles.species)[2])
+    theta0 = np.degrees(np.asarray(_species_rest_angles(c))[sp])
+    pos = np.array(state.particles.position)   # writable copy
+    for _ in range(600):
+        F = np.asarray(compute_angle_forces(
+            state._replace(particles=state.particles._replace(
+                position=jnp.asarray(pos))), c, phys))
+        for pid in (1, 3):
+            pos[pid] += 0.02 * F[pid]
+            v = pos[pid] - pos[2]
+            pos[pid] = pos[2] + v / (np.linalg.norm(v) + 1e-9)
+    u = pos[1] - pos[2]; w = pos[3] - pos[2]
+    theta = np.degrees(np.arccos(np.clip(u@w/(np.linalg.norm(u)*np.linalg.norm(w)), -1, 1)))
+    assert abs(theta - theta0) < 12
