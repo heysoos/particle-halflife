@@ -173,6 +173,38 @@ def compute_r_rest_matrix(config: SimConfig, fusion_radius, repulsion_radius) ->
         )(species_idx)
     )(species_idx)  # (S, S)
 
+def _hash_to_bond_energy(s_i: jnp.ndarray, s_j: jnp.ndarray,
+                         config: SimConfig) -> jnp.ndarray:
+    """
+    Hash-derived bond dissociation energy for species pair (s_i, s_j).
+
+    Order-independent (commutative additive pair hash) and re-mixed with a
+    Fibonacci-style constant DIFFERENT from the BE (2654435761, >>13),
+    valence (0x9E3779B1, >>13) and rest-length (0x9E3779B1, >>11) streams so
+    the four per-pair properties are mutually decorrelated.
+
+    Returns: scalar float32 in [0, config.bond_energy_scale]
+    """
+    h_i = _entity_hash_val(s_i, config).astype(jnp.uint32)
+    h_j = _entity_hash_val(s_j, config).astype(jnp.uint32)
+    h = (h_i + h_j) % jnp.uint32(config.hash_modulus)
+    h_mix = (h * jnp.uint32(0x85EBCA6B)) ^ (h >> jnp.uint32(9))
+    frac = (h_mix % jnp.uint32(1000)).astype(jnp.float32) / 999.0
+    return frac * config.bond_energy_scale
+
+
+@functools.partial(jax.jit, static_argnums=(0,))
+def compute_bond_energy_matrix(config: SimConfig) -> jnp.ndarray:
+    """(num_species, num_species) dissociation-energy matrix. Static per
+    config (like valence) — part of the universe, not of the run seed."""
+    species_idx = jnp.arange(config.num_species, dtype=jnp.int32)
+    return jax.vmap(
+        lambda i: jax.vmap(
+            lambda j: _hash_to_bond_energy(i, j, config)
+        )(species_idx)
+    )(species_idx)
+
+
 def _species_valences(config: SimConfig) -> jnp.ndarray:
     """Pre-compute the (num_species,) valence vector. Fixed for a given config."""
     species_idx = jnp.arange(config.num_species, dtype=jnp.int32)

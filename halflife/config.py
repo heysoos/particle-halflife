@@ -186,6 +186,25 @@ class SimConfig:
     # Same sequential-scan cost model as max_fusions_per_step (~45µs/unit).
     max_ring_closures_per_step: int = 16
 
+    # ── Chemical bond scission (per-bond breaking channel, 2026-06-12) ───────
+    # Every edge carries a hash-derived dissociation energy E_b (per species
+    # pair, decorrelated from BE / valence / rest length). Two break modes:
+    #   kinetic: stretch strain energy 0.5·k_bond·max(r − r_rest, 0)² >= E_b
+    #            → the bond snaps deterministically (the harmonic well is no
+    #            longer bottomless).
+    #   thermal: below threshold, P = 1 − exp(−dt·ν0·exp(−(E_b − strain)/kT))
+    #            (Arrhenius). kT = 0 disables thermal breaking entirely.
+    # Compression never breaks a bond — only stretch counts.
+    # At most one bond per composite breaks per step (the most-overstretched
+    # breaking edge). A broken bridge splits the composite into its two
+    # connected halves (no kick); a broken ring edge just removes the edge.
+    # Requires bond_mode == "edges".
+    enable_bond_scission: bool = True
+    bond_energy_scale: float = 2.0        # E_b = hash_frac × this
+    bond_temperature: float = 0.1         # kT for the Arrhenius thermal channel
+    bond_break_attempt_rate: float = 0.1  # ν0 — attempt frequency per sim-time
+    max_scissions_per_step: int = 32      # budget; excess breaks defer a step
+
     # ── Profiling / Instrumentation ──────────────────────────────────────────
     enable_profiling: bool = False
     cc_fusion_event_logging: bool = False  # Log individual C+C fusion events to console

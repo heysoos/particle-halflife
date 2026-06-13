@@ -668,6 +668,30 @@ def test_r_rest_is_deterministic_per_hash_modulus():
     np.testing.assert_array_almost_equal(np.asarray(p1.r_rest), np.asarray(p2.r_rest))
 
 
+def test_bond_energy_matrix_shape_symmetry_range():
+    """Hash-derived dissociation energies: symmetric, in [0, bond_energy_scale]."""
+    from halflife.chemistry import compute_bond_energy_matrix
+    config = SimConfig(num_species=5)
+    eb = np.asarray(compute_bond_energy_matrix(config))
+    assert eb.shape == (5, 5)
+    assert np.allclose(eb, eb.T)
+    assert (eb >= 0.0).all() and (eb <= config.bond_energy_scale).all()
+
+
+def test_bond_energy_decorrelated_from_rest_length_and_be():
+    """E_b must not be a monotone copy of r_rest or pair BE across pairs
+    (different Fibonacci remix stream). Sanity: rank orderings differ."""
+    from halflife.chemistry import (compute_bond_energy_matrix,
+                                    compute_r_rest_matrix)
+    config = SimConfig(num_species=6)
+    eb = np.asarray(compute_bond_energy_matrix(config))
+    rr = np.asarray(compute_r_rest_matrix(config, config.fusion_radius,
+                                          config.repulsion_radius))
+    iu = np.triu_indices(6)
+    # identical rank order across all 21 pairs would mean correlated streams
+    assert (np.argsort(eb[iu]) != np.argsort(rr[iu])).any()
+
+
 def test_composite_state_has_edges_fields():
     """CompositeState exposes edges and edge_count, initialized empty."""
     config = SimConfig(num_species=3, num_particles=100)
