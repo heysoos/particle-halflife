@@ -1009,55 +1009,181 @@ def test_ring_closure_adds_edge_between_same_composite_members():
     assert found, f"Expected (0, 3) edge after ring closure, got {edges_after[:4]}"
 
 
-def test_fission_rebuilds_spanning_tree_per_product():
+def _make_single_composite_world(config, pos, species, edge_pairs,
+                                  half_life=1e-4, binding_energy=0.0):
     """
-    A 4-member composite that fissions into two 2-member products should
-    leave each product with exactly 1 edge (the spanning-tree edge).
+    Build a world with one alive composite (slot 0) over particles [0, n),
+    where n = highest pid in edge_pairs + 1. Remaining particles are free
+    and parked far away by the caller's `pos`. edge_pairs are (pid, pid)
+    bond tuples.
     """
-    config = SimConfig(num_species=3, num_particles=10, max_composites=4,
-                       boundary_mode="reflect", world_width=20.0, world_height=20.0,
-                       half_life_min=0.001, half_life_max=0.001,  # decay every step
-                       fission_cost=0.0)
+    n = max(max(p) for p in edge_pairs) + 1
+    N = config.num_particles
     world = initialize_world(config, seed=0)
-    params = initialize_interaction_params(config, seed=0)
-    physics = initialize_physics_params(config)
-
-    pos = np.array([[5.0, 5.0], [5.5, 5.0], [6.0, 5.0], [6.5, 5.0]]
-                   + [[50.0+i, 50.0] for i in range(6)], dtype=np.float32)
-    species = np.zeros(10, dtype=np.int32)
-    composite_id = np.array([0, 0, 0, 0, -1, -1, -1, -1, -1, -1], dtype=np.int32)
-    members = np.full((4, config.max_composite_size), -1, dtype=np.int32)
-    members[0, :4] = (0, 1, 2, 3)
-    edges = np.full((4, config.e_max, 2), -1, dtype=np.int32)
-    edges[0, 0] = (0, 1); edges[0, 1] = (1, 2); edges[0, 2] = (2, 3)
-    edge_count = np.array([3, 0, 0, 0], dtype=np.int32)
-    alive = np.array([True, False, False, False], dtype=bool)
-    half_life = np.array([0.001, 0.0, 0.0, 0.0], dtype=np.float32)
-
-    world = world._replace(
+    composite_id = np.full(N, -1, dtype=np.int32)
+    composite_id[:n] = 0
+    members = np.full((config.max_composites, config.max_composite_size), -1, dtype=np.int32)
+    members[0, :n] = np.arange(n)
+    edges = np.full((config.max_composites, config.e_max, 2), -1, dtype=np.int32)
+    for k, (a, b) in enumerate(edge_pairs):
+        edges[0, k] = (a, b)
+    member_count = np.zeros(config.max_composites, dtype=np.int32)
+    member_count[0] = n
+    edge_count = np.zeros(config.max_composites, dtype=np.int32)
+    edge_count[0] = len(edge_pairs)
+    alive = np.zeros(config.max_composites, dtype=bool)
+    alive[0] = True
+    hl = np.zeros(config.max_composites, dtype=np.float32)
+    hl[0] = half_life
+    be = np.zeros(config.max_composites, dtype=np.float32)
+    be[0] = binding_energy
+    return world._replace(
         particles=world.particles._replace(
             position=jnp.asarray(pos), species=jnp.asarray(species),
             composite_id=jnp.asarray(composite_id),
         ),
         composites=world.composites._replace(
-            members=jnp.asarray(members), member_count=jnp.array([4,0,0,0]),
+            members=jnp.asarray(members), member_count=jnp.asarray(member_count),
             alive=jnp.asarray(alive), edges=jnp.asarray(edges),
-            edge_count=jnp.asarray(edge_count),
-            half_life=jnp.asarray(half_life),
+            edge_count=jnp.asarray(edge_count), half_life=jnp.asarray(hl),
+            binding_energy=jnp.asarray(be),
         ),
     )
 
-    new_state = apply_composite_decay(world, config, physics)
 
-    # The original composite has fissioned. Both products should each have a
-    # spanning tree (n-1 edges). For a 2-member product, that's exactly 1.
-    alive_after = np.asarray(new_state.composites.alive)
-    counts_after = np.asarray(new_state.composites.member_count)
-    edge_counts_after = np.asarray(new_state.composites.edge_count)
+def test_fission_never_mints_new_bonds():
+    """
+    THE long-bond-bug regression test. Fission products may only keep edges
+    that already existed in the parent — never invent new pairs. The member
+    SLOT order is deliberately scrambled relative to the bond topology so the
+    old slot-order path rebuild would mint non-edges.
+    """
+    config = SimConfig(num_species=3, num_particles=10, max_composites=4,
+                       boundary_mode="reflect", world_width=20.0, world_height=20.0,
+                       half_life_min=0.001, half_life_max=0.001)
+    pos = np.array([[5.0, 5.0], [5.5, 5.0], [6.0, 5.0], [6.5, 5.0]]
+                   + [[50.0 + i, 50.0] for i in range(6)], dtype=np.float32)
+    # Species 1 has valence 3 (see ring-closure test note), so fission
+    # products of any size are structurally valid and DO form composites
+    # with edges — making this test discriminate (all-species-0 products
+    # would shatter to free particles and pass vacuously).
+    species = np.ones(10, dtype=np.int32)
+    world = _make_single_composite_world(
+        config, pos, species, [(0, 1), (1, 2), (2, 3)], half_life=1e-4)
+    # Scramble slot order: members (0, 2, 1, 3) — bonds are still the chain.
+    members = np.asarray(world.composites.members).copy()
+    members[0, :4] = (0, 2, 1, 3)
+    world = world._replace(composites=world.composites._replace(
+        members=jnp.asarray(members)))
+    physics = initialize_physics_params(config)
+
+    original_edges = {(0, 1), (1, 2), (2, 3)}
+    # ONE decay call: at hl=1e-4 the per-step decay probability is ~1, and a
+    # single call lets us inspect the FIRST generation of products (more
+    # calls would cascade-fission them all the way to free particles and
+    # leave nothing to check).
+    state = apply_composite_decay(world, config, physics)
+
+    edges_after = np.asarray(state.composites.edges)
+    counts_after = np.asarray(state.composites.edge_count)
+    alive_after = np.asarray(state.composites.alive)
+    assert alive_after.any(), "expected at least one >=2-member product to inspect"
     for c in np.where(alive_after)[0]:
-        n = counts_after[c]
-        assert edge_counts_after[c] == max(0, n - 1), \
-            f"Composite {c} has {n} members but {edge_counts_after[c]} edges (expected {n-1})"
+        for e in range(counts_after[c]):
+            pair = tuple(sorted(edges_after[c, e].tolist()))
+            assert pair in original_edges, \
+                f"Fission minted new bond {pair} not in {original_edges}"
+
+
+def test_fission_products_keep_internal_edges_and_stay_consistent():
+    """After a 4-chain fissions, every alive product's edges reference only
+    its own members, and edge_count >= n - 1 (connected fragments)."""
+    config = SimConfig(num_species=3, num_particles=10, max_composites=4,
+                       boundary_mode="reflect", world_width=20.0, world_height=20.0,
+                       half_life_min=0.001, half_life_max=0.001)
+    pos = np.array([[5.0, 5.0], [5.5, 5.0], [6.0, 5.0], [6.5, 5.0]]
+                   + [[50.0 + i, 50.0] for i in range(6)], dtype=np.float32)
+    species = np.zeros(10, dtype=np.int32)
+    world = _make_single_composite_world(
+        config, pos, species, [(0, 1), (1, 2), (2, 3)], half_life=1e-4)
+    physics = initialize_physics_params(config)
+
+    state = apply_composite_decay(world, config, physics)
+
+    alive_after = np.asarray(state.composites.alive)
+    members_after = np.asarray(state.composites.members)
+    counts_after = np.asarray(state.composites.member_count)
+    edges_after = np.asarray(state.composites.edges)
+    ecounts_after = np.asarray(state.composites.edge_count)
+    cid_after = np.asarray(state.particles.composite_id)
+    fired = not alive_after[0] or counts_after[0] < 4
+    if fired:  # one decay roll is probabilistic; only assert when it fired
+        for c in np.where(alive_after)[0]:
+            mem = set(members_after[c, :counts_after[c]].tolist())
+            assert ecounts_after[c] >= counts_after[c] - 1
+            for e in range(ecounts_after[c]):
+                a, b = edges_after[c, e].tolist()
+                assert a in mem and b in mem, \
+                    f"Product {c} edge ({a},{b}) references non-members of {mem}"
+            for pid in mem:
+                assert cid_after[pid] == c
+
+
+def test_endothermic_fission_suppressed_by_default():
+    """With parent BE far above any possible product-BE sum, every cut has
+    Q < 0 → forbid_endothermic_fission (default True) keeps it alive."""
+    config = SimConfig(num_species=3, num_particles=10, max_composites=4,
+                       boundary_mode="reflect", world_width=20.0, world_height=20.0,
+                       half_life_min=0.001, half_life_max=0.001)
+    pos = np.array([[5.0, 5.0], [5.5, 5.0], [6.0, 5.0], [6.5, 5.0]]
+                   + [[50.0 + i, 50.0] for i in range(6)], dtype=np.float32)
+    species = np.zeros(10, dtype=np.int32)
+    # binding_energy=10: product BEs are <= 1.0 each (binding_energy_scale=1)
+    # so Q = BE0 + BE1 - 10 < 0 for every cut.
+    world = _make_single_composite_world(
+        config, pos, species, [(0, 1), (1, 2), (2, 3)],
+        half_life=1e-4, binding_energy=10.0)
+    physics = initialize_physics_params(config)
+
+    state = world
+    for _ in range(20):
+        state = apply_composite_decay(state, config, physics)
+    assert bool(state.composites.alive[0]), "endothermic fission should be barred"
+    assert int(state.composites.member_count[0]) == 4
+    # Same setup with the barrier off → it does fission (kick-less).
+    config_open = SimConfig(num_species=3, num_particles=10, max_composites=4,
+                            boundary_mode="reflect", world_width=20.0, world_height=20.0,
+                            half_life_min=0.001, half_life_max=0.001,
+                            forbid_endothermic_fission=False)
+    state = world
+    for _ in range(20):
+        state = apply_composite_decay(state, config_open, physics)
+    assert int(state.composites.member_count[0]) < 4 or not bool(state.composites.alive[0])
+
+
+def test_exothermic_fission_kicks_products_apart():
+    """Parent BE 0 → Q = BE0 + BE1 >= 0; if any positive-Q cut fires, member
+    velocities change (COM-axis kick)."""
+    config = SimConfig(num_species=3, num_particles=10, max_composites=4,
+                       boundary_mode="reflect", world_width=20.0, world_height=20.0,
+                       half_life_min=0.001, half_life_max=0.001)
+    pos = np.array([[5.0, 5.0], [5.5, 5.0], [6.0, 5.0], [6.5, 5.0]]
+                   + [[50.0 + i, 50.0] for i in range(6)], dtype=np.float32)
+    species = np.arange(10, dtype=np.int32) % 3   # mixed species → nonzero frag BEs
+    world = _make_single_composite_world(
+        config, pos, species, [(0, 1), (1, 2), (2, 3)],
+        half_life=1e-4, binding_energy=0.0)
+    world = world._replace(particles=world.particles._replace(
+        velocity=jnp.zeros((10, 2), dtype=jnp.float32)))
+    physics = initialize_physics_params(config)
+
+    state = world
+    for _ in range(20):
+        state = apply_composite_decay(state, config, physics)
+    fired = int(state.composites.member_count[0]) < 4 or not bool(state.composites.alive[0])
+    assert fired, "composite with hl=1e-4 should have fissioned within 20 rolls"
+    speeds = np.linalg.norm(np.asarray(state.particles.velocity[:4]), axis=1)
+    assert speeds.max() > 0.0, "exothermic fission should impart a kick"
 
 
 def test_initialize_edges_builds_spanning_tree_for_alive_composites():

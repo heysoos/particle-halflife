@@ -20,9 +20,10 @@ Decay:
   penalty applied in fusion_scan_body (larger composites are less stable).
 
 Fission:
-  Composite decay releases its member particles back to free state with
-  their original species (no transmutation), and injects
-  binding_energy * (1 - fission_cost) as radial kinetic energy.
+  Composite decay fractures along the bond cut that maximizes total product
+  binding energy (bond-cut fission). Fragments keep their internal bonds;
+  species are conserved (no transmutation). The kick is the Q-value
+  max(BE(p0) + BE(p1) − BE(parent), 0).
 
 JIT notes:
   - No Python control flow inside JAX operations
@@ -38,6 +39,7 @@ import jax.numpy as jnp
 from halflife.state import ParticleState, CompositeState, WorldState, InteractionParams, PhysicsParams, ReactionEvent
 from halflife.config import SimConfig
 from halflife.utils import find_free_slots
+from halflife.graph import bfs_tree, subtree_sums, descendant_mask, reachable_mask
 from halflife.analysis.events import KIND_FUSION, KIND_FISSION, KIND_NONE
 
 
@@ -324,161 +326,92 @@ def _entity_free_bonds(pid: jnp.ndarray, particles, composites,
     return jnp.where(is_free, free_val, comp_val)
 
 
-def _product_free_bonds(member_ids: jnp.ndarray, count: jnp.ndarray,
-                         particles, species_valences: jnp.ndarray,
-                         config: SimConfig) -> jnp.ndarray:
+def _hl_from_be_and_size(be: jnp.ndarray, n: jnp.ndarray,
+                         config: SimConfig, physics: PhysicsParams) -> jnp.ndarray:
     """
-    Free bonds for a fission product's (already-compacted) member list.
-    Identical math to the composite branch of _entity_free_bonds, but takes
-    the member list directly rather than dereferencing a composite slot.
-    Returns a scalar int32 (may be negative for structurally unsound partitions).
+    Half-life from BE + size penalty. Same formula as fusion_scan_body /
+    _fusion_apply_matching use inline; promoted to module level so the
+    binary-split applier can reuse it for fission products.
     """
-    M = config.max_composite_size
-    safe = jnp.where(member_ids >= 0, member_ids, 0)
-    sp = particles.species[safe]
-    valid = (member_ids >= 0) & (jnp.arange(M) < count)
-    vs = species_valences[sp]
-    total_v = jnp.sum(jnp.where(valid, vs, jnp.int32(0)))
-    return total_v - jnp.int32(2) * (count - jnp.int32(1))
+    t = jnp.clip((be - physics.fusion_threshold) / (1.0 - physics.fusion_threshold + 1e-8), 0.0, 1.0)
+    hl_base = config.half_life_min + (config.half_life_max - config.half_life_min) * t
+    size_penalty = 1.0 + config.composite_size_decay_scale * jnp.maximum(
+        0.0, n.astype(jnp.float32) - 2.0
+    )
+    return hl_base / size_penalty
 
 
-def _hash_to_partition(h: jnp.ndarray, n_members: jnp.ndarray,
-                       config: SimConfig) -> jnp.ndarray:
-    """
-    Determine a binary partition of composite members for fission.
+# ── Binary Split Applier (shared by fission and bond scission) ────────────────
 
-    For each member slot i ∈ [0, n_members), compute a sort key from
-    hash_mix(h, i) and rank slots by that key. The first `pivot` slots
-    in sorted order go to product 0, the rest to product 1. Both products
-    are guaranteed non-empty because pivot ∈ [1, n_members - 1].
+def _apply_binary_splits(particles, composites, split_slots, fires, assignment,
+                         kick_energy, config: SimConfig, physics: PhysicsParams):
+    """
+    Apply a batch of binary composite splits — the shared back half of
+    half-life fission (apply_composite_decay) and chemical bond scission
+    (apply_bond_scission, Phase B).
+
+    For each batch row k with fires[k] True, the composite in slot
+    split_slots[k] divides into product 0 (assignment[k] == 0) and product 1
+    (assignment[k] == 1):
+
+      - Product 0 reuses the parent slot; product 1 claims a fresh free slot.
+      - Each product keeps exactly the parent edges internal to its member
+        set — crossing edges break, and NO edges are ever minted. Bond
+        lengths can therefore only come from bonds that already existed:
+        this is the long-bond-bug fix.
+      - Products of size 1 become free particles. Under valence, a product
+        whose edge-based free bonds (Σ v_s − 2·edge_count) go negative
+        shatters into free particles. Splits only remove edges, so degrees
+        never grow and this is unreachable from a valid parent — kept as a
+        cheap invariant guard.
+      - kick_energy[k] splits equally between the two products as a kick
+        along the product COM-COM axis (each product moves as a unit).
 
     Args:
-        h:          scalar uint32 — composite's species hash
-        n_members:  scalar int32 — number of valid members (>= 2)
-        config:     SimConfig (static)
+        particles, composites: pre-split state pieces (authoritative)
+        split_slots: (K,) int32 — parent composite slot per row; C = padding
+        fires:       (K,) bool  — whether row k actually splits
+        assignment:  (K, M) int32 ∈ {-1, 0, 1} — fragment label per member slot
+        kick_energy: (K,) float32 — total kinetic energy released by row k
+        config, physics: statics / runtime scalars
 
     Returns:
-        assignment: (max_composite_size,) int32 — values in {0, 1} for slots
-                    i < n_members, else -1.
+        (new_particles, new_composites, events) — events has leading dim K
+        with kind == KIND_FISSION where fires. Callers discard events when
+        config.emit_events is False; XLA DCEs the build code.
     """
-    M = config.max_composite_size
-
-    # Per-slot sort key: mix h with slot index using Fibonacci-style hash.
-    slot_idx = jnp.arange(M, dtype=jnp.uint32)
-    sort_keys = (h.astype(jnp.uint32) * jnp.uint32(2_654_435_761)
-                 + slot_idx * jnp.uint32(1_000_003))
-    # Mark padding slots (i >= n_members) with max key so they sort last.
-    sort_keys = jnp.where(
-        jnp.arange(M, dtype=jnp.int32) < n_members,
-        sort_keys,
-        jnp.uint32(0xFFFFFFFF),
-    )
-
-    # Argsort: order[k] = slot whose sort_key is k-th smallest.
-    order = jnp.argsort(sort_keys)  # (M,)
-
-    # Pivot in [1, n_members - 1] from a different region of the hash.
-    # n_members >= 2 guarantees this range is non-empty.
-    pivot = jnp.int32(1) + (
-        ((h >> jnp.uint32(12)).astype(jnp.int32)) % jnp.maximum(n_members - 1, jnp.int32(1))
-    )
-
-    # In sorted order, assign first `pivot` to product 0, rest to product 1.
-    sorted_assignment = jnp.where(
-        jnp.arange(M, dtype=jnp.int32) < pivot,
-        jnp.int32(0),
-        jnp.int32(1),
-    )
-    # Mark padding slots (rank >= n_members in sorted order) with -1.
-    sorted_assignment = jnp.where(
-        jnp.arange(M, dtype=jnp.int32) < n_members,
-        sorted_assignment,
-        jnp.int32(-1),
-    )
-
-    # Scatter back to original slot order: assignment[order[k]] = sorted_assignment[k].
-    assignment = jnp.full(M, -1, dtype=jnp.int32).at[order].set(sorted_assignment)
-    return assignment
-
-
-# ── Composite Decay / Fission ─────────────────────────────────────────────────
-
-def apply_composite_decay(state: WorldState, config: SimConfig,
-                           physics: PhysicsParams) -> WorldState:
-    """
-    Apply binary fission decay to all alive composites.
-
-    A decaying composite is partitioned into two products by _hash_to_partition.
-    Product 0 reuses the parent's composite slot. Product 1 takes a fresh free
-    slot from the composite pool. Products of size 1 become free particles;
-    products of size >= 2 become new composites with hash-derived properties.
-
-    Particle species are never modified — only their composite_id and velocity.
-
-    Energy: parent.binding_energy * (1 - fission_cost) is split equally between
-    the two products as kinetic energy, applied as a momentum-conserving kick
-    along the COM-vs-COM axis (product 0 → +direction, product 1 → -direction).
-    Each product's members all get the same kick (the product moves as a unit).
-
-    Perf: per-fission work runs over a compacted batch of at most
-    config.max_fissions_per_step fissioning composites, not all C slots.
-    Fissions beyond the budget defer to the next step (the composite stays
-    alive and re-rolls). When emit_events is on, the fission ReactionEvent
-    batch has leading dim min(max_fissions_per_step, C) accordingly.
-
-    Args:
-        state:   WorldState
-        config:  SimConfig (static)
-        physics: PhysicsParams — provides dt for the per-step decay probability
-
-    Returns:
-        Updated WorldState
-    """
-    particles = state.particles
-    composites = state.composites
-    key, subkey = jax.random.split(state.rng_key)
     N = config.num_particles
     M = config.max_composite_size
     C = config.max_composites
+    E_max = config.e_max
+    K = split_slots.shape[0]
+    m_idx = jnp.arange(M, dtype=jnp.int32)
 
-    # ── Roll for which composites decay this step ───────────────────────────
-    rand = jax.random.uniform(subkey, (C,))
-    ln2 = jnp.log(2.0)
-    decay_prob = 1.0 - jnp.exp(-physics.dt * ln2 / (composites.half_life + 1e-10))
-    fissions = composites.alive & (rand < decay_prob)  # (C,) bool
+    safe_slots = jnp.minimum(split_slots, C - 1)
 
-    # ── Compact fissioning composites to a fixed batch (perf, 2026-06-12) ───
-    # The heavy per-fission work below (hash-partition argsort over M, product
-    # COMs, the (·, M) per-member kick grid) used to run for ALL C slots every
-    # step even though only a handful actually fission (~15/step steady state
-    # at num_species=3; ≤14 observed at 12 species). Gather the fissioning
-    # slots into a (K_f,) batch and run the heavy math only there. Fissions
-    # beyond the budget are deferred: the composite stays alive, unchanged,
-    # and simply re-rolls its decay next step.
-    K_f = min(config.max_fissions_per_step, C)
-    fission_rank = jnp.cumsum(fissions.astype(jnp.int32)) - 1  # rank among fissioning
-    selected = fissions & (fission_rank < K_f)
-    cand = jnp.where(selected, jnp.arange(C, dtype=jnp.int32), C)
-    fiss_idx = jnp.sort(cand)[:K_f]      # (K_f,) fissioning slot ids, C = padding
-    fiss_valid = fiss_idx < C            # (K_f,)
-    safe_fiss = jnp.minimum(fiss_idx, C - 1)
+    # Pre-allocate fresh composite slots for product 1: the k-th split takes
+    # free_slots[k]. No collision with parents — parents are alive,
+    # find_free_slots only returns dead slots.
+    target_p1 = find_free_slots(composites.alive, K)  # (K,) int32, -1 = exhausted
 
-    # Pre-allocate fresh composite slots for product 1 of each fissioning
-    # composite: the k-th selected fission takes free_slots[k]. No collision
-    # with parents — parents are alive, find_free_slots only returns dead slots.
-    free_slots = find_free_slots(composites.alive, K_f)  # (K_f,) int32
+    # ── Fragment lookup by particle id ───────────────────────────────────────
+    # Batch rows are member-disjoint (a particle lives in one composite), so a
+    # single (N,) array serves the whole batch.
+    member_grid = composites.members[safe_slots]                       # (K, M)
+    count_grid = composites.member_count[safe_slots]                   # (K,)
+    valid_grid = (member_grid >= 0) & (m_idx[None, :] < count_grid[:, None]) \
+                 & fires[:, None]
+    flat_pids = jnp.where(valid_grid, member_grid, N).reshape(-1)
+    frag_of_pid = jnp.full(N, -1, dtype=jnp.int32).at[flat_pids].set(
+        assignment.reshape(-1), mode='drop')
 
-    # ── Per-fission: compute partition assignment and COMs ──────────────────
-    def per_fission(k):
-        c = safe_fiss[k]
+    # ── Per-split: fragment COMs (min-image from member 0) ───────────────────
+    def per_split(k):
+        c = safe_slots[k]
         n = composites.member_count[c]
-        h = composites.species_hash[c]
-        assignment = _hash_to_partition(h, n, config)  # (M,) ∈ {-1, 0, 1}
-
-        # Compute each product's COM using min-image displacement from member 0.
-        member_ids = composites.members[c]  # (M,)
+        member_ids = composites.members[c]
         safe_ids = jnp.where(member_ids >= 0, member_ids, 0)
-        valid = (member_ids >= 0) & (jnp.arange(M) < n)
+        valid = (member_ids >= 0) & (m_idx < n)
         ref = particles.position[safe_ids[0]]
 
         def disp_from_ref(idx):
@@ -489,155 +422,124 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
             return d
 
         rels = jax.vmap(disp_from_ref)(jnp.arange(M))  # (M, 2)
-
-        in_p0 = valid & (assignment == 0)
-        in_p1 = valid & (assignment == 1)
+        a = assignment[k]
+        in_p0 = valid & (a == 0)
+        in_p1 = valid & (a == 1)
         n0 = jnp.sum(in_p0.astype(jnp.float32))
         n1 = jnp.sum(in_p1.astype(jnp.float32))
         com0 = ref + jnp.sum(rels * in_p0[:, None].astype(jnp.float32), axis=0) / (n0 + 1e-8)
         com1 = ref + jnp.sum(rels * in_p1[:, None].astype(jnp.float32), axis=0) / (n1 + 1e-8)
+        return com0, com1, n0.astype(jnp.int32), n1.astype(jnp.int32)
 
-        target_p1 = free_slots[k]
+    all_com0, all_com1, all_n0, all_n1 = jax.vmap(per_split)(
+        jnp.arange(K, dtype=jnp.int32))
 
-        return assignment, com0, com1, target_p1, n0.astype(jnp.int32), n1.astype(jnp.int32)
-
-    all_assignment, all_com0, all_com1, all_target_p1, all_n0, all_n1 = jax.vmap(per_fission)(
-        jnp.arange(K_f, dtype=jnp.int32)
-    )
-    # Shapes: (K_f, M), (K_f, 2), (K_f, 2), (K_f,), (K_f,), (K_f,)
-
-    # ── Compact each product's members & compute its hash ───────────────────
-    # Runs before per_member so that the cap-validity check below has the
-    # product hashes available; per_member then consults the validity flags
-    # when deciding whether each member rejoins a composite or goes free.
+    # ── Compact each product's members & compute its hash ────────────────────
     def per_product(k):
-        c = safe_fiss[k]
-        assignment = all_assignment[k]
+        c = safe_slots[k]
         member_ids = composites.members[c]
         n = composites.member_count[c]
+        a = assignment[k]
 
-        # Compact members of each product to front using cumsum (same trick as fusion).
-        in_p0 = (assignment == 0) & (member_ids >= 0) & (jnp.arange(M) < n)
-        in_p1 = (assignment == 1) & (member_ids >= 0) & (jnp.arange(M) < n)
+        in_p0 = (a == 0) & (member_ids >= 0) & (m_idx < n)
+        in_p1 = (a == 1) & (member_ids >= 0) & (m_idx < n)
 
-        pos_p0 = jnp.cumsum(in_p0.astype(jnp.int32)) - 1
-        out_pos_p0 = jnp.where(in_p0, pos_p0, M)
-        members_p0 = jnp.full(M, -1, dtype=jnp.int32).at[out_pos_p0].set(member_ids, mode='drop')
-        count_p0 = jnp.sum(in_p0.astype(jnp.int32))
+        # Compact members of each product to front using cumsum (same trick
+        # as fusion). Invalid entries route to OOB index M and drop.
+        def compact(mask):
+            pos = jnp.cumsum(mask.astype(jnp.int32)) - 1
+            out = jnp.where(mask, pos, M)
+            mem = jnp.full(M, -1, dtype=jnp.int32).at[out].set(member_ids, mode='drop')
+            return mem, jnp.sum(mask.astype(jnp.int32))
 
-        pos_p1 = jnp.cumsum(in_p1.astype(jnp.int32)) - 1
-        out_pos_p1 = jnp.where(in_p1, pos_p1, M)
-        members_p1 = jnp.full(M, -1, dtype=jnp.int32).at[out_pos_p1].set(member_ids, mode='drop')
-        count_p1 = jnp.sum(in_p1.astype(jnp.int32))
+        members_p0, count_p0 = compact(in_p0)
+        members_p1, count_p1 = compact(in_p1)
 
         # Species hashes via commutative sum over each product's members.
         def hash_for_product(members_arr, count_arr):
             safe = jnp.where(members_arr >= 0, members_arr, 0)
             sp = particles.species[safe]
-            valid_m = (members_arr >= 0) & (jnp.arange(M) < count_arr)
+            valid_m = (members_arr >= 0) & (m_idx < count_arr)
             hvals = jax.vmap(lambda s: _entity_hash_val(s, config))(sp)
-            return jnp.sum(jnp.where(valid_m, hvals, 0)) % config.hash_modulus
+            return (jnp.sum(jnp.where(valid_m, hvals, 0)) % config.hash_modulus).astype(jnp.uint32)
 
-        h_p0 = hash_for_product(members_p0, count_p0).astype(jnp.uint32)
-        h_p1 = hash_for_product(members_p1, count_p1).astype(jnp.uint32)
-
-        return members_p0, count_p0, h_p0, members_p1, count_p1, h_p1
+        return (members_p0, count_p0, hash_for_product(members_p0, count_p0),
+                members_p1, count_p1, hash_for_product(members_p1, count_p1))
 
     p0_members, p0_count, p0_hash, p1_members, p1_count, p1_hash = jax.vmap(per_product)(
-        jnp.arange(K_f, dtype=jnp.int32)
-    )
+        jnp.arange(K, dtype=jnp.int32))
 
-    # ── Build per-product spanning-tree edges ────────────────────────────────
-    # Each fission product gets a fresh path through its hash-sorted members:
-    # edges[k] = (members[k], members[k+1]) for k in [0, count-1).
-    # Parent edges are dropped — fission "rearranges chemistry."
-    M_size = config.max_composite_size
-    E_max = config.e_max
+    # ── Per-product edges: keep parent edges internal to each fragment ───────
+    def split_edges(k):
+        c = safe_slots[k]
+        ga = composites.edges[c, :, 0]
+        gb = composites.edges[c, :, 1]
+        evalid = (jnp.arange(E_max) < composites.edge_count[c]) & (ga >= 0)
+        fa = frag_of_pid[jnp.where(ga >= 0, ga, 0)]
+        fb = frag_of_pid[jnp.where(gb >= 0, gb, 0)]
 
-    def _path_edges_from_members(members_arr, count_arr):
-        """
-        Build a path-spanning tree through members in slot order: edges are
-        (members[0], members[1]), (members[1], members[2]), ...
-        Returns (edges: (E_max, 2), edge_count: int32).
-        """
-        # Edge k = (members[k], members[k+1]) for k in [0, count-1)
-        k_idx = jnp.arange(E_max, dtype=jnp.int32)
-        valid_edge = k_idx < jnp.maximum(count_arr - jnp.int32(1), jnp.int32(0))
-        # Safe gather
-        safe_k = jnp.minimum(k_idx, jnp.int32(M_size - 2))
-        a = members_arr[safe_k]
-        b = members_arr[safe_k + 1]
-        a_out = jnp.where(valid_edge, a, jnp.int32(-1))
-        b_out = jnp.where(valid_edge, b, jnp.int32(-1))
-        new_edges = jnp.stack([a_out, b_out], axis=-1)  # (E_max, 2)
-        new_edge_count = jnp.maximum(count_arr - jnp.int32(1), jnp.int32(0))
-        return new_edges, new_edge_count
+        def compact(keep):
+            pos = jnp.cumsum(keep.astype(jnp.int32)) - 1
+            out = jnp.where(keep, pos, E_max)
+            e = jnp.full((E_max, 2), -1, dtype=jnp.int32).at[out].set(
+                composites.edges[c], mode='drop')
+            return e, jnp.sum(keep.astype(jnp.int32))
 
-    p0_edges, p0_edge_count_all = jax.vmap(_path_edges_from_members)(p0_members, p0_count)
-    p1_edges, p1_edge_count_all = jax.vmap(_path_edges_from_members)(p1_members, p1_count)
+        e0, n_e0 = compact(evalid & (fa == 0) & (fb == 0))
+        e1, n_e1 = compact(evalid & (fa == 1) & (fb == 1))
+        return e0, n_e0, e1, n_e1
 
-    # ── Per-product free bonds and structural validity ──────────────────────
-    # free_bonds(product) = Σ v_s − 2 × (count − 1). A product with free_bonds
-    # < 0 is structurally unsound (a tree with that many nodes would require
-    # more bonds than the members collectively offer), so it cannot form a
-    # composite — its members shatter into free particles (the fission kick
-    # still fires). Gated by config.use_valence so the toggle is zero-cost
-    # when off. Size-1 products are handled by the count >= 2 gate downstream.
-    species_valences_decay = _species_valences(config)
-    p0_free_bonds = jax.vmap(
-        lambda members, count: _product_free_bonds(
-            members, count, particles, species_valences_decay, config
-        )
-    )(p0_members, p0_count)
-    p1_free_bonds = jax.vmap(
-        lambda members, count: _product_free_bonds(
-            members, count, particles, species_valences_decay, config
-        )
-    )(p1_members, p1_count)
+    p0_edges, p0_edge_count_all, p1_edges, p1_edge_count_all = jax.vmap(split_edges)(
+        jnp.arange(K, dtype=jnp.int32))
+
+    # ── Per-product free bonds (edge-based) and structural validity ──────────
+    species_valences_split = _species_valences(config)
+
+    def product_free_bonds(members_arr, count_arr, e_cnt):
+        safe = jnp.where(members_arr >= 0, members_arr, 0)
+        vs = species_valences_split[particles.species[safe]]
+        valid_m = (members_arr >= 0) & (m_idx < count_arr)
+        return jnp.sum(jnp.where(valid_m, vs, 0)) - jnp.int32(2) * e_cnt
+
+    p0_free_bonds = jax.vmap(product_free_bonds)(p0_members, p0_count, p0_edge_count_all)
+    p1_free_bonds = jax.vmap(product_free_bonds)(p1_members, p1_count, p1_edge_count_all)
 
     if config.use_valence:
         p0_valid = p0_free_bonds >= 0
         p1_valid = p1_free_bonds >= 0
     else:
-        p0_valid = jnp.ones(K_f, dtype=bool)
-        p1_valid = jnp.ones(K_f, dtype=bool)
+        p0_valid = jnp.ones(K, dtype=bool)
+        p1_valid = jnp.ones(K, dtype=bool)
 
-    # ── Update each member particle's composite_id and velocity ────────────
+    # ── Update each member particle's composite_id and velocity ──────────────
     def per_member(k, m):
-        c = safe_fiss[k]
-        does_fission = fiss_valid[k]
+        c = safe_slots[k]
         n = composites.member_count[c]
         member_id = composites.members[c, m]
-        valid = does_fission & (m < n) & (member_id >= 0)
+        valid = fires[k] & (m < n) & (member_id >= 0)
 
-        a = all_assignment[k, m]
+        a = assignment[k, m]
         com0 = all_com0[k]
         com1 = all_com1[k]
         n0 = all_n0[k]
         n1 = all_n1[k]
-        target_p1 = all_target_p1[k]
 
         # Direction along COM-COM axis (min-image).
         d = com0 - com1
         if config.boundary_mode == "periodic":
             d = d - config.world_width  * jnp.round(d[0] / config.world_width)  * jnp.array([1., 0.])
             d = d - config.world_height * jnp.round(d[1] / config.world_height) * jnp.array([0., 1.])
-        d_norm = jnp.linalg.norm(d) + 1e-8
-        d_hat = d / d_norm
+        d_hat = d / (jnp.linalg.norm(d) + 1e-8)
 
-        # Energy split: half to each product.
-        e_per = composites.binding_energy[c] * (1.0 - config.fission_cost) * 0.5
-
-        # Mass per product (mass=1 per particle).
-        mass_p0 = n0.astype(jnp.float32)
-        mass_p1 = n1.astype(jnp.float32)
-        v0 = jnp.sqrt(jnp.maximum(0.0, 2.0 * e_per / (mass_p0 + 1e-8)))
-        v1 = jnp.sqrt(jnp.maximum(0.0, 2.0 * e_per / (mass_p1 + 1e-8)))
+        # Energy split: half of the released kick energy to each product.
+        e_per = kick_energy[k] * 0.5
+        v0 = jnp.sqrt(jnp.maximum(0.0, 2.0 * e_per / (n0.astype(jnp.float32) + 1e-8)))
+        v1 = jnp.sqrt(jnp.maximum(0.0, 2.0 * e_per / (n1.astype(jnp.float32) + 1e-8)))
 
         # Kick: product 0 → +d_hat * v0, product 1 → -d_hat * v1.
         # Note: the kick always fires (even for shattered products), because
-        # the binding-energy release happens regardless of whether the pieces
-        # then bind into a sub-composite or fly apart as free particles.
+        # the energy release happens regardless of whether the pieces then
+        # bind into a sub-composite or fly apart as free particles.
         kick = jnp.where(
             a == 0,
             d_hat * v0,
@@ -645,36 +547,33 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
         )
 
         # Composite-formation flags incorporate structural free-bond validity.
-        # When valence is off, p0_valid/p1_valid are all-True, so behavior is
-        # unchanged from the no-saturation baseline.
         forms_p0 = (n0 >= 2) & p0_valid[k]
         forms_p1 = (n1 >= 2) & p1_valid[k]
 
         # New composite_id:
         #   a==0 and forms_p0 → c (reuse parent slot)
-        #   a==0 and not forms_p0 → -1 (free particle — size-1 or structurally unsound)
-        #   a==1 and forms_p1 → target_p1
+        #   a==0 and not forms_p0 → -1 (free particle — size-1 or unsound)
+        #   a==1 and forms_p1 → target_p1[k]
         #   a==1 and not forms_p1 → -1 (free)
-        #   a==-1 (padding) → preserve original (the scatter is gated on `valid`,
-        #                     so this value is never written; use a safe default).
+        #   a==-1 (padding) → preserve original (the scatter is gated on
+        #                     `valid`, so this value is never written).
         safe_member = jnp.where(member_id >= 0, member_id, 0)
         new_cid = jnp.where(
             a == 0,
             jnp.where(forms_p0, c, jnp.int32(-1)),
             jnp.where(a == 1,
-                      jnp.where(forms_p1, target_p1, jnp.int32(-1)),
+                      jnp.where(forms_p1, target_p1[k], jnp.int32(-1)),
                       particles.composite_id[safe_member]),
         )
-
         return member_id, valid, new_cid, kick
 
-    pid_grid, valid_grid, cid_grid, kick_grid = jax.vmap(
+    pid_grid, valid_grid_m, cid_grid, kick_grid = jax.vmap(
         lambda k: jax.vmap(lambda m: per_member(k, m))(jnp.arange(M, dtype=jnp.int32))
-    )(jnp.arange(K_f, dtype=jnp.int32))
-    # Shapes: (K_f, M), (K_f, M), (K_f, M), (K_f, M, 2)
+    )(jnp.arange(K, dtype=jnp.int32))
+    # Shapes: (K, M), (K, M), (K, M), (K, M, 2)
 
     flat_pid   = pid_grid.reshape(-1)
-    flat_valid = valid_grid.reshape(-1)
+    flat_valid = valid_grid_m.reshape(-1)
     flat_cid   = cid_grid.reshape(-1)
     flat_kick  = kick_grid.reshape(-1, 2)
 
@@ -691,57 +590,44 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
         jnp.where(flat_valid[:, None], flat_kick, 0.0)
     )
 
-    # ── Write product 0 into parent slot c (in place) ──
+    # ── Write product 0 into the parent slot (in place) ──
     # AND with p0_valid so structurally unsound products leave the parent slot
     # dead (its members already got composite_id=-1 above), reclaiming the slot.
-    p0_alive = fiss_valid & (p0_count >= 2) & p0_valid
-
-    # Half-life from BE + size penalty. Same formula as fusion_scan_body.
-    # Take both args explicitly so both can be vmapped (closing over p0_count
-    # would mis-broadcast against scalar `be` under vmap).
-    def _hl_from_be_and_n(be, n):
-        t = jnp.clip((be - physics.fusion_threshold) / (1.0 - physics.fusion_threshold + 1e-8), 0.0, 1.0)
-        hl_base = config.half_life_min + (config.half_life_max - config.half_life_min) * t
-        size_penalty = 1.0 + config.composite_size_decay_scale * jnp.maximum(
-            0.0, n.astype(jnp.float32) - 2.0
-        )
-        return hl_base / size_penalty
+    p0_alive = fires & (p0_count >= 2) & p0_valid
 
     p0_be_all = jax.vmap(lambda h: _hash_to_binding_energy(h, config, physics))(p0_hash)
-    p0_hl_all = jax.vmap(_hl_from_be_and_n)(p0_be_all, p0_count)
+    p0_hl_all = jax.vmap(lambda be, n: _hl_from_be_and_size(be, n, config, physics))(
+        p0_be_all, p0_count)
 
     # Scatter product-0 results into the parent slots (padding rows route to
-    # OOB index C and drop) — replaces the old full-(C,)-array jnp.where
-    # selects, which forced every field to be materialized at (C, ...) even
-    # for a handful of fissions.
-    fiss_drop = jnp.where(fiss_valid, fiss_idx, C)
-    new_alive = composites.alive.at[fiss_drop].set(p0_alive, mode='drop')
-    new_members = composites.members.at[fiss_drop].set(p0_members, mode='drop')
-    new_member_count = composites.member_count.at[fiss_drop].set(p0_count, mode='drop')
-    new_species_hash = composites.species_hash.at[fiss_drop].set(p0_hash, mode='drop')
-    new_binding_energy = composites.binding_energy.at[fiss_drop].set(p0_be_all, mode='drop')
-    new_half_life = composites.half_life.at[fiss_drop].set(p0_hl_all, mode='drop')
-    new_free_bonds = composites.free_bonds.at[fiss_drop].set(p0_free_bonds, mode='drop')
+    # OOB index C and drop).
+    split_drop = jnp.where(fires, split_slots, C)
+    new_alive = composites.alive.at[split_drop].set(p0_alive, mode='drop')
+    new_members = composites.members.at[split_drop].set(p0_members, mode='drop')
+    new_member_count = composites.member_count.at[split_drop].set(p0_count, mode='drop')
+    new_species_hash = composites.species_hash.at[split_drop].set(p0_hash, mode='drop')
+    new_binding_energy = composites.binding_energy.at[split_drop].set(p0_be_all, mode='drop')
+    new_half_life = composites.half_life.at[split_drop].set(p0_hl_all, mode='drop')
+    new_free_bonds = composites.free_bonds.at[split_drop].set(p0_free_bonds, mode='drop')
     # Reset age on the parent slot (it's now a fresh product).
-    new_age = composites.age.at[fiss_drop].set(jnp.float32(0.0), mode='drop')
-    new_edges = composites.edges.at[fiss_drop].set(p0_edges, mode='drop')
-    new_edge_count = composites.edge_count.at[fiss_drop].set(p0_edge_count_all, mode='drop')
+    new_age = composites.age.at[split_drop].set(jnp.float32(0.0), mode='drop')
+    new_edges = composites.edges.at[split_drop].set(p0_edges, mode='drop')
+    new_edge_count = composites.edge_count.at[split_drop].set(p0_edge_count_all, mode='drop')
 
-    # ── Write product 1 into all_target_p1[k] when valid AND p1_count[k] >= 2 ──
-    # AND with p1_valid so structurally unsound products are not written to a
-    # fresh composite slot (the free slot remains available for next step).
-    p1_writes = fiss_valid & (p1_count >= 2) & p1_valid
+    # ── Write product 1 into target_p1[k] when it forms a composite ──
+    p1_writes = fires & (p1_count >= 2) & p1_valid
 
     p1_be_all = jax.vmap(lambda h: _hash_to_binding_energy(h, config, physics))(p1_hash)
-    p1_hl_all = jax.vmap(_hl_from_be_and_n)(p1_be_all, p1_count)
+    p1_hl_all = jax.vmap(lambda be, n: _hl_from_be_and_size(be, n, config, physics))(
+        p1_be_all, p1_count)
 
-    # Scatter-write product 1 to all_target_p1[c]. Guard against negative
-    # indices: find_free_slots returns -1 when there aren't enough free slots,
-    # and JAX's negative-index default would wrap to [C-1] — clobbering the
-    # last composite. Route those to C (OOB) so mode='drop' actually drops them.
+    # Guard against negative indices: find_free_slots returns -1 when there
+    # aren't enough free slots, and JAX's negative-index default would wrap
+    # to [C-1] — clobbering the last composite. Route those to C (OOB) so
+    # mode='drop' actually drops them.
     drop_targets = jnp.where(
-        p1_writes & (all_target_p1 >= 0),
-        all_target_p1,
+        p1_writes & (target_p1 >= 0),
+        target_p1,
         C,  # OOB → drop
     )
 
@@ -774,49 +660,181 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
         velocity=new_velocity,
     )
 
-    # ── Per-fission event emission (output only; gated by config) ───────────
-    # Event kind=2 (fission) for every selected fission in the compacted
-    # batch — leading dim is min(max_fissions_per_step, C), not C.
-    # source_slots = (c, -1); product_slots = (c, target_p1[k]).
-    # source_hash/size = the parent composite at slot c BEFORE the state update.
-    # product_hashes = (p0_hash[k], p1_hash[k]); product_sizes = (p0_count[k], p1_count[k]).
-    # Slot 0 of products may be a shattered free particle (count=1, hash=0);
-    # slot 1 likewise. Either or both being product_size==1 is legal.
-    if config.emit_events:
-        ev_kind = jnp.where(fiss_valid, jnp.int32(KIND_FISSION), jnp.int32(KIND_NONE))
-        ev_src_slots = jnp.stack([
-            jnp.where(fiss_valid, fiss_idx, jnp.int32(-1)),
-            jnp.full((K_f,), -1, dtype=jnp.int32),
-        ], axis=1)
-        ev_src_hashes = jnp.stack([
-            jnp.where(fiss_valid, composites.species_hash[safe_fiss], jnp.uint32(0)),
-            jnp.zeros((K_f,), dtype=jnp.uint32),
-        ], axis=1)
-        ev_src_sizes = jnp.stack([
-            jnp.where(fiss_valid, composites.member_count[safe_fiss], jnp.int32(0)),
-            jnp.zeros((K_f,), dtype=jnp.int32),
-        ], axis=1)
-        ev_prod_slots = jnp.stack([
-            jnp.where(fiss_valid, fiss_idx, jnp.int32(-1)),
-            jnp.where(fiss_valid, all_target_p1, jnp.int32(-1)),
-        ], axis=1)
-        ev_prod_hashes = jnp.stack([
-            jnp.where(fiss_valid, p0_hash, jnp.uint32(0)),
-            jnp.where(fiss_valid, p1_hash, jnp.uint32(0)),
-        ], axis=1)
-        ev_prod_sizes = jnp.stack([
-            jnp.where(fiss_valid, p0_count, jnp.int32(0)),
-            jnp.where(fiss_valid, p1_count, jnp.int32(0)),
-        ], axis=1)
-        events = ReactionEvent(
-            kind=ev_kind,
-            source_slots=ev_src_slots,
-            source_hashes=ev_src_hashes,
-            source_sizes=ev_src_sizes,
-            product_slots=ev_prod_slots,
-            product_hashes=ev_prod_hashes,
-            product_sizes=ev_prod_sizes,
-        )
+    # ── Per-split event emission (kind=2 fission; callers discard when off) ──
+    # source = the parent composite BEFORE the state update; products may be
+    # size 1 (shattered free particle) or — for a cycle-edge scission with no
+    # actual split — product 1 may be empty (size 0, hash 0).
+    ev_kind = jnp.where(fires, jnp.int32(KIND_FISSION), jnp.int32(KIND_NONE))
+    ev_src_slots = jnp.stack([
+        jnp.where(fires, split_slots, jnp.int32(-1)),
+        jnp.full((K,), -1, dtype=jnp.int32),
+    ], axis=1)
+    ev_src_hashes = jnp.stack([
+        jnp.where(fires, composites.species_hash[safe_slots], jnp.uint32(0)),
+        jnp.zeros((K,), dtype=jnp.uint32),
+    ], axis=1)
+    ev_src_sizes = jnp.stack([
+        jnp.where(fires, composites.member_count[safe_slots], jnp.int32(0)),
+        jnp.zeros((K,), dtype=jnp.int32),
+    ], axis=1)
+    ev_prod_slots = jnp.stack([
+        jnp.where(fires, split_slots, jnp.int32(-1)),
+        jnp.where(fires, target_p1, jnp.int32(-1)),
+    ], axis=1)
+    ev_prod_hashes = jnp.stack([
+        jnp.where(fires, p0_hash, jnp.uint32(0)),
+        jnp.where(fires & (p1_count > 0), p1_hash, jnp.uint32(0)),
+    ], axis=1)
+    ev_prod_sizes = jnp.stack([
+        jnp.where(fires, p0_count, jnp.int32(0)),
+        jnp.where(fires, p1_count, jnp.int32(0)),
+    ], axis=1)
+    events = ReactionEvent(
+        kind=ev_kind,
+        source_slots=ev_src_slots,
+        source_hashes=ev_src_hashes,
+        source_sizes=ev_src_sizes,
+        product_slots=ev_prod_slots,
+        product_hashes=ev_prod_hashes,
+        product_sizes=ev_prod_sizes,
+    )
+
+    return new_particles, new_composites, events
+
+
+# ── Composite Decay / Fission ─────────────────────────────────────────────────
+
+def apply_composite_decay(state: WorldState, config: SimConfig,
+                           physics: PhysicsParams):
+    """
+    Half-life ("nuclear") fission with bond-cut fracture (2026-06-12).
+
+    A decaying composite no longer partitions by hashing slot indices — it
+    fractures along a BOND CUT: among the edges of its BFS spanning tree, the
+    cut that maximizes total product binding energy (the hash-BE landscape
+    acting as the shell-structure / magic-number analog) defines the two
+    fragments. The additive commutative hash lets every cut be scored from
+    one subtree-sum pass: frag hashes are (subtree, total − subtree). Each
+    fragment keeps the parent edges internal to it, so fission never mints
+    new bonds — slot order is irrelevant and the long-bond bug is gone.
+
+    Energy: the kick is the Q-value max(BE(p0) + BE(p1) − BE(parent), 0),
+    split equally between products along the COM-COM axis (replaces the old
+    binding_energy * (1 − fission_cost) release). With
+    config.forbid_endothermic_fission (default True), a roll whose best cut
+    has Q < 0 is suppressed — the composite survives (fission barrier).
+
+    Particle species are never modified — only composite_id and velocity.
+
+    Perf: per-fission work runs over a compacted batch of at most
+    config.max_fissions_per_step fissioning composites, not all C slots.
+    Fissions beyond the budget defer to the next step (the composite stays
+    alive and re-rolls). Graph sweeps are capped at
+    config.fission_label_iters. When emit_events is on, the fission
+    ReactionEvent batch has leading dim min(max_fissions_per_step, C).
+
+    Args:
+        state:   WorldState
+        config:  SimConfig (static)
+        physics: PhysicsParams — provides dt for the per-step decay probability
+
+    Returns:
+        Updated WorldState (and the ReactionEvent batch when emit_events)
+    """
+    particles = state.particles
+    composites = state.composites
+    key, subkey = jax.random.split(state.rng_key)
+    N = config.num_particles
+    M = config.max_composite_size
+    C = config.max_composites
+    E_max = config.e_max
+    iters = config.fission_label_iters
+    m_idx = jnp.arange(M, dtype=jnp.int32)
+
+    # ── Roll for which composites decay this step ───────────────────────────
+    rand = jax.random.uniform(subkey, (C,))
+    ln2 = jnp.log(2.0)
+    decay_prob = 1.0 - jnp.exp(-physics.dt * ln2 / (composites.half_life + 1e-10))
+    fissions = composites.alive & (rand < decay_prob)  # (C,) bool
+
+    # ── Compact fissioning composites to a fixed batch (perf, 2026-06-12) ───
+    # Gather the fissioning slots into a (K_f,) batch and run the heavy math
+    # only there. Fissions beyond the budget are deferred: the composite
+    # stays alive, unchanged, and simply re-rolls its decay next step.
+    K_f = min(config.max_fissions_per_step, C)
+    fission_rank = jnp.cumsum(fissions.astype(jnp.int32)) - 1  # rank among fissioning
+    selected = fissions & (fission_rank < K_f)
+    cand = jnp.where(selected, jnp.arange(C, dtype=jnp.int32), C)
+    fiss_idx = jnp.sort(cand)[:K_f]      # (K_f,) fissioning slot ids, C = padding
+    fiss_valid = fiss_idx < C            # (K_f,)
+    safe_fiss = jnp.minimum(fiss_idx, C - 1)
+
+    # ── pid → local member slot, for the whole batch ─────────────────────────
+    # Batch composites are member-disjoint, so one (N,) array serves all K_f.
+    member_grid = composites.members[safe_fiss]                          # (K_f, M)
+    count_grid = composites.member_count[safe_fiss]                      # (K_f,)
+    valid_grid = (member_grid >= 0) & (m_idx[None, :] < count_grid[:, None]) \
+                 & fiss_valid[:, None]
+    flat = jnp.where(valid_grid, member_grid, N).reshape(-1)
+    slot_of = jnp.zeros(N, dtype=jnp.int32).at[flat].set(
+        jnp.tile(m_idx, K_f), mode='drop')
+
+    # ── Per-fission: BFS tree → subtree sums → best bond cut ─────────────────
+    def choose_cut(k):
+        c = safe_fiss[k]
+        n = composites.member_count[c]
+        members = composites.members[c]
+        valid_m = (members >= 0) & (m_idx < n)
+
+        ga = composites.edges[c, :, 0]
+        gb = composites.edges[c, :, 1]
+        evalid = (jnp.arange(E_max) < composites.edge_count[c]) & (ga >= 0)
+        la = slot_of[jnp.where(ga >= 0, ga, 0)]
+        lb = slot_of[jnp.where(gb >= 0, gb, 0)]
+
+        dist, parent = bfs_tree(la, lb, evalid, M, iters)
+
+        # Per-slot hash values (masked to valid members) for the subtree pass.
+        safe_members = jnp.where(members >= 0, members, 0)
+        hvals = jax.vmap(lambda s: _entity_hash_val(s, config))(
+            particles.species[safe_members]).astype(jnp.uint32)
+        base_h = jnp.where(valid_m, hvals, jnp.uint32(0))
+        base_c = valid_m.astype(jnp.int32)
+        sub_h, sub_c = subtree_sums(parent, base_h, base_c, M, iters)
+
+        # uint32 wraparound sum — same convention as the product hashes, so
+        # the complement (total − subtree) is exact before the modulus.
+        total_h = jnp.sum(base_h)
+
+        # Candidate cut v ⇔ the spanning-tree edge (v, parent[v]).
+        cand_v = valid_m & (parent >= 0)
+        h1 = sub_h % jnp.uint32(config.hash_modulus)
+        h0 = (total_h - sub_h) % jnp.uint32(config.hash_modulus)
+        be1 = jax.vmap(lambda h: _hash_to_binding_energy(h, config, physics))(h1)
+        be0 = jax.vmap(lambda h: _hash_to_binding_energy(h, config, physics))(h0)
+
+        # Shell-effect analog: fracture along the cut that maximizes total
+        # product binding energy. Deterministic (argmax ties → lowest slot).
+        score = jnp.where(cand_v, be0 + be1, -jnp.inf)
+        v = jnp.argmax(score)
+        q = score[v] - composites.binding_energy[c]
+
+        in_p1 = descendant_mask(parent, v.astype(jnp.int32), M, iters) & valid_m
+        a = jnp.where(valid_m,
+                      jnp.where(in_p1, jnp.int32(1), jnp.int32(0)),
+                      jnp.int32(-1))
+        has_cut = jnp.any(cand_v)  # size>=2 composites always have an edge; guard anyway
+        return a, q, has_cut
+
+    assignment, q_all, has_cut = jax.vmap(choose_cut)(jnp.arange(K_f, dtype=jnp.int32))
+
+    fires = fiss_valid & has_cut
+    if config.forbid_endothermic_fission:
+        fires = fires & (q_all >= 0.0)
+    kick = jnp.maximum(q_all, 0.0)
+
+    new_particles, new_composites, events = _apply_binary_splits(
+        particles, composites, fiss_idx, fires, assignment, kick, config, physics)
 
     new_state = state._replace(
         particles=new_particles,
@@ -827,6 +845,8 @@ def apply_composite_decay(state: WorldState, config: SimConfig,
     if config.emit_events:
         return new_state, events
     return new_state
+
+
 
 
 # ── Fusion ───────────────────────────────────────────────────────────────────

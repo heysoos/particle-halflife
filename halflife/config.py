@@ -72,8 +72,6 @@ class SimConfig:
     init_speed: float = 1.5
     # Binding energy scale — how much energy fusing releases
     binding_energy_scale: float = 1.0
-    # Cost multiplier for fission (energy required = binding_energy * fission_cost)
-    fission_cost: float = 0.5
     # Velocity damping per step (1.0 = no damping, 0.99 = slight damping)
     damping: float = 0.995
     max_velocity: float = 8.0         # velocity clamp
@@ -86,6 +84,25 @@ class SimConfig:
 
     # ── Composite Stability ───────────────────────────────────────────────────
     composite_size_decay_scale: float = 0.05   # size penalty on composite half-life (larger → shorter hl)
+
+    # ── Fission fracture (bond-cut, 2026-06-12) ──────────────────────────────
+    # Fission no longer partitions members by hashing slot indices — it
+    # fractures along the bond cut that maximizes total product binding
+    # energy (the hash-BE landscape acting as the shell-structure analog).
+    # Products keep the parent edges internal to them; crossing edges break.
+    # The kick is the Q-value max(BE(p0) + BE(p1) − BE(parent), 0), replacing
+    # the old binding_energy * (1 − fission_cost) release.
+    #
+    # Iteration cap for the graph sweeps (BFS / subtree sums / fragment
+    # labeling) inside fission and bond scission. Correct for bond graphs of
+    # diameter <= this value; members beyond the horizon stay with the root
+    # fragment (graceful degradation for extreme chains). Cost is linear.
+    fission_label_iters: int = 64
+    # Barrier analog: when True, a decay roll whose best cut has Q < 0 is
+    # suppressed entirely — hash-favored ("magic") composites become stable
+    # against spontaneous fission and only break kinetically/thermally via
+    # bond scission. When False, endothermic fission fires with zero kick.
+    forbid_endothermic_fission: bool = True
 
     # ── Valence / Free Bonds (hash-encoded per-species bond capacity) ─────────
     # Each species has a fixed hash-derived valence v_s ∈ [1, max_valence] (the
