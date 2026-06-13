@@ -36,7 +36,7 @@ from halflife.config import SimConfig
 from halflife.state import WorldState, InteractionParams, PhysicsParams
 from halflife.spatial import build_cell_list, find_all_neighbors
 from halflife.interactions import compute_all_forces
-from halflife.chemistry import attempt_fusion, apply_composite_decay
+from halflife.chemistry import attempt_fusion, apply_composite_decay, _species_rest_angles
 from halflife.energy import compute_total_energy, apply_soft_energy_conservation
 from halflife.utils import apply_boundary
 
@@ -264,6 +264,79 @@ def build_angle_list(nbrs: jnp.ndarray, config: SimConfig) -> jnp.ndarray:
     angles = jnp.stack([i_ids, j_ids, k_ids], axis=-1)      # (N, P, 3)
     invalid = (i_ids < 0) | (k_ids < 0)
     return jnp.where(invalid[..., None], jnp.int32(-1), angles)
+
+
+def compute_angle_forces(state: WorldState, config: SimConfig,
+                         physics: PhysicsParams) -> jnp.ndarray:
+    """
+    Per-triple angular forces over composite bonds. (N, 2) float32.
+
+    Force law selected by static config.angle_mode:
+      "vsepr"    — chord-Coulomb repulsion between bond directions; emergent even
+                   spread (2π/degree), no frustration at degree ≥ 3.
+      "harmonic" — pull cos θ toward cos θ0(central species) (smooth cosine form).
+
+    Both laws are purely tangential (rotate bonds, never stretch them) and conserve
+    linear & angular momentum per triple (F_j = -(F_i + F_k)). Min-image displacement
+    matches compute_edge_bond_forces.
+    """
+    particles = state.particles
+    composites = state.composites
+    N = config.num_particles
+    k_angle = physics.k_angle
+
+    angles = build_angle_list(build_neighbor_list(composites, config), config)  # (N,P,3)
+    i_id, j_id, k_id = angles[..., 0], angles[..., 1], angles[..., 2]            # (N,P)
+    valid = i_id >= 0
+
+    safe = lambda x: jnp.where(x >= 0, x, 0)
+    pi = particles.position[safe(i_id)]   # (N,P,2)
+    pj = particles.position[safe(j_id)]
+    pk = particles.position[safe(k_id)]
+
+    def min_image(d):
+        if config.boundary_mode == "periodic":
+            d = d - config.world_width  * jnp.round(d[..., 0:1] / config.world_width)  * jnp.array([1., 0.])
+            d = d - config.world_height * jnp.round(d[..., 1:2] / config.world_height) * jnp.array([0., 1.])
+        return d
+
+    r_ji = min_image(pi - pj)
+    r_jk = min_image(pk - pj)
+    Lji = jnp.linalg.norm(r_ji, axis=-1) + 1e-10
+    Ljk = jnp.linalg.norm(r_jk, axis=-1) + 1e-10
+    ui = r_ji / Lji[..., None]
+    uk = r_jk / Ljk[..., None]
+    c = jnp.clip((ui * uk).sum(-1), -1.0, 1.0)   # cos θ, (N,P)
+
+    if config.angle_mode == "vsepr":
+        w = ui - uk
+        d2 = (w * w).sum(-1) + 1e-6              # |û_i − û_k|² ; ε-softened core
+        inv = d2 ** (-1.5)
+        proj_i = w - ui * (ui * w).sum(-1, keepdims=True)        # tangential ⟂ û_i
+        nw = -w
+        proj_k = nw - uk * (uk * nw).sum(-1, keepdims=True)      # tangential ⟂ û_k
+        g = (k_angle * inv)[..., None]
+        f_i = g / Lji[..., None] * proj_i
+        f_k = g / Ljk[..., None] * proj_k
+    elif config.angle_mode == "harmonic":
+        cos0 = jnp.cos(_species_rest_angles(config))            # (S,)
+        c0 = cos0[particles.species[safe(j_id)]]                # (N,P)
+        g = (k_angle * (c - c0))[..., None]
+        f_i = -g / Lji[..., None] * (uk - c[..., None] * ui)
+        f_k = -g / Ljk[..., None] * (ui - c[..., None] * uk)
+    else:  # "off" — should not be reached (gated in simulation_step)
+        return jnp.zeros((N, 2), dtype=jnp.float32)
+
+    f_j = -(f_i + f_k)
+    mask = valid[..., None].astype(jnp.float32)
+    f_i, f_j, f_k = f_i * mask, f_j * mask, f_k * mask
+
+    drop = lambda ids: jnp.where(valid, ids, N)
+    forces = jnp.zeros((N, 2), dtype=jnp.float32)
+    forces = forces.at[drop(i_id).reshape(-1)].add(f_i.reshape(-1, 2), mode='drop')
+    forces = forces.at[drop(j_id).reshape(-1)].add(f_j.reshape(-1, 2), mode='drop')
+    forces = forces.at[drop(k_id).reshape(-1)].add(f_k.reshape(-1, 2), mode='drop')
+    return forces
 
 
 # ── Composite Size Statistics ─────────────────────────────────────────────────

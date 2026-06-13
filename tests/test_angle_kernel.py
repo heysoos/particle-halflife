@@ -46,7 +46,7 @@ def _world_with_edges(edge_pairs, num_particles=8, positions=None):
         composite_id=state.particles.composite_id.at[jnp.asarray(members)].set(0),
     )
     if positions is not None:
-        pos = np.asarray(state.particles.position)
+        pos = np.array(state.particles.position)   # writable copy (JAX array is read-only)
         for pid, xy in positions.items():
             pos[pid] = xy
         parts = parts._replace(position=jnp.asarray(pos, jnp.float32))
@@ -151,3 +151,62 @@ def test_angle_list_free_particle_empty():
     state, c = _world_with_edges([(1, 2), (2, 3)])
     angles = build_angle_list(build_neighbor_list(state.composites, c), c)
     assert np.all(np.asarray(angles[6]) == -1)         # free particle, no triples
+
+
+# ── Task 5: compute_angle_forces — VSEPR mode ────────────────────────────────
+
+def test_vsepr_two_bonds_open_and_conserve():
+    from halflife.step import compute_angle_forces
+    # center 2 at origin; neighbor 1 at +x, neighbor 3 at +y → θ = 90°.
+    # VSEPR should push 1 and 3 apart (toward 180°) and conserve momentum.
+    state, c = _world_with_edges(
+        [(1, 2), (2, 3)],
+        positions={2: (5.0, 5.0), 1: (6.0, 5.0), 3: (5.0, 6.0)},
+    )
+    c = dataclasses.replace(c, angle_mode="vsepr", boundary_mode="open")
+    phys = initialize_physics_params(c)
+    F = np.asarray(compute_angle_forces(state, c, phys))
+    # tangential opening: F on 1 has -y component, F on 3 has -x component
+    assert F[1][1] < -1e-4
+    assert F[3][0] < -1e-4
+    # momentum conserved over the triple
+    assert np.allclose(F[1] + F[2] + F[3], 0.0, atol=1e-4)
+
+
+def test_vsepr_straight_is_equilibrium():
+    from halflife.step import compute_angle_forces
+    # 1-2-3 collinear (180°) → ~zero angle force, no NaN
+    state, c = _world_with_edges(
+        [(1, 2), (2, 3)],
+        positions={2: (5.0, 5.0), 1: (4.0, 5.0), 3: (6.0, 5.0)},
+    )
+    c = dataclasses.replace(c, angle_mode="vsepr", boundary_mode="open")
+    F = np.asarray(compute_angle_forces(state, c, initialize_physics_params(c)))
+    assert np.all(np.isfinite(F))
+    assert np.allclose(F[1], 0.0, atol=1e-4)
+
+
+def test_vsepr_relaxes_three_bonds_to_Y():
+    from halflife.step import compute_angle_forces
+    # Integrate angle-only dynamics on a degree-3 star from a squished start;
+    # the three pairwise angles should converge toward 120°.
+    state, c = _world_with_edges(
+        [(0, 1), (0, 2), (0, 3)],
+        positions={0: (5., 5.), 1: (6., 5.0), 2: (6., 5.3), 3: (4., 5.)},
+    )
+    c = dataclasses.replace(c, angle_mode="vsepr", boundary_mode="open")
+    phys = initialize_physics_params(c)
+    pos = np.array(state.particles.position)   # writable copy
+    for _ in range(400):
+        F = np.asarray(compute_angle_forces(
+            state._replace(particles=state.particles._replace(
+                position=jnp.asarray(pos))), c, phys))
+        for pid in (1, 2, 3):
+            pos[pid] += 0.02 * F[pid]                       # tiny overdamped step
+            v = pos[pid] - pos[0]
+            pos[pid] = pos[0] + v / (np.linalg.norm(v) + 1e-9)  # keep |bond|≈1
+    def ang(p, q):
+        u = pos[p] - pos[0]; w = pos[q] - pos[0]
+        return np.degrees(np.arccos(np.clip(u@w/(np.linalg.norm(u)*np.linalg.norm(w)), -1, 1)))
+    angs = sorted([ang(1, 2), ang(1, 3), ang(2, 3)])
+    assert angs[0] > 90 and abs(np.mean(angs) - 120) < 15
