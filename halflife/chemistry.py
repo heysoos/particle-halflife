@@ -2171,8 +2171,19 @@ def compute_liquid_drop_half_life(particles, composites, rep_pe: jnp.ndarray,
     n = composites.member_count.astype(jnp.float32)
     e_coh = bond_sum - config.surface_energy_coeff * n ** (2.0 / 3.0)
 
-    x = e_rep / (2.0 * jnp.maximum(e_coh, 1e-6))
-    t_coh = jnp.clip(e_coh / (config.cohesion_hl_scale * jnp.maximum(n, 1.0)), 0.0, 1.0)
+    # Disruption — long-range Coulomb-analog monopole self-energy. Uniform unit
+    # "charge" per member: E_coulomb = disruption_scale·n²/R_g grows super-
+    # linearly with size for a compact blob (R_g ∝ √n → E_coulomb/E_coh ∝ √n),
+    # so big/compact composites cross the fissility threshold and fission. Shape-
+    # aware: extended composites have large R_g → low disruption. Summed with the
+    # short-range hard-core e_rep (the over-crammed term). disruption_scale = 0
+    # collapses x back to the legacy hard-core-only fissility.
+    rg = compute_radius_of_gyration(particles, composites, config)
+    e_coulomb = physics.disruption_scale * n * n / (rg + 1e-6)
+    e_dis = e_coulomb + e_rep
+
+    x = e_dis / (2.0 * jnp.maximum(e_coh, 1e-6))
+    t_coh = jnp.clip(e_coh / (physics.cohesion_hl_scale * jnp.maximum(n, 1.0)), 0.0, 1.0)
     stab = t_coh * jnp.clip(1.0 - x, 0.0, 1.0) ** config.fissility_exponent
     hl = config.half_life_min + (config.half_life_max - config.half_life_min) * stab
     return jnp.where(composites.alive, hl, composites.half_life)

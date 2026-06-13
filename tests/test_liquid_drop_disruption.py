@@ -124,3 +124,47 @@ def test_rg_dead_composite_is_zero():
         {0: (0.0, 5.0), 1: (2.0, 5.0)}, [(0, 1)], boundary="reflect")
     rg = np.asarray(compute_radius_of_gyration(state.particles, state.composites, c))
     assert rg[1] == 0.0 and rg[2] == 0.0 and rg[3] == 0.0   # composites 1-3 dead
+
+
+# ── Task 3: disruption wired into the half-life ──────────────────────────────
+
+def _hl0(state, c, physics=None):
+    from halflife.chemistry import compute_liquid_drop_half_life
+    physics = physics or initialize_physics_params(c)
+    rep_pe = jnp.zeros(c.num_particles, dtype=jnp.float32)   # spaced members → no hard core
+    hl = compute_liquid_drop_half_life(state.particles, state.composites, rep_pe, c, physics)
+    return float(hl[0])
+
+
+def test_disruption_shortens_larger_blobs():
+    # Same density, bigger blob → higher fissility → shorter half-life.
+    small, c1 = _composite_world(*_grid_members(2), num_particles=20)
+    big,   c2 = _composite_world(*_grid_members(4), num_particles=20)
+    assert _hl0(big, c2) < _hl0(small, c1)
+
+
+def test_disruption_shape_sensitivity_chain_vs_blob():
+    # Equal member count (9), compact blob vs extended chain → blob shorter-lived.
+    blob_pos, blob_edges = _grid_members(3)                       # 3×3 = 9
+    chain_pos = {i: (20.0 + i, 20.0) for i in range(9)}           # 1×9 line
+    chain_edges = [(i, i + 1) for i in range(8)]
+    blob,  cb = _composite_world(blob_pos, blob_edges, num_particles=16)
+    chain, cc = _composite_world(chain_pos, chain_edges, num_particles=16)
+    assert _hl0(chain, cc) > _hl0(blob, cb)
+
+
+def test_disruption_off_reproduces_legacy_pinning():
+    # disruption_scale=0 and a well-bonded, spaced composite → pins at half_life_max
+    # (the pre-feature behavior: x≈0, t_coh saturated for this composition).
+    state, c = _composite_world(*_grid_members(2), num_particles=20)
+    physics = initialize_physics_params(
+        dataclasses.replace(c, disruption_scale=0.0, cohesion_hl_scale=1.0))
+    assert np.isclose(_hl0(state, c, physics), c.half_life_max, rtol=1e-5)
+
+
+def test_cohesion_scale_gradient():
+    # Equal geometry, different mean bond energy (species 0 vs 2 self-pairs) →
+    # different half-life once cohesion is de-saturated (cohesion_hl_scale=5).
+    a, ca = _composite_world(*_grid_members(2), num_particles=20, species_val=0)
+    b, cb = _composite_world(*_grid_members(2), num_particles=20, species_val=2)
+    assert _hl0(a, ca) != _hl0(b, cb)
