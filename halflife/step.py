@@ -198,6 +198,48 @@ def compute_edge_bond_forces(state: WorldState, params: InteractionParams,
     return forces
 
 
+# ── Angle-locking kernel (VSEPR / harmonic) ──────────────────────────────────
+
+def build_neighbor_list(composites, config: SimConfig) -> jnp.ndarray:
+    """
+    Per-particle adjacency from the edge graph: (N, max_valence) int32, -1 padded.
+
+    Each undirected edge contributes its partner to BOTH endpoints' rows.
+    Vectorized via argsort + segmented rank (no scan). Column width is
+    max_valence because degree ≤ valence ≤ max_valence always; any overflow is
+    dropped (mode='drop'). Free particles (no edges) get an all -1 row.
+    """
+    N = config.num_particles
+    E = config.e_max
+    V = config.max_valence
+
+    e_idx = jnp.arange(E, dtype=jnp.int32)
+    valid = composites.alive[:, None] & (e_idx[None, :] < composites.edge_count[:, None])  # (C,E)
+    a = composites.edges[:, :, 0]  # (C,E)
+    b = composites.edges[:, :, 1]
+
+    # Directed pairs in both orientations.
+    src = jnp.concatenate([a.reshape(-1), b.reshape(-1)])   # (2CE,)
+    dst = jnp.concatenate([b.reshape(-1), a.reshape(-1)])
+    vmask = jnp.concatenate([valid.reshape(-1), valid.reshape(-1)])
+    src = jnp.where(vmask, src, N)                          # invalid → OOB sentinel
+
+    M = src.shape[0]
+    order = jnp.argsort(src)                                # groups become contiguous
+    src_s = src[order]
+    dst_s = dst[order]
+    pos = jnp.arange(M, dtype=jnp.int32)
+    is_new = jnp.concatenate([jnp.array([True]), src_s[1:] != src_s[:-1]])
+    # group_start[p] = index where p's src-group began → col = pos - group_start
+    group_start = jax.lax.associative_scan(jnp.maximum, jnp.where(is_new, pos, 0))
+    col = pos - group_start                                 # 0,1,2,... within group
+
+    nbrs = jnp.full((N, V), -1, dtype=jnp.int32)
+    # src_s==N (OOB row) and col>=V both dropped.
+    nbrs = nbrs.at[src_s, col].set(dst_s, mode='drop')
+    return nbrs
+
+
 # ── Composite Size Statistics ─────────────────────────────────────────────────
 
 def compute_composite_size_stats(composites, config: SimConfig) -> tuple:

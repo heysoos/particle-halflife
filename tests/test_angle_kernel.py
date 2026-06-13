@@ -89,3 +89,34 @@ def test_rest_angle_decorrelated_from_valence():
     ang = np.asarray(_species_rest_angles(c))
     val = np.asarray(_species_valences(c))
     assert not np.array_equal(np.argsort(ang), np.argsort(val))
+
+
+# ── Task 3: per-particle neighbor list ───────────────────────────────────────
+
+def _nbr_set(nbrs, pid):
+    row = np.asarray(nbrs[pid])
+    return set(int(x) for x in row if x >= 0)
+
+
+def test_neighbor_list_chain():
+    from halflife.step import build_neighbor_list
+    # chain 1-2-3: 2 is central (neighbors 1,3); ends have one neighbor
+    state, c = _world_with_edges([(1, 2), (2, 3)])
+    nbrs = build_neighbor_list(state.composites, c)
+    assert _nbr_set(nbrs, 1) == {2}
+    assert _nbr_set(nbrs, 2) == {1, 3}
+    assert _nbr_set(nbrs, 3) == {2}
+    assert _nbr_set(nbrs, 5) == set()      # free particle
+
+
+def test_neighbor_list_branch_and_ring():
+    from halflife.step import build_neighbor_list
+    # star: 0 bonded to 1,2,3 (degree 3)
+    state, c = _world_with_edges([(0, 1), (0, 2), (0, 3)])
+    nbrs = build_neighbor_list(state.composites, c)
+    assert _nbr_set(nbrs, 0) == {1, 2, 3}
+    # triangle ring 4-5-6
+    state, c = _world_with_edges([(4, 5), (5, 6), (6, 4)])
+    nbrs = build_neighbor_list(state.composites, c)
+    assert _nbr_set(nbrs, 4) == {5, 6}
+    assert _nbr_set(nbrs, 5) == {4, 6}
