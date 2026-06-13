@@ -67,3 +67,25 @@ def test_physics_params_seeds_k_angle():
     c = dataclasses.replace(SimConfig(), k_angle=7.5)
     p = initialize_physics_params(c)
     assert float(p.k_angle) == 7.5
+
+
+# ── Task 2: hash-derived rest angle θ0 ───────────────────────────────────────
+
+def test_rest_angle_deterministic_and_in_band():
+    from halflife.chemistry import _hash_to_rest_angle, _species_rest_angles
+    c = dataclasses.replace(SimConfig(), num_species=6)
+    lo, hi = math.radians(c.theta_min_deg), math.radians(c.theta_max_deg)
+    angles = np.asarray(_species_rest_angles(c))
+    assert angles.shape == (6,)
+    assert np.all(angles >= lo - 1e-6) and np.all(angles <= hi + 1e-6)
+    # deterministic per species index
+    assert float(_hash_to_rest_angle(jnp.int32(3), c)) == float(angles[3])
+
+
+def test_rest_angle_decorrelated_from_valence():
+    from halflife.chemistry import _species_rest_angles, _species_valences
+    # Different hash stream → θ0 ordering differs from valence ordering.
+    c = dataclasses.replace(SimConfig(), num_species=12, max_valence=4)
+    ang = np.asarray(_species_rest_angles(c))
+    val = np.asarray(_species_valences(c))
+    assert not np.array_equal(np.argsort(ang), np.argsort(val))

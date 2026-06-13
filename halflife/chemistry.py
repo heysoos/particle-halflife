@@ -211,6 +211,35 @@ def _species_valences(config: SimConfig) -> jnp.ndarray:
     return jax.vmap(lambda s: _hash_to_valence(s, config))(species_idx)
 
 
+def _hash_to_rest_angle(species: jnp.ndarray, config: SimConfig) -> jnp.ndarray:
+    """
+    Per-species target bond angle θ0 (radians) for angle_mode="harmonic".
+
+    Same recipe as _hash_to_valence / _hash_to_rest_length: hash the species
+    index, then re-mix with its OWN Fibonacci constant (0x85EBCA77, shift 15 —
+    distinct from BE / valence / rest-length / bond-energy streams) so θ0 is
+    decorrelated from the other per-species properties. Mapped into
+    [theta_min_deg, theta_max_deg].
+
+    Keyed on the CENTRAL species only (geometry is a property of the central
+    atom), so a 2-bond atom of this species always prefers the same angle.
+
+    Returns: scalar float32 in [theta_min, theta_max] radians.
+    """
+    h = _entity_hash_val(species, config).astype(jnp.uint32)
+    h2 = (h * jnp.uint32(0x85EBCA77)) ^ (h >> jnp.uint32(15))
+    frac = (h2 % jnp.uint32(1000)).astype(jnp.float32) / 999.0
+    lo = jnp.float32(config.theta_min_deg * jnp.pi / 180.0)
+    hi = jnp.float32(config.theta_max_deg * jnp.pi / 180.0)
+    return lo + frac * (hi - lo)
+
+
+def _species_rest_angles(config: SimConfig) -> jnp.ndarray:
+    """Pre-compute the (num_species,) θ0 vector (radians). Fixed per config."""
+    species_idx = jnp.arange(config.num_species, dtype=jnp.int32)
+    return jax.vmap(lambda s: _hash_to_rest_angle(s, config))(species_idx)
+
+
 def compute_degree(composites, config: SimConfig) -> jnp.ndarray:
     """
     Per-particle edge-incidence count, summed across all alive composites.
