@@ -3,10 +3,16 @@
 **Date:** 2026-06-01
 **Topic:** Root-caused the "long-distance bonds" bug, then designed a principled bond-breaking / fission overhaul. Mid-brainstorm — design not yet written up as a spec. This note lets a cold session resume.
 
-**Status (2026-06-12):** Implementation underway — see
-`docs/superpowers/plans/2026-06-12-fission-bond-breaking-redesign.md`.
-Commit 1 (bond-cut fission) landed; benchmark: 29.1 → 23.2 steps/s (1.25×),
-max bond length 4.1 (single-digit, bug gone).
+**Status (2026-06-12):** COMPLETE — all three commits landed (plan:
+`docs/superpowers/plans/2026-06-12-fission-bond-breaking-redesign.md`).
+1. Bond-cut fission (max-product-BE cut, Q-value kick, `forbid_endothermic_fission`).
+2. Chemical bond scission (kinetic + Arrhenius thermal, one bond/composite/step;
+   `bond_energy_scale=10` so only overstretched bonds snap).
+3. Liquid-drop fissility half-life (cohesion vs internal-repulsion PE; `stability_mode`,
+   `legacy` fallback). New `halflife/graph.py` (BFS/subtree/reachability), shared
+   `_apply_binary_splits`. Morse force left out of scope (note's "eventual").
+Final benchmark: 29.1 → 16.3 steps/s (1.78×, within the <2× target); max bond length
+3.1 (single-digit, long-bond bug gone). Full test suite (135) + analysis suite (48) green.
 
 ## Summary
 

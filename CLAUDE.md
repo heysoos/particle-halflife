@@ -144,9 +144,11 @@ halflife-particle/
 │   ├── state.py        ← ParticleState, CompositeState, WorldState (NamedTuples)
 │   ├── utils.py        ← hash_multiset(), find_free_slots(), boundary helpers
 │   ├── spatial.py      ← build_cell_list(), find_all_neighbors()
-│   ├── interactions.py ← InteractionParams, pairwise_force(), compute_all_forces()
-│   ├── chemistry.py    ← attempt_fusion(), attempt_ring_closure(), apply_composite_decay(),
-│   │                     compute_degree(), compute_composite_free_bonds(), _hash_to_partition(),
+│   ├── graph.py        ← bond-graph algorithms (bfs_tree, subtree_sums, descendant/reachable masks)
+│   ├── interactions.py ← InteractionParams, pairwise_force(), compute_all_forces() (returns forces + repulsion PE)
+│   ├── chemistry.py    ← attempt_fusion(), attempt_ring_closure(), apply_composite_decay() (bond-cut fission),
+│   │                     apply_bond_scission(), compute_liquid_drop_half_life(), _apply_binary_splits(),
+│   │                     compute_degree(), compute_composite_free_bonds(), _hash_to_bond_energy(),
 │   │                     _hash_to_binding_energy(), _hash_to_valence(), _hash_to_rest_length()
 │   ├── energy.py       ← energy tracking and soft conservation
 │   ├── step.py         ← simulation_step() — single @jax.jit orchestrator
@@ -289,6 +291,33 @@ empty size-0 product of a ring break.
 overstretched bonds, not normal equilibrium bonds — a scale near the strain band (the
 initial 2.0) caps every composite at a dimer.
 
+## Liquid-Drop Stability (live fissility half-life)
+
+`config.stability_mode` selects how a composite's half-life is set:
+
+- **`"liquid_drop"` (default)** — `compute_liquid_drop_half_life` recomputes every
+  composite's half-life **every step** (step Phase 6d, just before the decay roll) from a
+  nuclear liquid-drop competition:
+  - **Cohesion** `E_coh = Σ bond E_b − surface_energy_coeff · n^(2/3)` (aggregate bond
+    dissociation energy minus a surface-tension penalty).
+  - **Disruption** `E_rep` = the composite's internal hard-core repulsion PE — the
+    "Coulomb" analog — accumulated for free by the force pass (`compute_all_forces` now
+    returns `(forces, rep_pe)`; `rep_pe[i]` is particle `i`'s same-composite hard-core PE,
+    summed per composite and halved since each pair is counted from both endpoints).
+  - **Fissility** `x = E_rep / (2·E_coh)`; the half-life is
+    `hl_min + (hl_max − hl_min) · t_coh · clip(1 − x, 0, 1)^fissility_exponent`, with
+    `t_coh = clip(E_coh / (cohesion_hl_scale · n), 0, 1)`. Big / crammed / weakly-bonded
+    composites get short half-lives and fission fast; this **replaces** the ad-hoc
+    `composite_size_decay_scale` size penalty as the principled "big/repulsive things
+    fission" law. The hash-BE → half-life value written at fusion/fission time is now just
+    an initial placeholder until the first step overwrites it.
+- **`"legacy"`** — the original fixed hash-BE → half-life formula (with the
+  `composite_size_decay_scale` size penalty), set once at creation and never rewritten.
+  `composite_size_decay_scale` is now legacy-mode-only (plus the placeholder values).
+
+The one-step lag (PE comes from pre-integration positions) is negligible at `dt=0.06`.
+In legacy mode `rep_pe` is dead-code-eliminated from the compiled step.
+
 ## Valence & Free Bonds (edge-based saturation)
 
 Optional gate (`config.use_valence`, default True). Each species `s` gets a fixed
@@ -415,7 +444,13 @@ config = SimConfig(
     half_life_min=1.0,
     half_life_max=100.0,       # current experiment runs long-lived composites
     hash_modulus=100_000_007,  # changes the "universe" / chemistry
-    composite_size_decay_scale=0.05,  # bigger composites decay faster (legacy-mode hl + placeholder)
+
+    # Composite stability (liquid-drop fissility law; "legacy" = fixed hash-BE hl)
+    stability_mode="liquid_drop",
+    surface_energy_coeff=0.5,      # a_s — cohesion penalty × n^(2/3)
+    cohesion_hl_scale=1.0,         # per-member cohesion for max stability
+    fissility_exponent=1.0,        # sharpness of the collapse as x → 1
+    composite_size_decay_scale=0.05,  # legacy-mode hl size penalty + placeholder values
 
     # Bond-cut fission (2026-06-12)
     fission_label_iters=64,            # BFS / subtree-sum sweep cap (>= graph diameter)
@@ -524,8 +559,12 @@ across the two scenarios is the core diagnostic move:
 The **Tier 5** open-endedness section quantifies novelty accumulation over the run on
 two type axes — composition (`species_hash`) and structure (Weisfeiler-Lehman bond-graph
 hash). It shows the cumulative type-discovery curve, per-window novelty rate, Hill-number
-diversity, window-to-window turnover (Jaccard / Bray-Curtis), and per-window size facets.
-All of it is host-side post-processing on the cached `RunResult`, so
+diversity, window-to-window turnover (Jaccard / Bray-Curtis), per-window size facets, and
+— folded into the structure axis (2026-06-12) — a per-window **bonded-particle degree
+distribution** (5f) and a **topology split** (5g: chain / tree-branch / cyclic, shown by
+composite *count* vs particle *mass* — the count-vs-mass contrast surfaces "mostly dimers
+by count but mostly cyclic mesh by mass"). All of it is host-side post-processing on the
+cached `RunResult`, so
 `--from-cache --windows N` re-renders a different windowing instantly. Resolved at
 `sample_every` cadence; structure metrics are only meaningful in `bond_mode="edges"` runs.
 
