@@ -341,6 +341,18 @@ def simulation_step(state: WorldState, params: InteractionParams,
     else:
         scission_events = None
 
+    # ── Phase 6d: live liquid-drop half-life (before the decay roll) ──────────
+    # Fissility law over the CURRENT bond graph + the internal repulsion PE
+    # from this step's force pass (pre-integration positions — one-step lag,
+    # negligible at dt=0.06). In legacy mode the creation-time half_life
+    # stands and rep_pe is DCE'd out of the compiled step.
+    if config.stability_mode == "liquid_drop":
+        from halflife.chemistry import compute_liquid_drop_half_life
+        new_hl = compute_liquid_drop_half_life(
+            state.particles, state.composites, rep_pe, config, physics)
+        state = state._replace(
+            composites=state.composites._replace(half_life=new_hl))
+
     # ── Phase 7: Decay ────────────────────────────────────────────────────────
     if config.emit_events:
         state, fission_events = apply_composite_decay(state, config, physics)

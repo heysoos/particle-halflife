@@ -2068,3 +2068,45 @@ def apply_bond_scission(state: WorldState, params: InteractionParams,
     if config.emit_events:
         return new_state, events
     return new_state
+
+
+# ── Liquid-Drop Stability (live fissility half-life) ──────────────────────────
+
+def compute_liquid_drop_half_life(particles, composites, rep_pe: jnp.ndarray,
+                                  config: SimConfig,
+                                  physics: PhysicsParams) -> jnp.ndarray:
+    """
+    (C,) live half-life from the liquid-drop competition: cohesion (aggregate
+    bond dissociation energy − surface term) vs disruption (internal hard-core
+    repulsion PE, computed by the force pass and passed in as per-particle
+    rep_pe). Fissility x = E_rep / (2·E_coh); half-life collapses as x → 1
+    and scales with normalized cohesion below that. Replaces the creation-time
+    BE→half-life value (which remains as a placeholder for display until the
+    first step touches it).
+
+    Dead slots keep their stored half_life (the alive mask gates decay anyway).
+    """
+    C = config.max_composites
+    E_max = config.e_max
+    e_idx = jnp.arange(E_max, dtype=jnp.int32)
+
+    # E_rep per composite: per-particle PE counted from both pair endpoints → ×0.5
+    safe_cid = jnp.where(particles.composite_id >= 0, particles.composite_id, C)
+    e_rep = jnp.zeros(C, dtype=jnp.float32).at[safe_cid].add(rep_pe, mode='drop') * 0.5
+
+    # E_coh: Σ E_b over valid edges − surface term
+    ga = composites.edges[:, :, 0]
+    gb = composites.edges[:, :, 1]
+    evalid = composites.alive[:, None] & (e_idx[None, :] < composites.edge_count[:, None]) & (ga >= 0)
+    sa = particles.species[jnp.where(ga >= 0, ga, 0)]
+    sb = particles.species[jnp.where(gb >= 0, gb, 0)]
+    eb = compute_bond_energy_matrix(config)[sa, sb]          # (C, E)
+    bond_sum = jnp.sum(jnp.where(evalid, eb, 0.0), axis=1)   # (C,)
+    n = composites.member_count.astype(jnp.float32)
+    e_coh = bond_sum - config.surface_energy_coeff * n ** (2.0 / 3.0)
+
+    x = e_rep / (2.0 * jnp.maximum(e_coh, 1e-6))
+    t_coh = jnp.clip(e_coh / (config.cohesion_hl_scale * jnp.maximum(n, 1.0)), 0.0, 1.0)
+    stab = t_coh * jnp.clip(1.0 - x, 0.0, 1.0) ** config.fissility_exponent
+    hl = config.half_life_min + (config.half_life_max - config.half_life_min) * stab
+    return jnp.where(composites.alive, hl, composites.half_life)

@@ -83,7 +83,22 @@ class SimConfig:
     hash_prime_b: int = 7             # offset
 
     # ── Composite Stability ───────────────────────────────────────────────────
-    composite_size_decay_scale: float = 0.05   # size penalty on composite half-life (larger → shorter hl)
+    # stability_mode picks how half-life is determined:
+    #   "liquid_drop" (default) — live fissility law, recomputed every step:
+    #       E_coh = Σ bond E_b − surface_energy_coeff · n^(2/3)
+    #       x     = E_rep / (2 · E_coh)          (E_rep = internal hard-core PE)
+    #       hl    = hl_min + (hl_max − hl_min) · t_coh · clip(1 − x, 0, 1)^fissility_exponent
+    #       with t_coh = clip(E_coh / (cohesion_hl_scale · n), 0, 1).
+    #     Big/crammed/weakly-bonded composites fission fast; the BE→hl values
+    #     written at fusion/fission time become initial placeholders only.
+    #   "legacy" — the original hash-BE → half-life formula with the size
+    #     penalty below, fixed at creation time.
+    # Static field — changing it retraces once.
+    stability_mode: str = "liquid_drop"
+    surface_energy_coeff: float = 0.5   # a_s — cohesion penalty × n^(2/3)
+    cohesion_hl_scale: float = 1.0      # per-member cohesion needed for max stability
+    fissility_exponent: float = 1.0     # sharpness of the collapse as x → 1
+    composite_size_decay_scale: float = 0.05   # size penalty on composite half-life (legacy mode + creation-time placeholder values)
 
     # ── Fission fracture (bond-cut, 2026-06-12) ──────────────────────────────
     # Fission no longer partitions members by hashing slot indices — it
