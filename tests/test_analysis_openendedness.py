@@ -256,3 +256,68 @@ def test_tier5_plot_builders_return_base64():
 
     for img in (a, b, c, d, e):
         assert isinstance(img, str) and len(img) > 100   # non-empty base64
+
+
+# ── Degree & topology (Tier 5 structure axis) ───────────────────────────────
+
+def _snap_one(members, edges, ncomp_buf=1):
+    """Single-composite snapshot for degree/topology tests."""
+    M = max(8, len(members))
+    E = max(8, len(edges))
+    alive = np.array([True])
+    mem = np.full((1, M), -1, np.int32)
+    mem[0, :len(members)] = members
+    member_count = np.array([len(members)], np.int32)
+    ed = np.full((1, E, 2), -1, np.int32)
+    for k, (a, b) in enumerate(edges):
+        ed[0, k] = [a, b]
+    edge_count = np.array([len(edges)], np.int32)
+    species_hash = np.array([1], np.uint32)
+    return _Snap(alive, member_count, species_hash, mem, ed, edge_count)
+
+
+def test_snapshot_degree_topology_classes():
+    # chain 0-1-2: 2 tips + 1 deg-2; classed "chain"
+    deg, tc, tm = oe._snapshot_degree_topology(_snap_one([0, 1, 2], [(0, 1), (1, 2)]), 16)
+    assert list(deg) == [2, 1, 0, 0]
+    assert list(tc) == [1, 0, 0] and list(tm) == [3, 0, 0]
+
+    # triangle 3-4-5: all deg-2, edges>=nodes → "cyclic"
+    deg, tc, tm = oe._snapshot_degree_topology(
+        _snap_one([3, 4, 5], [(3, 4), (4, 5), (5, 3)]), 16)
+    assert list(deg) == [0, 3, 0, 0]
+    assert list(tc) == [0, 0, 1] and list(tm) == [0, 0, 3]
+
+    # star (deg-3 center): 3 tips + 1 deg-3; tree with a junction → "tree-branch"
+    deg, tc, tm = oe._snapshot_degree_topology(
+        _snap_one([0, 1, 2, 3], [(0, 1), (0, 2), (0, 3)]), 16)
+    assert list(deg) == [3, 0, 1, 0]
+    assert list(tc) == [0, 1, 0] and list(tm) == [0, 4, 0]
+
+
+def test_degree_topology_windowed_fractions():
+    chain = _snap_one([0, 1, 2], [(0, 1), (1, 2)])
+    ring = _snap_one([3, 4, 5], [(3, 4), (4, 5), (5, 3)])
+    out = oe.degree_topology_windowed([chain, ring], [0, 0], [(0, 1)], 16)
+    # combined bonded: tips=2, deg2=1+3=4 → [2/6, 4/6, 0, 0]
+    assert np.allclose(out['deg_frac'][0], [2 / 6, 4 / 6, 0, 0])
+    assert np.allclose(out['topo_count'][0], [0.5, 0.0, 0.5])   # 1 chain, 1 cyclic
+    assert np.allclose(out['topo_mass'][0], [0.5, 0.0, 0.5])    # 3 + 3 particles
+
+
+def test_degree_topology_empty_window_is_zero():
+    out = oe.degree_topology_windowed([], [], [(0, 1)], 16)
+    assert np.allclose(out['deg_frac'][0], 0.0)
+    assert np.allclose(out['topo_mass'][0], 0.0)
+
+
+def test_degree_topology_plot_builders_return_base64():
+    from halflife.analysis import plots
+    wl = ['W1\n0-100', 'W2\n100-200']
+    deg = np.array([[0.25, 0.5, 0.25, 0.0], [0.2, 0.4, 0.4, 0.0]])
+    tc = np.array([[0.9, 0.0, 0.1], [0.8, 0.05, 0.15]])
+    tm = np.array([[0.2, 0.0, 0.8], [0.25, 0.05, 0.7]])
+    s1 = plots.plot_degree_distribution(wl, deg)
+    s2 = plots.plot_topology_split(wl, tc, tm)
+    assert isinstance(s1, str) and len(s1) > 100
+    assert isinstance(s2, str) and len(s2) > 100

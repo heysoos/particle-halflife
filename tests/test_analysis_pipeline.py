@@ -50,6 +50,8 @@ def test_full_pipeline_produces_html_with_all_sections():
     # Tier 5 — open-endedness section present and fully substituted.
     assert 'Tier 5' in html
     assert 'Type discovery' in html or 'discovery' in html
+    assert 'Topology: count vs mass' in html      # degree/topology panels folded in
+    assert 'degree distribution' in html.lower()
     assert '{img_oe_' not in html        # no leftover format placeholders
     # Plot images present (base64 PNG prefix).
     assert 'data:image/png;base64,' in html

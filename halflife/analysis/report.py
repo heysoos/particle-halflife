@@ -335,6 +335,14 @@ _HTML_TEMPLATE = """\
     <p class="cap"><strong>5e · Size distribution by window.</strong> Mean composite-size histogram within each window, overlaid (one line per window, dark→bright = early→late). Shows whether the run grows larger structures over time or stays small — the structural-complexity axis. The y-axis is symlog so both the many small composites and the rare large ones are visible. A right-shifting peak over successive windows = growing complexity.</p>
     <img src="data:image/png;base64,{img_oe_size_facets}">
   </div>
+  <div class="capfig">
+    <p class="cap"><strong>5f · Bonded-particle degree distribution.</strong> For every particle with at least one bond, its <em>degree</em> = number of incident edges, bucketed per window: <strong>tip</strong> (deg 1, a chain end / cap), <strong>chain</strong> (deg 2, an interior link), <strong>branch</strong> (deg 3 / 4+, a junction). Stacked to 100% of bonded particles. Degree is capped by a species' valence, so a wall at deg 3 with ~0 at deg 4 means the bonded population is dominated by valence-3 species saturating their bonds. This is the <em>geometry-free</em> shape signature — what the VSEPR angle kernel will later give an actual angle to.</p>
+    <img src="data:image/png;base64,{img_oe_degree}">
+  </div>
+  <div class="capfig">
+    <p class="cap"><strong>5g · Topology: count vs mass.</strong> Each composite (size ≥ 2) is classed <strong>chain</strong> (a path/dimer, all degrees ≤ 2), <strong>tree-branch</strong> (a tree with a Y-junction), or <strong>cyclic</strong> (contains a ring: edges ≥ nodes). <em>Left</em> = fraction by composite <strong>count</strong>; <em>right</em> = fraction by particle <strong>mass</strong> (Σ members). The two usually disagree sharply — a swarm of tiny chains can dominate the count while a few large cyclic networks hold most of the mass. Read them together: "mostly chains" by count can mean "mostly cyclic mesh" by material.</p>
+    <img src="data:image/png;base64,{img_oe_topology}">
+  </div>
 </div>
 
 <h3>5d · Window-to-window turnover</h3>
@@ -577,6 +585,12 @@ def render_html(result: RunResult, top_k: int = 30,
     img_oe_size_facets = plots.plot_window_size_facets(
         oe.per_window_size_hist(result.per_step_metrics, win), win_labels)
 
+    dt = oe.degree_topology_windowed(
+        result.snapshots, snap_steps, win, result.config.num_particles)
+    img_oe_degree = plots.plot_degree_distribution(win_labels, dt['deg_frac'])
+    img_oe_topology = plots.plot_topology_split(
+        win_labels, dt['topo_count'], dt['topo_mass'])
+
     return _HTML_TEMPLATE.format(
         scenario=getattr(result.config, '_scenario_name', '(custom)'),
         seed=result.seed,
@@ -620,6 +634,8 @@ def render_html(result: RunResult, top_k: int = 30,
         img_oe_diversity=img_oe_diversity,
         img_oe_turnover=img_oe_turnover,
         img_oe_size_facets=img_oe_size_facets,
+        img_oe_degree=img_oe_degree,
+        img_oe_topology=img_oe_topology,
         jax_platform=jax.default_backend(),
         timestamp=datetime.datetime.now().isoformat(timespec='seconds'),
     )

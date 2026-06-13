@@ -247,3 +247,83 @@ def per_window_size_hist(per_step_metrics: Dict[str, np.ndarray],
         seg = hist[start:end]
         out.append(seg.mean(axis=0) if len(seg) else np.zeros(hist.shape[1]))
     return out
+
+
+# ── Bond-graph degree & topology (structure axis, snapshot-resolved) ─────────
+#
+# The WL structure hash above answers "how many distinct arrangements?" but hides
+# *what kind* of arrangement. These two views surface the shape directly, and in
+# particular separate the count-vs-mass story: many tiny chains can dominate the
+# composite COUNT while a few large cyclic networks hold most of the particle MASS.
+
+def _snapshot_degree_topology(snapshot, num_particles: int):
+    """One snapshot → (deg_counts[4], topo_count[3], topo_mass[3]).
+
+    deg_counts: histogram of bonded-particle degree, bucketed 1 / 2 / 3 / 4+
+                (degree = number of incident edges; only particles with ≥1 bond).
+    topo_count: composite count in each {chain, tree-branch, cyclic} class.
+    topo_mass:  particles (Σ member_count) in each class.
+
+    A composite (n ≥ 2) is classified:
+      cyclic       if edge_count ≥ n          (a cycle exists: ≥ n edges on n nodes)
+      tree-branch  elif max member degree ≥ 3 (a tree with a Y-junction)
+      chain        else                       (a path / dimer, all degrees ≤ 2)
+    """
+    deg = np.zeros(num_particles, dtype=np.int64)
+    topo_c = np.zeros(3, dtype=np.int64)
+    topo_m = np.zeros(3, dtype=np.int64)
+    for c in np.nonzero(snapshot.alive)[0]:
+        n = int(snapshot.member_count[c])
+        if n < 2:
+            continue
+        ne = int(snapshot.edge_count[c])
+        ep = snapshot.edges[c, :ne]
+        a = ep[:, 0]; b = ep[:, 1]
+        a = a[a >= 0]; b = b[b >= 0]
+        np.add.at(deg, a, 1)
+        np.add.at(deg, b, 1)
+        local = np.concatenate([a, b])
+        maxdeg = int(np.bincount(local).max()) if local.size else 0
+        if ne >= n:
+            k = 2          # cyclic
+        elif maxdeg >= 3:
+            k = 1          # tree-branch
+        else:
+            k = 0          # chain
+        topo_c[k] += 1
+        topo_m[k] += n
+    bonded = deg[deg >= 1]
+    deg_counts = np.array([
+        int(np.sum(bonded == 1)), int(np.sum(bonded == 2)),
+        int(np.sum(bonded == 3)), int(np.sum(bonded >= 4)),
+    ], dtype=np.int64)
+    return deg_counts, topo_c, topo_m
+
+
+def degree_topology_windowed(snapshots, snapshot_steps: List[int],
+                             windows: List[Tuple[int, int]],
+                             num_particles: int) -> Dict[str, np.ndarray]:
+    """Per-window bonded-particle degree distribution and topology split.
+
+    Returns dict of fractions (rows sum to 1; empty windows are all-zero):
+      deg_frac:   (nW, 4) fraction of bonded particles at degree 1 / 2 / 3 / 4+
+      topo_count: (nW, 3) fraction of composites that are chain/tree-branch/cyclic
+      topo_mass:  (nW, 3) fraction of bonded particles living in each class
+    """
+    nW = len(windows)
+    deg = np.zeros((nW, 4), dtype=np.int64)
+    tc = np.zeros((nW, 3), dtype=np.int64)
+    tm = np.zeros((nW, 3), dtype=np.int64)
+    for s, step in zip(snapshots, snapshot_steps):
+        wi = _window_index(step, windows)
+        if wi is None:
+            continue
+        d, c, m = _snapshot_degree_topology(s, num_particles)
+        deg[wi] += d; tc[wi] += c; tm[wi] += m
+
+    def _frac(M):
+        tot = M.sum(axis=1, keepdims=True)
+        return np.divide(M.astype(float), tot, out=np.zeros(M.shape, dtype=float),
+                         where=tot > 0)
+
+    return {'deg_frac': _frac(deg), 'topo_count': _frac(tc), 'topo_mass': _frac(tm)}

@@ -406,3 +406,51 @@ def plot_window_size_facets(per_window_hist, window_labels) -> str:
     ax.set_yscale('symlog'); ax.set_title('Size distribution by window')
     ax.grid(True); ax.legend(fontsize=6.5)
     return _fig_to_base64(fig)
+
+
+def plot_degree_distribution(window_labels, deg_frac) -> str:
+    """Stacked bars per window: bonded-particle degree distribution (1/2/3/4+)."""
+    fig = Figure(figsize=(5.5, 2.6), constrained_layout=True)
+    ax = fig.subplots()
+    x = np.arange(len(window_labels))
+    colors = [_C_TERTIARY, _C_PRIMARY, _C_SECONDARY, _C_ACCENT]
+    labels = ['tip (deg 1)', 'chain (deg 2)', 'branch (deg 3)', 'branch (deg 4+)']
+    bottom = np.zeros(len(window_labels))
+    for k in range(4):
+        ax.bar(x, deg_frac[:, k], bottom=bottom, width=0.7,
+               color=colors[k], label=labels[k])
+        bottom += deg_frac[:, k]
+    ax.set_xticks(x)
+    ax.set_xticklabels([l.split('\n')[0] for l in window_labels], fontsize=6.5)
+    ax.set_ylabel('fraction of bonded particles'); ax.set_ylim(0, 1)
+    ax.set_title('Degree distribution by window')
+    ax.legend(fontsize=6, ncol=2, loc='upper center')
+    return _fig_to_base64(fig)
+
+
+def _plot_topo_panel(ax, window_labels, frac, title):
+    x = np.arange(len(window_labels))
+    colors = [_C_PRIMARY, _C_TERTIARY, _C_SECONDARY]
+    labels = ['chain', 'tree-branch', 'cyclic']
+    bottom = np.zeros(len(window_labels))
+    for k in range(3):
+        ax.bar(x, frac[:, k], bottom=bottom, width=0.7, color=colors[k], label=labels[k])
+        bottom += frac[:, k]
+    ax.set_xticks(x)
+    ax.set_xticklabels([l.split('\n')[0] for l in window_labels], fontsize=6.5)
+    ax.set_ylim(0, 1); ax.set_title(title, fontsize=8)
+
+
+def plot_topology_split(window_labels, topo_count, topo_mass) -> str:
+    """Two stacked-bar panels: topology class by composite COUNT vs particle MASS.
+
+    The count-vs-mass contrast is the point: many tiny chains can dominate the
+    left panel while a few large cyclic networks dominate the right.
+    """
+    fig = Figure(figsize=(5.5, 2.6), constrained_layout=True)
+    ax1, ax2 = fig.subplots(1, 2)
+    _plot_topo_panel(ax1, window_labels, topo_count, 'By composite count')
+    _plot_topo_panel(ax2, window_labels, topo_mass, 'By particle mass')
+    ax1.set_ylabel('fraction')
+    ax2.legend(fontsize=6.5, loc='upper right')
+    return _fig_to_base64(fig)
