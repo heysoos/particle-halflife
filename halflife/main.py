@@ -139,12 +139,17 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
 
     renderer = Renderer(config, metrics=metrics)
 
+    # Default simulation steps per rendered frame. Warm up the JIT with this
+    # same value so the first frame doesn't trigger a second compile (n_steps
+    # is static_argnums — JAX retraces per unique value).
+    steps_per_frame = 8
+
     # JIT-compile via make_run_n_steps (first call triggers compilation)
     print("JIT-compiling simulation step... (this takes ~10-30 seconds first time)")
     t0 = time.time()
     run_n = _make_runner(config)
-    # Warm up with a single step
-    _ = run_n(state, params, physics, 1)
+    # Warm up at the default steps_per_frame so the live loop reuses the compile
+    _ = run_n(state, params, physics, steps_per_frame)
     jax.block_until_ready(_)
     print(f"JIT compilation done in {time.time() - t0:.1f}s")
 
@@ -156,7 +161,7 @@ def run(config: SimConfig = None, seed: int = 0, enable_chemistry: bool = True):
     # ── Main Loop ─────────────────────────────────────────────────────────────
     running         = True
     paused          = False
-    steps_per_frame = 1      # simulation steps per rendered frame
+    # steps_per_frame is set above (before warm-up) so the JIT compile matches
     clock           = pygame.time.Clock()
     frame_count     = 0
 
