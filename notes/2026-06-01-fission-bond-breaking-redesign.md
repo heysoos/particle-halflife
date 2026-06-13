@@ -3,6 +3,11 @@
 **Date:** 2026-06-01
 **Topic:** Root-caused the "long-distance bonds" bug, then designed a principled bond-breaking / fission overhaul. Mid-brainstorm — design not yet written up as a spec. This note lets a cold session resume.
 
+**Status (2026-06-12):** Implementation underway — see
+`docs/superpowers/plans/2026-06-12-fission-bond-breaking-redesign.md`.
+Commit 1 (bond-cut fission) landed; benchmark: 29.1 → 23.2 steps/s (1.25×),
+max bond length 4.1 (single-digit, bug gone).
+
 ## Summary
 
 User reported routinely seeing very long bonds (spanning much of the screen) despite `fusion_radius=1.5`. Investigation **confirmed the root cause**: fission rebuilds each product's bond graph as a path through members *in slot order, with no spatial constraint*, minting edges up to ~34 units long. We then brainstormed a full redesign where bond breaking becomes physical, splitting into two orthogonal channels — **chemical** (per-bond scission) and **nuclear** (whole-body fission via a liquid-drop model). A series of physics-design decisions are locked in (below). We were about to present the full 3-commit design when the user paused to take notes. **Nothing has been implemented yet.**

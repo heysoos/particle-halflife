@@ -221,8 +221,7 @@ H(multiset) = sum(f(s) for s in members) % MODULUS
 
 # Composite properties derived from H:
 binding_energy    = _hash_to_binding_energy(h)   # Fibonacci-mixed → [0, scale]
-half_life         = f(BE, size)                  # high BE + small size → long HL
-fission_partition = _hash_to_partition(h, n)     # binary split into two non-empty products
+half_life         = f(BE, size)                  # high BE + small size → long HL (placeholder; see liquid drop)
 
 # Per-species (not per-multiset) valence — fixed once at config:
 v_s               = _hash_to_valence(s, config)  # in [1, max_valence]; saturation gate
@@ -231,15 +230,33 @@ v_s               = _hash_to_valence(s, config)  # in [1, max_valence]; saturati
 Same species set → same hash → same properties every time. Different hash constants give
 different universes.
 
-## Hash Fission (binary partition)
+## Hash Fission (bond-cut fracture)
 
-Composite decay is **binary fission**: a decaying composite is partitioned by
-`_hash_to_partition(h, n)` into two non-empty products. Slot assignment is hash-determined
-(deterministic per multiset). Product 0 reuses the parent's composite slot; product 1
-claims a fresh free slot. Products of size 1 become free particles; products of size ≥ 2
-become new composites. Energy: `binding_energy * (1 - fission_cost)` is split equally
-between products as a momentum-conserving COM-axis kick. Species are conserved — fission
-never transmutes.
+Composite decay is **bond-cut binary fission** (2026-06-12, replacing the old
+slot-order `_hash_to_partition` path that minted long bonds). A decaying composite is
+fractured along the cut that maximizes total product binding energy — the hash-BE
+landscape acting as the "shell structure / magic number" analog, so fission favors
+hash-stable fragments and is naturally asymmetric. Mechanism:
+
+1. Build a BFS spanning tree of the composite's bond graph (`halflife/graph.py:bfs_tree`,
+   fixed-shape `lax.fori_loop` sweeps capped at `config.fission_label_iters`).
+2. Score all `n−1` candidate tree-edge cuts in one `subtree_sums` pass: a cut at slot
+   `v` gives fragment hashes `(subtree_hash, total − subtree_hash)` via the additive
+   commutative hash (uint32 wraparound, then `% modulus`). Pick the cut maximizing
+   `BE(frag0) + BE(frag1)`.
+3. Each fragment keeps only the parent edges internal to it — **no edge is ever minted**,
+   so fission can't create long bonds regardless of member slot order (the bug fix).
+
+Product 0 reuses the parent slot; product 1 claims a fresh free slot. Products of size 1
+become free particles; structurally unsound products (`free_bonds < 0` under valence)
+shatter. Energy: the kick is the **Q-value** `max(BE(p0) + BE(p1) − BE(parent), 0)`,
+split equally as a momentum-conserving COM-axis kick (replaces the removed `fission_cost`).
+With `config.forbid_endothermic_fission` (default True), a decay roll whose best cut has
+`Q < 0` is **suppressed** — hash-favored composites become a fission barrier and only break
+kinetically/thermally via bond scission. Species are conserved — fission never transmutes.
+
+The shared back half (member/edge compaction, fragment hashes, COM kick, slot writes,
+event emission) is factored into `_apply_binary_splits`, reused by chemical bond scission.
 
 ## Valence & Free Bonds (edge-based saturation)
 
@@ -367,7 +384,11 @@ config = SimConfig(
     half_life_min=1.0,
     half_life_max=100.0,       # current experiment runs long-lived composites
     hash_modulus=100_000_007,  # changes the "universe" / chemistry
-    composite_size_decay_scale=0.05,  # bigger composites decay faster
+    composite_size_decay_scale=0.05,  # bigger composites decay faster (legacy-mode hl + placeholder)
+
+    # Bond-cut fission (2026-06-12)
+    fission_label_iters=64,            # BFS / subtree-sum sweep cap (>= graph diameter)
+    forbid_endothermic_fission=True,   # suppress decay rolls whose best cut has Q < 0
 
     # Valence saturation (per-species free-bond gate, on by default)
     use_valence=True,
