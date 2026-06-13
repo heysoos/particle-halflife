@@ -284,7 +284,7 @@ def profile_all_phases(config, physics, params, n_warmup=3, n_bench=50, n_runs=3
     # JIT-compile all phase functions
     build_jit   = jax.jit(build_cell_list,       static_argnums=(1,))
     nb_jit      = jax.jit(find_all_neighbors,    static_argnums=(2,))
-    forces_jit  = jax.jit(compute_all_forces,    static_argnums=(4,))
+    forces_jit  = jax.jit(compute_all_forces,    static_argnums=(5,))
     bond_jit    = jax.jit(compute_bond_forces,   static_argnums=(1,))
     fusion_jit  = jax.jit(attempt_fusion,        static_argnums=(3,))
     decay_jit   = jax.jit(apply_composite_decay, static_argnums=(1,))
@@ -307,8 +307,8 @@ def profile_all_phases(config, physics, params, n_warmup=3, n_bench=50, n_runs=3
     for _ in range(n_warmup):
         build_jit(particles.position, config).particle_ids.block_until_ready()
         nb_jit(particles.position, cl_fixed, config).block_until_ready()
-        forces_jit(particles.position, particles.species,
-                   nb_fixed, params, config, physics).block_until_ready()
+        forces_jit(particles.position, particles.species, particles.composite_id,
+                   nb_fixed, params, config, physics)[0].block_until_ready()
         if config.use_bond_forces:
             bond_jit(state, config, physics).block_until_ready()
         fusion_jit(state, nb_fixed, params, config, physics).particles.composite_id.block_until_ready()
@@ -330,8 +330,8 @@ def profile_all_phases(config, physics, params, n_warmup=3, n_bench=50, n_runs=3
         n_warmup=0, n_bench=n_bench, n_runs=n_runs,
     )
     results['3. compute_all_forces'] = _time_fn(
-        lambda: forces_jit(particles.position, particles.species,
-                           nb_fixed, params, config, physics)
+        lambda: forces_jit(particles.position, particles.species, particles.composite_id,
+                           nb_fixed, params, config, physics)[0]
                           .block_until_ready(),
         n_warmup=0, n_bench=n_bench, n_runs=n_runs,
     )

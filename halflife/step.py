@@ -255,8 +255,9 @@ def simulation_step(state: WorldState, params: InteractionParams,
     neighbors = find_all_neighbors(particles.position, cell_list, config)
 
     # ── Phase 3: Force Computation ────────────────────────────────────────────
-    forces = compute_all_forces(
-        particles.position, particles.species, neighbors, params, config, physics
+    forces, rep_pe = compute_all_forces(
+        particles.position, particles.species, particles.composite_id,
+        neighbors, params, config, physics
     )
 
     # Bond forces — dispatched on static config.bond_mode so XLA traces only

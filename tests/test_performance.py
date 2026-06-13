@@ -210,20 +210,20 @@ def benchmark_compute_forces():
 
     build_jit     = jax.jit(build_cell_list,    static_argnums=(1,))
     neighbors_jit = jax.jit(find_all_neighbors, static_argnums=(2,))
-    forces_jit    = jax.jit(compute_all_forces, static_argnums=(4,))
+    forces_jit    = jax.jit(compute_all_forces, static_argnums=(5,))
 
     particles = state.particles
     cl  = build_jit(particles.position, config)
     nb  = neighbors_jit(particles.position, cl, config)
     nb.block_until_ready()
 
-    f = forces_jit(particles.position, particles.species,
-                   nb, params, config, physics)
+    f, _ = forces_jit(particles.position, particles.species, particles.composite_id,
+                      nb, params, config, physics)
     f.block_until_ready()
 
     def one_call():
-        f = forces_jit(particles.position, particles.species,
-                       nb, params, config, physics)
+        f, _ = forces_jit(particles.position, particles.species, particles.composite_id,
+                          nb, params, config, physics)
         f.block_until_ready()
 
     mean_ms, std_ms = _time_fn(one_call, n_warmup=3, n_bench=50)
@@ -288,7 +288,7 @@ def benchmark_per_phase_breakdown():
 
     build_jit   = jax.jit(build_cell_list,       static_argnums=(1,))
     nb_jit      = jax.jit(find_all_neighbors,    static_argnums=(2,))
-    forces_jit  = jax.jit(compute_all_forces,    static_argnums=(4,))
+    forces_jit  = jax.jit(compute_all_forces,    static_argnums=(5,))
     bond_jit    = jax.jit(compute_bond_forces,   static_argnums=(1,))
     edge_jit    = jax.jit(compute_edge_bond_forces, static_argnums=(2,))
     degree_jit  = jax.jit(compute_degree,        static_argnums=(1,))
@@ -348,8 +348,8 @@ def benchmark_per_phase_breakdown():
        lambda: nb_jit(particles.position, cl_fixed, config)
                      .block_until_ready())
     _t("3. compute_all_forces",
-       lambda: forces_jit(particles.position, particles.species,
-                          nb_fixed, params, config, physics)
+       lambda: forces_jit(particles.position, particles.species, particles.composite_id,
+                          nb_fixed, params, config, physics)[0]
                          .block_until_ready())
     if config.bond_mode == "edges":
         _t("4. compute_edge_bond_forces",

@@ -124,65 +124,91 @@ def pairwise_force(pos_i: jnp.ndarray, pos_j: jnp.ndarray,
 def compute_forces_for_particle(i: jnp.ndarray,
                                   positions: jnp.ndarray,
                                   species: jnp.ndarray,
+                                  composite_id: jnp.ndarray,
                                   neighbors: jnp.ndarray,
                                   params: InteractionParams,
                                   config: SimConfig,
-                                  physics: PhysicsParams) -> jnp.ndarray:
+                                  physics: PhysicsParams) -> tuple:
     """
-    Net force on particle i from all its neighbors.
+    Net force on particle i from all its neighbors, plus its same-composite
+    hard-core repulsion potential energy (the liquid-drop "Coulomb" term).
 
     Args:
-        i:          scalar int32 — particle index
-        positions:  (N, 2)
-        species:    (N,)
-        neighbors:  (max_neighbors,) int32 — neighbor indices for particle i
-        params:     InteractionParams
-        config:     SimConfig (static)
-        physics:    PhysicsParams (runtime-tunable)
+        i:            scalar int32 — particle index
+        positions:    (N, 2)
+        species:      (N,)
+        composite_id: (N,) int32 — composite index, -1 = free
+        neighbors:    (max_neighbors,) int32 — neighbor indices for particle i
+        params:       InteractionParams
+        config:       SimConfig (static)
+        physics:      PhysicsParams (runtime-tunable)
 
     Returns:
-        (2,) float32 — total force on particle i
+        (force (2,) float32, rep_pe () float32) — rep_pe is particle i's summed
+        hard-core PE against SAME-COMPOSITE neighbors. Each pair is counted
+        from both endpoints, so per-composite totals must be halved.
     """
     pos_i = positions[i]
     sp_i  = species[i]
+    cid_i = composite_id[i]
 
-    def force_from_neighbor(j):
+    def contrib_from_neighbor(j):
         valid = (j >= 0)
-        pos_j = jnp.where(valid, positions[j], pos_i)  # safe fallback
-        sp_j  = jnp.where(valid, species[j], sp_i)
+        safe_j = jnp.where(valid, j, 0)
+        pos_j = jnp.where(valid, positions[safe_j], pos_i)  # safe fallback
+        sp_j  = jnp.where(valid, species[safe_j], sp_i)
         f = pairwise_force(pos_i, pos_j, sp_i, sp_j, params, config, physics)
-        return jnp.where(valid, f, jnp.zeros(2))
+
+        # Same-composite hard-core PE (liquid-drop disruption term). The
+        # min-image + norm below duplicates pairwise_force's internal math on
+        # identical inputs — XLA CSEs it, so this is effectively free.
+        # Closed form: U(r) = ∫ᵣ^rr R·(1 − s/rr) ds = R·(rr − r)²/(2·rr),
+        # matching the hard-core ramp in particle_life_force.
+        d = pos_i - pos_j
+        if config.boundary_mode == "periodic":
+            d = d - config.world_width  * jnp.round(d[0] / config.world_width) * jnp.array([1., 0.])
+            d = d - config.world_height * jnp.round(d[1] / config.world_height) * jnp.array([0., 1.])
+        r = jnp.linalg.norm(d) + 1e-10
+        rr = physics.repulsion_radius
+        same_comp = valid & (cid_i >= 0) & (composite_id[safe_j] == cid_i)
+        u = jnp.where(same_comp & (r < rr),
+                      physics.repulsion_strength * (rr - r) ** 2 / (2.0 * rr + 1e-10),
+                      0.0)
+        return jnp.where(valid, f, jnp.zeros(2)), u
 
     # vmap over the neighbor array
-    forces = jax.vmap(force_from_neighbor)(neighbors)  # (max_neighbors, 2)
-    return jnp.sum(forces, axis=0)
+    forces, pes = jax.vmap(contrib_from_neighbor)(neighbors)  # (max_neighbors, 2), (max_neighbors,)
+    return jnp.sum(forces, axis=0), jnp.sum(pes)
 
 
 def compute_all_forces(positions: jnp.ndarray,
                         species: jnp.ndarray,
+                        composite_id: jnp.ndarray,
                         neighbors: jnp.ndarray,
                         params: InteractionParams,
                         config: SimConfig,
-                        physics: PhysicsParams) -> jnp.ndarray:
+                        physics: PhysicsParams) -> tuple:
     """
-    Compute net force for every particle simultaneously (outer vmap).
+    Compute net force for every particle simultaneously (outer vmap), plus the
+    per-particle same-composite hard-core repulsion PE (liquid-drop term).
 
     Args:
-        positions:  (N, 2) float32
-        species:    (N,)   int32
-        neighbors:  (N, max_neighbors) int32
-        params:     InteractionParams
-        config:     SimConfig (static)
-        physics:    PhysicsParams (runtime-tunable)
+        positions:    (N, 2) float32
+        species:      (N,)   int32
+        composite_id: (N,)   int32
+        neighbors:    (N, max_neighbors) int32
+        params:       InteractionParams
+        config:       SimConfig (static)
+        physics:      PhysicsParams (runtime-tunable)
 
     Returns:
-        (N, 2) float32 — force vectors per particle
+        (forces (N, 2) float32, rep_pe (N,) float32)
     """
     particle_indices = jnp.arange(config.num_particles, dtype=jnp.int32)
 
     def forces_for_i(i):
         return compute_forces_for_particle(
-            i, positions, species, neighbors[i], params, config, physics
+            i, positions, species, composite_id, neighbors[i], params, config, physics
         )
 
-    return jax.vmap(forces_for_i)(particle_indices)   # (N, 2)
+    return jax.vmap(forces_for_i)(particle_indices)   # (N, 2), (N,)
