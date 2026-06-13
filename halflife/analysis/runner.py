@@ -112,7 +112,9 @@ def run_diagnostic(
 
     # Concatenate event chunks across (chunk_idx, step, slot) → flat.
     # Each chunk's events has shape (chunk, E, ...) where
-    # E = min(max_fusions, N) + min(max_fissions, C) (budget-sized batches).
+    # E = min(max_fusions, N) + min(max_fissions, C)
+    #     [+ min(max_scissions, C) when bond scission is on] (budget-sized
+    # batches; bond-scission events ride the fission kind).
     # Filter sentinels per-chunk to keep memory down, then concatenate.
     filtered_chunks = []
     for chunk_events in all_events_per_chunk:

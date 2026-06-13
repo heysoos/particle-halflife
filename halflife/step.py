@@ -326,6 +326,20 @@ def simulation_step(state: WorldState, params: InteractionParams,
         degree=degree, species_valences=species_valences,
     )
 
+    # ── Phase 6c: Chemical bond scission (per-bond breaking channel) ──────────
+    # Kinetic (strain >= E_b) + thermal (Arrhenius) bond breaking. Statically
+    # gated: in star_spring/off modes the edge array is physics-inert, and the
+    # enable flag lets experiments A/B the channel.
+    from halflife.chemistry import apply_bond_scission
+    if config.bond_mode == "edges" and config.enable_bond_scission:
+        if config.emit_events:
+            state, scission_events = apply_bond_scission(state, params, config, physics)
+        else:
+            state = apply_bond_scission(state, params, config, physics)
+            scission_events = None
+    else:
+        scission_events = None
+
     # ── Phase 7: Decay ────────────────────────────────────────────────────────
     if config.emit_events:
         state, fission_events = apply_composite_decay(state, config, physics)
@@ -368,17 +382,22 @@ def simulation_step(state: WorldState, params: InteractionParams,
     #                 budget-sized since the 2026-06-12 fission compaction)
     # Concatenate along the leading axis so downstream consumers see one
     # padded ReactionEvent per step with
-    # E = min(max_fusions, N) + min(max_fissions, C).
+    # E = min(max_fusions, N) + min(max_fissions, C)
+    #     [+ min(max_scissions, C) when bond scission is enabled].
+    # Bond-scission events ride the fission event kind (KIND_FISSION).
     if config.emit_events:
         from halflife.state import ReactionEvent
+        batches = [fusion_events, fission_events]
+        if scission_events is not None:
+            batches.append(scission_events)
         events = ReactionEvent(
-            kind=jnp.concatenate([fusion_events.kind, fission_events.kind]),
-            source_slots=jnp.concatenate([fusion_events.source_slots, fission_events.source_slots], axis=0),
-            source_hashes=jnp.concatenate([fusion_events.source_hashes, fission_events.source_hashes], axis=0),
-            source_sizes=jnp.concatenate([fusion_events.source_sizes, fission_events.source_sizes], axis=0),
-            product_slots=jnp.concatenate([fusion_events.product_slots, fission_events.product_slots], axis=0),
-            product_hashes=jnp.concatenate([fusion_events.product_hashes, fission_events.product_hashes], axis=0),
-            product_sizes=jnp.concatenate([fusion_events.product_sizes, fission_events.product_sizes], axis=0),
+            kind=jnp.concatenate([b.kind for b in batches]),
+            source_slots=jnp.concatenate([b.source_slots for b in batches], axis=0),
+            source_hashes=jnp.concatenate([b.source_hashes for b in batches], axis=0),
+            source_sizes=jnp.concatenate([b.source_sizes for b in batches], axis=0),
+            product_slots=jnp.concatenate([b.product_slots for b in batches], axis=0),
+            product_hashes=jnp.concatenate([b.product_hashes for b in batches], axis=0),
+            product_sizes=jnp.concatenate([b.product_sizes for b in batches], axis=0),
         )
         return final_state, events
     return final_state

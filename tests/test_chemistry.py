@@ -427,15 +427,23 @@ def test_observability_distinct_composite_types():
 
 def test_valence_off_unchanged():
     """
-    With use_valence=False, max_valence should not affect dynamics — both
-    configs run the same number of steps with identical seed, no valence
+    With use_valence=False, the valence *gate* must not affect dynamics —
+    both configs run the same number of steps with identical seed, no valence
     gate engaged.
+
+    Bond scission is disabled here: its thermal channel draws a (C, e_max)
+    uniform, and e_max = max(M-1, M*max_valence//2) depends on max_valence
+    even when use_valence=False. That coupling is a buffer-size artifact (the
+    RNG stream shape), not the valence gate this test guards — so we hold it
+    out to isolate the property under test. (Scission's own valence
+    independence is covered by tests/test_scission.py.)
     """
-    base = SimConfig(num_particles=500, use_valence=False)
+    base = SimConfig(num_particles=500, use_valence=False, enable_bond_scission=False)
     state_a = _run_steps(200, config=base, seed=11)
     state_b = _run_steps(
         200,
-        config=SimConfig(num_particles=500, use_valence=False, max_valence=2),
+        config=SimConfig(num_particles=500, use_valence=False, max_valence=2,
+                         enable_bond_scission=False),
         seed=11,
     )
     n_a = int(jnp.sum(state_a.composites.alive.astype(jnp.int32)))

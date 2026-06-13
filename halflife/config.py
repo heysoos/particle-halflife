@@ -200,8 +200,13 @@ class SimConfig:
     # connected halves (no kick); a broken ring edge just removes the edge.
     # Requires bond_mode == "edges".
     enable_bond_scission: bool = True
-    bond_energy_scale: float = 2.0        # E_b = hash_frac × this
-    bond_temperature: float = 0.1         # kT for the Arrhenius thermal channel
+    # bond_energy_scale sits ABOVE the natural equilibrium-bond strain band
+    # (measured mean ~0.25, p99 ~2.3, max ~3.3 at k_bond=20), so the kinetic
+    # channel snaps only genuinely overstretched bonds (a distance-4 bond has
+    # strain ~90 ≫ 10) rather than normal equilibrium bonds — a scale of 2.0
+    # capped every composite at a dimer (2026-06-12). E_b = hash_frac × this.
+    bond_energy_scale: float = 10.0       # E_b = hash_frac × this
+    bond_temperature: float = 1.0         # kT for the Arrhenius thermal channel
     bond_break_attempt_rate: float = 0.1  # ν0 — attempt frequency per sim-time
     max_scissions_per_step: int = 32      # budget; excess breaks defer a step
 

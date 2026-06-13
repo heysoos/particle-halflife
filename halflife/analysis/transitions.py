@@ -38,7 +38,11 @@ def _iter_edges(events: ReactionEvent):
                        int(ph[i, 0]),       int(ps[i, 0]))
         elif kind[i] == KIND_FISSION:
             # C → A + B; yield (C, A) and (C, B). Source is in slot 0.
+            # Ring-edge scissions emit size-0 product-1 entries (the bond
+            # broke but nothing split off) — skip those cells.
             for prod_idx in (0, 1):
+                if ps[i, prod_idx] == 0:
+                    continue
                 yield (int(sh[i, 0]),         int(ss[i, 0]),
                        int(ph[i, prod_idx]),  int(ps[i, prod_idx]))
 

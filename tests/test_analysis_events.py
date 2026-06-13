@@ -174,8 +174,9 @@ def test_apply_composite_decay_emits_fission_events():
 
 def test_simulation_step_returns_events_when_enabled():
     """simulation_step with emit_events=True returns (state, events).
-    E = min(max_fusions, N) + min(max_fissions, C) — both event batches are
-    budget-sized (2026-06-12), not pool-sized."""
+    E = min(max_fusions, N) + min(max_fissions, C) + min(max_scissions, C)
+    (the scission term only when bond_mode='edges' and enable_bond_scission).
+    All event batches are budget-sized (2026-06-12), not pool-sized."""
     import dataclasses
     from halflife.step import simulation_step
     config = dataclasses.replace(_tiny_config(), emit_events=True)
@@ -187,7 +188,10 @@ def test_simulation_step_returns_events_when_enabled():
     assert isinstance(result, tuple) and len(result) == 2
     new_state, events = result
     expected_e = (min(config.max_fusions_per_step, config.num_particles)
-                  + min(config.max_fissions_per_step, config.max_composites))
+                  + min(config.max_fissions_per_step, config.max_composites)
+                  + (min(config.max_scissions_per_step, config.max_composites)
+                     if (config.bond_mode == "edges" and config.enable_bond_scission)
+                     else 0))
     assert events.kind.shape == (expected_e,), f"expected ({expected_e},), got {events.kind.shape}"
 
 

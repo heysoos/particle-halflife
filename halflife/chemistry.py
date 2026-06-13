@@ -1905,3 +1905,166 @@ def attempt_ring_closure(state: WorldState, neighbors: jnp.ndarray,
     )
 
     return state._replace(composites=final_composites, rng_key=key), final_degree
+
+
+# ── Chemical Bond Scission (per-bond breaking channel) ────────────────────────
+
+def apply_bond_scission(state: WorldState, params: InteractionParams,
+                        config: SimConfig, physics: PhysicsParams):
+    """
+    Chemical (per-bond) breaking — the kinetic/thermal counterpart to
+    half-life fission. Makes the harmonic well finite: every edge carries a
+    hash-derived dissociation energy E_b (_hash_to_bond_energy), and each step
+
+      kinetic: stretch strain 0.5·k_bond·max(r − r_rest, 0)² >= E_b snaps the
+               bond deterministically;
+      thermal: below threshold, the bond snaps with Arrhenius probability
+               P = 1 − exp(−dt · ν0 · exp(−(E_b − strain)/kT)).
+
+    Compression never breaks a bond. At most ONE bond per composite breaks
+    per step (the most-overstretched breaking edge), and at most
+    config.max_scissions_per_step composites break per step (excess defers a
+    step, like the fusion/fission budgets). If the broken bond was a bridge,
+    the composite splits into its two connected halves via
+    _apply_binary_splits with zero kick (the spring's stored energy simply
+    stops acting — the pairwise forces take over); if it was a ring edge,
+    only the edge is removed (members and composite_id untouched, though the
+    slot's hash-derived properties and age are refreshed by the applier).
+
+    Requires bond_mode == "edges" (step.py gates statically; the early
+    return below covers standalone use).
+
+    Returns:
+        Updated WorldState (and a ReactionEvent batch of leading dim
+        min(max_scissions_per_step, C) when config.emit_events).
+    """
+    if not (config.enable_bond_scission and config.bond_mode == "edges"):
+        return state
+
+    particles = state.particles
+    composites = state.composites
+    key, subkey = jax.random.split(state.rng_key)
+    N = config.num_particles
+    M = config.max_composite_size
+    C = config.max_composites
+    E_max = config.e_max
+    iters = config.fission_label_iters
+    m_idx = jnp.arange(M, dtype=jnp.int32)
+    e_idx = jnp.arange(E_max, dtype=jnp.int32)
+
+    # ── Per-edge strain vs dissociation energy, over the (C, E) grid ────────
+    ga = composites.edges[:, :, 0]   # (C, E)
+    gb = composites.edges[:, :, 1]
+    evalid = composites.alive[:, None] & (e_idx[None, :] < composites.edge_count[:, None]) & (ga >= 0)
+    safe_a = jnp.where(ga >= 0, ga, 0)
+    safe_b = jnp.where(gb >= 0, gb, 0)
+    pa = particles.position[safe_a]  # (C, E, 2)
+    pb = particles.position[safe_b]
+    d = pa - pb
+    if config.boundary_mode == "periodic":
+        d = d - config.world_width  * jnp.round(d[..., 0:1] / config.world_width)  * jnp.array([1., 0.])
+        d = d - config.world_height * jnp.round(d[..., 1:2] / config.world_height) * jnp.array([0., 1.])
+    r = jnp.linalg.norm(d, axis=-1)  # (C, E)
+    sa = particles.species[safe_a]
+    sb = particles.species[safe_b]
+    r_rest = params.r_rest[sa, sb] * physics.r_rest_scale
+    # Only stretch strains a bond; compression never breaks it.
+    stretch = jnp.maximum(r - r_rest, 0.0)
+    strain = 0.5 * physics.k_bond * stretch ** 2
+
+    bond_e = compute_bond_energy_matrix(config)[sa, sb]  # (C, E)
+
+    kT = jnp.maximum(jnp.float32(config.bond_temperature), 1e-8)
+    barrier = jnp.maximum(bond_e - strain, 0.0)
+    rate = config.bond_break_attempt_rate * jnp.exp(-barrier / kT)
+    p_thermal = 1.0 - jnp.exp(-physics.dt * rate)
+    u = jax.random.uniform(subkey, (C, E_max))
+    breaks = evalid & ((strain >= bond_e) | (u < p_thermal))
+
+    # ── One break per composite: the most-overstretched breaking edge ───────
+    over = jnp.where(breaks, strain - bond_e, -jnp.inf)
+    chosen_e = jnp.argmax(over, axis=1).astype(jnp.int32)  # (C,)
+    has_break = jnp.any(breaks, axis=1)                    # (C,)
+
+    # ── Budget-compact to a (K_s,) batch (same trick as fission) ────────────
+    K_s = min(config.max_scissions_per_step, C)
+    rank = jnp.cumsum(has_break.astype(jnp.int32)) - 1
+    sel = has_break & (rank < K_s)
+    cand = jnp.where(sel, jnp.arange(C, dtype=jnp.int32), C)
+    sciss_idx = jnp.sort(cand)[:K_s]
+    sciss_valid = sciss_idx < C
+    safe_sc = jnp.minimum(sciss_idx, C - 1)
+    cut_e = chosen_e[safe_sc]                              # (K_s,)
+
+    # ── Remove the chosen edge from each selected composite (compact) ───────
+    def drop_edge(k):
+        c = safe_sc[k]
+        keep = (e_idx < composites.edge_count[c]) & (composites.edges[c, :, 0] >= 0) \
+               & (e_idx != cut_e[k])
+        pos = jnp.cumsum(keep.astype(jnp.int32)) - 1
+        out = jnp.where(keep, pos, E_max)
+        new_e = jnp.full((E_max, 2), -1, dtype=jnp.int32).at[out].set(
+            composites.edges[c], mode='drop')
+        return new_e, jnp.sum(keep.astype(jnp.int32))
+
+    new_edges_k, new_ecnt_k = jax.vmap(drop_edge)(jnp.arange(K_s, dtype=jnp.int32))
+    drop_slots = jnp.where(sciss_valid, sciss_idx, C)
+    composites_cut = composites._replace(
+        edges=composites.edges.at[drop_slots].set(new_edges_k, mode='drop'),
+        edge_count=composites.edge_count.at[drop_slots].set(new_ecnt_k, mode='drop'),
+    )
+
+    # ── pid → local slot for the batch (member-disjoint rows) ───────────────
+    member_grid = composites.members[safe_sc]
+    count_grid = composites.member_count[safe_sc]
+    valid_grid = (member_grid >= 0) & (m_idx[None, :] < count_grid[:, None]) \
+                 & sciss_valid[:, None]
+    flat = jnp.where(valid_grid, member_grid, N).reshape(-1)
+    slot_of = jnp.zeros(N, dtype=jnp.int32).at[flat].set(
+        jnp.tile(m_idx, K_s), mode='drop')
+
+    # ── Bipartition by reachability over the remaining edges ────────────────
+    # Fragment 0 = everything still reachable from the removed edge's "a"
+    # endpoint; fragment 1 = the rest. If the removed edge was a ring edge,
+    # everything stays reachable → fragment 1 is empty → the applier writes
+    # product 0 (the whole composite, minus the edge) back to the parent slot.
+    def label_split(k):
+        c = safe_sc[k]
+        n = composites.member_count[c]
+        members = composites.members[c]
+        valid_m = (members >= 0) & (m_idx < n)
+
+        rga = composites_cut.edges[c, :, 0]
+        rgb = composites_cut.edges[c, :, 1]
+        revalid = (e_idx < composites_cut.edge_count[c]) & (rga >= 0)
+        la = slot_of[jnp.where(rga >= 0, rga, 0)]
+        lb = slot_of[jnp.where(rgb >= 0, rgb, 0)]
+
+        # local slot of the removed edge's first endpoint (from ORIGINAL edges)
+        cut_a_pid = composites.edges[c, cut_e[k], 0]
+        start = slot_of[jnp.where(cut_a_pid >= 0, cut_a_pid, 0)]
+
+        reach = reachable_mask(la, lb, revalid, start, M, iters)
+        a = jnp.where(valid_m,
+                      jnp.where(reach, jnp.int32(0), jnp.int32(1)),
+                      jnp.int32(-1))
+        return a
+
+    assignment = jax.vmap(label_split)(jnp.arange(K_s, dtype=jnp.int32))
+
+    # No kick: the snapped spring just stops acting; pairwise forces take over.
+    kick = jnp.zeros(K_s, dtype=jnp.float32)
+
+    new_particles, new_composites, events = _apply_binary_splits(
+        particles, composites_cut, sciss_idx, sciss_valid, assignment, kick,
+        config, physics)
+
+    new_state = state._replace(
+        particles=new_particles,
+        composites=new_composites,
+        rng_key=key,
+    )
+
+    if config.emit_events:
+        return new_state, events
+    return new_state
