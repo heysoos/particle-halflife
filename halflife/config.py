@@ -195,6 +195,19 @@ class SimConfig:
     # to the hard core, ceiling at the fusion distance), so the band auto-rescales
     # with fusion_radius. See chemistry._hash_to_rest_length.
 
+    # ── Angle-locking (covalent bond geometry, edges mode) ────────────────────
+    # Angular force between a composite's bonds so geometry isn't floppy.
+    #   "off"      → no angle force (default; bit-identical to pre-feature)
+    #   "vsepr"    → bond directions repel & spread evenly (2π/degree); emergent
+    #               rest angle, no frustration at degree ≥ 3. Fixes floppy chains.
+    #   "harmonic" → bonds pulled toward a hash-derived target angle θ0 per central
+    #               species (cosine form). Robust 2-D route to prescribed bent
+    #               low-valence shapes (water-analog). Intended for degree ≤ 2.
+    angle_mode: str = "off"
+    k_angle: float = 10.0          # angle stiffness; seeds runtime PhysicsParams.k_angle
+    theta_min_deg: float = 90.0    # harmonic θ0 band floor (degrees)
+    theta_max_deg: float = 180.0   # harmonic θ0 band ceiling (degrees)
+
     # Ring closure: allow intra-composite fusion when both members still have
     # per-particle free bonds (degree[i] < v_{species[i]}).
     allow_ring_closure: bool = True
