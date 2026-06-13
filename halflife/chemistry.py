@@ -2101,6 +2101,43 @@ def apply_bond_scission(state: WorldState, params: InteractionParams,
 
 # ── Liquid-Drop Stability (live fissility half-life) ──────────────────────────
 
+def compute_radius_of_gyration(particles, composites, config: SimConfig) -> jnp.ndarray:
+    """
+    (C,) RMS radius of each composite's members about their centroid.
+
+    Computed with periodic min-image unwrapping relative to the first member, so
+    a composite straddling the world-wrap edge gets a correct (small) R_g rather
+    than an inflated naive-centroid value. Exact while a composite spans < half
+    the world in each axis — always true here (composites ≪ world). Dead / empty
+    composites return 0.
+
+    O(C · MAX_COMPOSITE_SIZE) — same order as the e_coh edge gather; no O(n²).
+    """
+    C = config.max_composites
+    S = config.max_composite_size
+    s_idx = jnp.arange(S, dtype=jnp.int32)
+    members = composites.members                                   # (C, S) int32, -1 pad
+    valid = (composites.alive[:, None]
+             & (s_idx[None, :] < composites.member_count[:, None])
+             & (members >= 0))                                     # (C, S)
+
+    safe_m = jnp.where(members >= 0, members, 0)
+    pos = particles.position[safe_m]                               # (C, S, 2)
+    ref = pos[:, 0:1, :]                                           # (C, 1, 2) first member
+
+    d = pos - ref                                                  # (C, S, 2)
+    if config.boundary_mode == "periodic":
+        d = d - config.world_width  * jnp.round(d[..., 0:1] / config.world_width)  * jnp.array([1., 0.])
+        d = d - config.world_height * jnp.round(d[..., 1:2] / config.world_height) * jnp.array([0., 1.])
+
+    w = valid.astype(jnp.float32)                                  # (C, S)
+    cnt = jnp.maximum(w.sum(axis=1), 1.0)                          # (C,)
+    centroid = (d * w[..., None]).sum(axis=1) / cnt[:, None]       # (C, 2) offset from ref
+    dev = d - centroid[:, None, :]                                 # (C, S, 2)
+    rg2 = ((dev * dev).sum(axis=-1) * w).sum(axis=1) / cnt         # (C,)
+    return jnp.sqrt(rg2)
+
+
 def compute_liquid_drop_half_life(particles, composites, rep_pe: jnp.ndarray,
                                   config: SimConfig,
                                   physics: PhysicsParams) -> jnp.ndarray:
