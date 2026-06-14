@@ -179,9 +179,10 @@ sim's existing damping, spreading heat to neighbors.
 under it, forming a bond would *cost* kinetic energy — the opposite of what the fission
 kick does. Flip to `KE − BE` so the recorded `total_energy` diagnostic is actually
 conserved by the new reactions. `apply_soft_energy_conservation` stays commented out as
-it is today; this change only makes the readout honest. (`apply_soft_energy_conservation`'s
-internal `target_ke = target − BE` arithmetic is consistent with the new sign and needs
-no change, but is not re-enabled in this spec.)
+it is today; this change only makes the readout honest. Note its internal
+`target_ke = target − BE` arithmetic assumes the *old* `KE + BE` sign and would be
+wrong under the new convention — so we leave a warning comment on that function rather
+than silently flip it, since re-enabling the thermostat is out of scope here.
 
 ### New config knobs (`halflife/config.py`)
 
