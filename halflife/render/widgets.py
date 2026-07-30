@@ -15,13 +15,18 @@ class Slider:
 
     def __init__(self, label: str, field: str, default_value: float,
                  track_rect: pygame.Rect, fmt: str = "{:.3f}",
-                 linear_range=None, target_dict: dict = None):
+                 linear_range=None, target_dict: dict = None, gamma: float = 1.0):
         self._label = label
         self._field = field
         self._default = float(default_value)
         self._track_rect = track_rect
         self._fmt = fmt
         self._linear_range = linear_range
+        # Power curve applied to the linear-range mapping: value = lo + t**gamma*(hi-lo).
+        # gamma=1.0 is plain linear (every existing slider). gamma>1 gives the lower
+        # values more of the track (finer control down low); gamma<1 the reverse.
+        # Ignored in log-multiplier mode (linear_range is None).
+        self._gamma = float(gamma)
         # When set, this slider writes into target_dict[field] instead of the
         # renderer's generic _physics_updates dict. Used to keep render-only
         # sliders out of the PhysicsParams update pipeline.
@@ -36,7 +41,9 @@ class Slider:
         """Compute the exponent that would produce self._default as the slider value."""
         if self._linear_range is not None:
             lo, hi = self._linear_range
-            t = (self._default - lo) / max(hi - lo, 1e-8)
+            # Invert value = lo + t**gamma*(hi-lo): t = ((default-lo)/(hi-lo))**(1/gamma).
+            frac = np.clip((self._default - lo) / max(hi - lo, 1e-8), 0.0, 1.0)
+            t = frac ** (1.0 / self._gamma)
             return self.EXPO_MIN + float(np.clip(t, 0.0, 1.0)) * (self.EXPO_MAX - self.EXPO_MIN)
         return 0.0  # 1× = default on the log scale
 
@@ -53,7 +60,8 @@ class Slider:
         if self._linear_range is not None:
             lo, hi = self._linear_range
             t = (self._exponent - self.EXPO_MIN) / (self.EXPO_MAX - self.EXPO_MIN)
-            return lo + float(np.clip(t, 0.0, 1.0)) * (hi - lo)
+            t = float(np.clip(t, 0.0, 1.0)) ** self._gamma
+            return lo + t * (hi - lo)
         return self._default * (10.0 ** self._exponent)
 
     def reset(self) -> None:

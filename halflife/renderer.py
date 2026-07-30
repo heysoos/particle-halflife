@@ -836,6 +836,11 @@ class Renderer:
             # ── Particle dynamics ─────────────────────────────────────────────
             ("dt",                       "dt",          _phys("dt"),                   "{:.4f}", (0.001, 0.1)),
             ("damping",                  "damping",     _phys("damping"),              "{:.4f}", (0.0, 1.0)),
+            # Power-curved track: range [0, 2×default], gamma so the default sits 3/4
+            # across and the lower 3/4 of the track covers [0, default] (fine control
+            # at small vmax). gamma = ln(0.5)/ln(0.75); 6th tuple element = gamma.
+            ("max_velocity",             "max vel",     _phys("max_velocity"),         "{:.2f}",
+                (0.0, 2.0 * _phys("max_velocity")), 2.4094),
         ]
         slider_specs.extend(bond_slots)
 
@@ -854,7 +859,7 @@ class Renderer:
         # _slider_content_h, so it follows automatically.
         _MIN_ROW_H, _MIN_GAP = 28, 8   # 28px keeps the label clear of the handle
                                        # below it while fitting the edges panel
-                                       # (14 sliders) into a 720px window.
+                                       # (15 sliders) into a 720px window.
         n_rows = sum(1 for s in slider_specs if s is not None)
         n_gaps = sum(1 for s in slider_specs if s is None)
         # Panel bottom = slider_start_y + content_h + 6 (see hud._draw_slider_panel);

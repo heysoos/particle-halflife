@@ -431,7 +431,7 @@ def simulation_step(state: WorldState, params: InteractionParams,
     # diagonal motion reach |v| = sqrt(2) * max_velocity, which is unphysical.
     speed = jnp.linalg.norm(new_vel, axis=-1, keepdims=True)
     new_vel = new_vel * jnp.minimum(
-        1.0, config.max_velocity / (speed + 1e-10)
+        1.0, physics.max_velocity / (speed + 1e-10)
     )
     new_pos = particles.position + new_vel * physics.dt
 
@@ -523,7 +523,7 @@ def simulation_step(state: WorldState, params: InteractionParams,
     # large violations within ~100 steps. Same magnitude semantics as phase 4.
     final_speed = jnp.linalg.norm(state.particles.velocity, axis=-1, keepdims=True)
     final_vel = state.particles.velocity * jnp.minimum(
-        1.0, config.max_velocity / (final_speed + 1e-10)
+        1.0, physics.max_velocity / (final_speed + 1e-10)
     )
     state = state._replace(
         particles=state.particles._replace(velocity=final_vel)

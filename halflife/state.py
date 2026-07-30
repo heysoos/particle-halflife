@@ -287,6 +287,7 @@ class PhysicsParams(NamedTuple):
     disruption_scale:         jnp.ndarray  # () float32 — liquid-drop Coulomb-analog constant (0 = legacy hard-core-only fissility)
     cohesion_hl_scale:        jnp.ndarray  # () float32 — per-member cohesion for max stability (runtime; was config.cohesion_hl_scale)
     attraction_scale:         jnp.ndarray  # () float32 — global attraction magnitude multiplier
+    max_velocity:             jnp.ndarray  # () float32 — hard speed clamp |v| (runtime; was config.max_velocity)
     dt:                       jnp.ndarray  # () float32 — integration timestep
 
 
@@ -307,6 +308,7 @@ def initialize_physics_params(config: SimConfig) -> PhysicsParams:
         disruption_scale=jnp.float32(config.disruption_scale),
         cohesion_hl_scale=jnp.float32(config.cohesion_hl_scale),
         attraction_scale=jnp.float32(1.0),
+        max_velocity=jnp.float32(config.max_velocity),
         dt=jnp.float32(config.dt),
     )
 
