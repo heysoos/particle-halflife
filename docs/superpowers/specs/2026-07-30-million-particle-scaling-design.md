@@ -1,0 +1,442 @@
+# Million-Particle Scaling — Design
+
+**Date:** 2026-07-30
+**Status:** Design (approved for spec review)
+**Target:** 1–2M particles with full chemistry at 60 fps; 5M+ at interactive rates
+**Hardware:** RTX 3080 Laptop (8 GB, GA104, compute 8.6), 95 W power cap
+
+---
+
+## 1. Why the current architecture cannot get there
+
+### 1.1 Measured baseline
+
+All numbers measured on the target machine, default `SimConfig`, `angle_mode="off"`,
+`emit_events=False` (i.e. *easier* than the live app, which enables both).
+
+Fixed world 200×112.5 — density grows with N:
+
+| N | step | steps/s | peak VRAM |
+|---|---|---|---|
+| 5,000 | 6.01 ms | 166 | 0.11 GB |
+| 10,000 | 7.54 ms | 133 | 0.33 GB |
+| 20,000 | 11.77 ms | 85 | 0.45 GB |
+| 40,000 | 21.76 ms | 46 | 0.88 GB |
+| 80,000 | 156.51 ms | 6.4 | 1.88 GB |
+
+Constant density — world area scales with N:
+
+| N | world | step | steps/s |
+|---|---|---|---|
+| 5,000 | 200×112 | 6.10 ms | 164 |
+| 20,000 | 400×225 | 11.60 ms | 86 |
+| 80,000 | 800×450 | 38.41 ms | 26 |
+| 200,000 | 1265×711 | **OOM** (3.11 GiB single allocation failed) | — |
+
+Two facts set the agenda:
+
+1. **At 80k, holding density constant is 4.1× faster** than letting it grow (38.4 ms vs 156.5 ms).
+   Cost tracks *neighbors per particle*, not particle count.
+2. **The wall at 200k is memory, not speed.** An independent run at N=1e6 reported
+   `Can't reduce memory use below 1.09GiB ... only reduced to 12.25GiB, down from 17.51GiB`
+   before failing. 3.6 GB of that is *static* allocation.
+
+### 1.2 The padding tax
+
+Measured array utilisation after 200 steps at default settings:
+
+| array | shape | mean actual | utilisation |
+|---|---|---|---|
+| neighbor list | (N, 256) | 68 neighbors | **26.7%** |
+| composite `members` | (C, 256) | 8.3 members | **3.2%** |
+| composite pool | (C,) | — | 15% |
+
+73% of the force loop evaluates masked-out padding lanes. A composite occupies
+**5,149 bytes — 161× a particle — of which 99.4% is padding** (`edges` at (C,512,2) = 4 KB
+plus `members` at (C,256) = 1 KB, both worst-case-sized).
+
+At N=1e6 this padding *is* the OOM: neighbor list 1 GB, `members` 512 MB, `edges` 2 GB.
+
+### 1.3 The transient tax
+
+`find_all_neighbors` ([spatial.py:129-209](../../../halflife/spatial.py#L129-L209)) allocates
+**24.6 KiB of transient per particle** — (N, 9·cell_capacity) = (N,576) candidate arrays and
+(N,576,2) position gathers, compacted down to (N,256). ≥5.6 GB live at N=1e6.
+It evaluates all 576 slots per particle regardless of occupancy, to find ~45 real neighbors.
+
+### 1.4 Other structural costs
+
+- **5 full-N sorts/permutations per step.** Two sort all N elements to extract 64 and 16 items.
+- **A 3.07M-element radix sort every step** for the VSEPR angle list (2·C·e_max), measured at
+  2.6 ms — ~43% of the entire step at N=5,000. Scales with C·E, not N.
+- **6+ full (C, e_max) grid traversals per step** (degree, bond forces, scission incl. a
+  (C,512) RNG draw, liquid-drop, radius of gyration) — 9.2M edge-slot visits for typically
+  <10k real bonds.
+- **256 sequential `fori_loop` iterations per step** (BFS tree, subtree sums, descendant mask,
+  reachable mask) — a fixed launch-latency floor.
+
+### 1.5 The renderer
+
+`renderer.py:1197` does `jax.device_get` of **19 arrays in full every frame**, including the
+entire (C, e_max, 2) edge array and (C, M) member array regardless of how many are alive.
+Then per-frame numpy over N (colors, norms, clips), then `.tobytes()` — a full extra CPU copy.
+Then a **Python `for` loop over every alive composite** to build bond vertices.
+
+Measured cost of that path in isolation, before OpenGL touches anything:
+
+| N | current host path | on-device density splat |
+|---|---|---|
+| 100,000 | 4.90 ms | 3.67 ms |
+| 1,000,000 | **75.48 ms** | 7.15 ms |
+| 2,000,000 | **145.29 ms** | 4.06 ms |
+
+Above ~350k the render path alone exceeds the entire 60 fps frame budget.
+
+**Important nuance:** drawing is *not* the problem. Measured on this GPU at 1280×720,
+5M additively-blended 1px points cost **2.86 ms**. Moving 5M positions costs 24.7 ms.
+**Data movement is 8.6× more expensive than rasterisation.** The fix is to stop moving data,
+not to draw more cleverly.
+
+### 1.6 Correctness note (pre-existing, unrelated to scaling)
+
+Measured max cell occupancy is **372 against `cell_capacity=64`**. Particles past slot 64 are
+silently invisible to forces, fusion and ring closure by step ~2000. The sim is already lossy
+at 5k particles. Any rewrite must not reproduce this; any interim fix should address it.
+
+---
+
+## 2. Platform decision
+
+### 2.1 What is and isn't possible under WSL2
+
+Verified first-hand on this machine through the real pygame + moderngl stack:
+
+| capability | WSL2 status |
+|---|---|
+| WSLg default GL adapter | **Intel UHD iGPU**, GL 4.1 — *not* the RTX 3080 |
+| `MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA` | RTX 3080, GL 4.2 |
+| GLSL version string | capped at 4.20 |
+| Compute shaders | **WORK** via `#extension GL_ARB_compute_shader : require` |
+| SSBOs | **WORK** via `GL_ARB_shader_storage_buffer_object` |
+| Zero-copy SSBO-as-VBO | **WORKS** (same `moderngl.Buffer` for storage + vertex array) |
+| Float atomics in GLSL | **NO** (`GL_NV_shader_atomic_float` absent) — integer only |
+| CUDA ↔ OpenGL interop | **IMPOSSIBLE** — `CUDA error 304`; NVIDIA's CUDA-on-WSL guide §5.2 states *"OpenGL-CUDA Interop is not yet supported"* |
+| Vulkan | no ICD installed |
+| JAX on native Windows | **does not exist** — Linux-only CUDA wheels |
+
+The binding consequence: **JAX ⟹ WSL2 ⟹ a mandatory host round-trip, permanently.**
+There is no path from a JAX device array into a GL buffer without going through the host.
+
+Measured round-trip, with a hard cliff at 32 MB:
+
+| payload | D2H | GL upload | total | fps ceiling |
+|---|---|---|---|---|
+| 1M × vec2 fp32 (8 MB) | 2.11 ms | 1.10 ms | 3.22 ms | 311 |
+| 5M × vec2 fp32 (40 MB) | 24.68 ms | 3.10 ms | 27.78 ms | 36 |
+| 5M × vec2 **fp16** (20 MB) | 4.78 ms | — | — | — |
+
+D2H is linear at ~4.5 GB/s up to 32 MB, then collapses (32 MB → 7.0 ms, 40 MB → 23.7 ms).
+Chunking does not help. **fp16 positions are worth 5×** and keep you under the cliff.
+
+### 2.2 Decision: NVIDIA Warp on native Windows
+
+**Chosen.** Rationale:
+
+- **Measured on this GPU.** A particle-life force kernel with `wp.HashGrid` at current density
+  (~45 neighbors/particle): 1M at **5.59 ms (179 steps/s)**, 5M at **32.12 ms (31 steps/s)**.
+- **Warp ships `win_amd64` wheels.** On native Windows you get working
+  `RegisteredGLBuffer` zero-copy into existing ModernGL VBOs — the host round-trip disappears.
+  JAX cannot follow; Warp can.
+- **Migration discipline already paid.** Warp has no dynamic containers either, so the
+  fixed-size-array + `-1` sentinel + mask idiom carries over unchanged. But real `if`/`for`
+  control flow returns, which makes `graph.py` (`bfs_tree`, `subtree_sums`) and `chemistry.py`'s
+  conflict batching *simpler*, not harder.
+- **Incremental migration is possible.** `wp.from_jax` / `wp.to_jax` are zero-copy, so hot
+  kernels can move one at a time rather than big-bang.
+
+Rejected alternatives:
+
+- **Raw ModernGL compute shaders** — highest ceiling (a validated prototype hit 5M at 16.14 ms
+  = 62 fps on this GPU), but writing `chemistry.py`'s 2,189 lines of graph algorithms in GLSL
+  with no printf and no debugger is a different order of pain. Keep as a fallback for the
+  render path only.
+- **Taichi** — effectively abandoned. Zero commits to `master` since 2025-07-30; last release
+  v1.7.4 (2025-07-31); 924 open issues. GGUI broken under WSL2 ([taichi#8055](https://github.com/taichi-dev/taichi/issues/8055), open 3 years).
+- **CuPy RawKernel / cuda-python / PyCUDA** — blocked under WSL2 by the same error 304, and
+  on native Windows Warp dominates them on ergonomics. `numba-cuda` is explicitly in
+  maintenance mode.
+- **wgpu-py** — compute pipelines fail here (`DownlevelFlags(COMPUTE_SHADERS) ... not supported`);
+  v0.31.1+ needs Python 3.11 (this project is on 3.10.12).
+
+**Critical implementation constraint discovered during benchmarking:** spatial sorting is
+**mandatory, not an optimisation**. Unsorted, Warp at 1M runs at 10.7 steps/s — no better than
+JAX at 200k. Sorted, 179 steps/s. That is a **16.8× swing at 1M and 21.1× at 5M**. Reorder
+`pos`/`vel`/`species` into cell order every step via
+`wp.utils.radix_sort_pairs(keys, values, count, begin_bit=0, end_bit=None)` plus gather kernels.
+Grid build itself is cheap (0.61 ms at 1M).
+
+Two `wp.HashGrid` gotchas: `HashGrid(dim_x, dim_y, dim_z)` sizes *hash buckets*, not spatial
+extent; and queries return points outside the radius on hash collisions, so the kernel must
+re-check distance itself.
+
+---
+
+## 3. Target configuration
+
+Chosen regime: **bigger world *and* denser.** Anchor point for design:
+
+| | value |
+|---|---|
+| N | 1–2M (full chemistry), 5M (reduced mode) |
+| world area | ~20× current |
+| density | ~10× current (2.22 particles/unit²) |
+| neighbors within `interaction_radius`=8 | **~447 per particle** |
+| naive pair evaluations | 447M/step at N=1e6 |
+
+447M pairs/step at 60 fps is 27 G pair-evaluations/s. That is *near* the ceiling of a
+GROMACS-class cluster kernel on this hardware, with no margin for chemistry. **Direct pairwise
+summation does not close at this density.** This is what makes §4.2 load-bearing rather than
+optional.
+
+---
+
+## 4. Architecture
+
+### 4.1 Data layout
+
+**Particles — structure of arrays, mixed precision.**
+
+| field | dtype | bytes | @2M |
+|---|---|---|---|
+| `position` | fp32 × 2 | 8 | 16 MB |
+| `velocity` | fp16 × 2 | 4 | 8 MB |
+| `species` | uint8 | 1 | 2 MB |
+| `composite_label` | int32 | 4 | 8 MB |
+| `mass`, `energy`, `age` | fp16 | 6 | 12 MB |
+| **total** | | **23 B** | **46 MB** |
+
+Position stays fp32 for world-coordinate accuracy. Velocity and derived scalars go fp16 —
+this is the same split `par-particle-life` uses, and it is why their buffers are separate.
+(A further option, if bandwidth binds: unorm16 positions *relative to cell origin*, as
+bleuje's physarum does — 0.02 px resolution at 1280 wide. Not needed at 2M; noted for 5M+.)
+
+**Bonds — an edge list, not per-composite padded grids.** This is the single highest-leverage
+change in the whole design.
+
+```
+edges        (E, 2) int32      E ≈ 2N        →  32 MB at 2M particles
+edge_species (E, 2) uint8      (cached)      →   8 MB
+```
+
+versus the current `(C, 256)` members + `(C, 512, 2)` edges at 5,149 B/composite. Holding the
+current pool ratio C ≈ 0.6·N, that is **3.1 GB at 1M particles and 15.4 GB at 5M** — on its own
+enough to exceed the card. A **~100× reduction from one data-structure change**, and it deletes
+`max_composite_size` and `e_max` as concepts entirely.
+
+Composites become *implicit*: a `composite_label` per particle, derived from connected
+components over the edge list. Per-composite aggregates come from segmented reductions over
+labels, not from iterating a padded pool.
+
+**Total simulation state at 2M particles: well under 200 MB on an 8 GB card.**
+Memory stops being the binding constraint.
+
+### 4.2 Forces — P³M split
+
+Split the force at `r_split ≈ 2` (just above `fusion_radius=1.5`, comfortably above
+`repulsion_radius=0.8`):
+
+**Short range, `r < r_split` — exact, on a tight cell list.**
+Covers the hard core and all fusion contact. At 10× density that is
+π·4·2.22 ≈ **28 neighbors per particle** instead of 447 — a **16× reduction in exact pair work**.
+Cell size `r_split/2 = 1`, 5×5 stencil (see §4.3 for why r/2).
+
+**Long range, `r_split < r < 8` — on a mesh, density-independent.**
+
+```
+F_long(i) = Σ_s  a[s_i, s] · (∇W * ρ_s)(x_i)
+```
+
+- Scatter each particle's species into S density fields `ρ_s` (bilinear/cloud-in-cell deposit,
+  integer `atomicAdd` — note GLSL has no float atomics here, so accumulate fixed-point).
+- Convolve each field once with the radial kernel `W` (separable stencil, or FFT).
+- Gather per particle: S multiply-adds against the precomputed gradient fields.
+
+Cost is `O(N + S·G)` where G is grid cells — **independent of density**. At the target
+configuration: grid at h=1 over ~900k unit² = 900k cells × 4 species × 4 B = **14.4 MB**;
+a separable 17-tap convolution is ~60M taps. Negligible against 447M direct pairs.
+
+**Preserving per-species-pair force shape.** The current kernel has per-pair `peak_fraction`
+and `cutoff_fraction`, so the radial shape differs per (s_i, s_j) and cannot be factored out of
+a single convolution. Solution: express each pair kernel in a small basis of B fixed radial
+kernels (e.g. B=3 Gaussians at different radii),
+`F_long(i) = Σ_b Σ_s c_b[s_i,s] · (∇W_b * ρ_s)(x_i)`, giving S·B convolutions.
+At S=4, B=3 that is 12 separable convolutions of a 900k-cell field — still trivial.
+
+This is standard practice (P³M in cosmological N-body; hybrid particle-field MD), and it is the
+formulation Particle Lenia and FlowLenia — already in this project's inspiration list —
+point directly at.
+
+**Physics caveat to validate:** the mesh long-range term is a mean-field approximation. With
+~447 neighbors in the long-range band the discrete sum is already effectively smooth, so grid
+error should sit well below the existing discreteness noise. This needs an A/B check against
+the direct kernel at current N before it is trusted (see §6).
+
+### 4.3 Neighbor search
+
+Per the literature and the Warp benchmark, in priority order:
+
+1. **Morton-reorder the particle arrays every step** (two-level: cells in Morton order,
+   particles Morton-ordered within cell, cell boundaries coinciding with the search grid).
+   Worth **16.8–21.1×** as measured in Warp on this GPU; independently measured at ~2× by two
+   other groups. This is not optional.
+2. **Do not materialise a neighbor list.** [Bramas et al. 2024](https://arxiv.org/pdf/2406.16091),
+   studying exactly this regime (30–40 neighbors, few particles per cell), found the fastest
+   NVIDIA strategy is **one thread per particle looping neighbor cells directly, no shared
+   memory, no stored list** — all classical shared-memory tiling schemes lost. This is also the
+   bandwidth-optimal choice: ~2.6 GB/step materialised vs ~200 MB/step traversed.
+3. **Cell size = `r_split/2`.** In 2D, cell=r gives a 3×3 stencil covering 9r² for a useful πr²
+   — 35% efficiency. cell=r/2 gives 5×5 over 6.25r² — **50%**. cell=r/3 gives 58%, diminishing.
+   r/2 is the sweet spot, matching both Hoetzlein and the LAMMPS GPU default.
+4. **Build the cell list by boundary detection, not sorting.** After Morton reordering, cell
+   membership is already contiguous — one thread per particle comparing with its predecessor.
+   If a sort is needed, use a single-radix counting sort on exact bins (Hoetzlein: 5–10× over
+   4-pass byte radix, 15 kernels → 4).
+
+### 4.4 Chemistry at scale
+
+With composites as an edge list, every current `(C, e_max)` grid traversal becomes linear in
+*real* edges:
+
+| operation | current | redesigned |
+|---|---|---|
+| `compute_degree` | O(C·E) scatter over padded grid | O(E) scatter-add over edge list |
+| `compute_edge_bond_forces` | O(C·E) = 1.54M slots | O(E), one thread per real edge |
+| radius of gyration | O(C·M), (C,256,2) arrays | segmented reduction by label, O(N) |
+| bond scission | O(C·E) grid + (C,E) RNG | O(E), one thread per edge |
+| angle list | 3.07M-element sort/step | counting sort over E, O(E) |
+| liquid-drop half-life | O(C·E) + O(C·M) | O(N + E) segmented reductions |
+
+**Connected components is the one genuinely new piece.** Composite labels must be recomputed
+from the edge list. Plan: label propagation with pointer jumping (Afforest-style), targeting
+1–2 ms at 4M edges. Fusion is a cheap union; only fission and scission force a relabel.
+If per-step full CC proves too slow, fall back to incremental relabelling of only the
+components touched by this step's fission/scission batch.
+
+**The expensive graph surgery does not scale with N and is not a problem.** BFS spanning trees,
+subtree sums for fission cut-scoring, and reachability for scission already run on a *compacted
+batch* — `max_fissions_per_step=64`, `max_scissions_per_step=32`. Measured steady-state demand
+is ~15 fissions/step. That is a fixed cost that amortises away as N grows. Keep the batching.
+
+### 4.5 Rendering
+
+On native Windows: `RegisteredGLBuffer` maps the Warp position/color buffers directly as GL
+vertex buffers. **Zero copy, no host round-trip.** Draw as `GL_POINTS`.
+
+Measured on this GPU at 1280×720: 5M 1px additively-blended points = **2.86 ms**. Rendering is
+not the bottleneck once the data stops moving. Sprite size is the only real fillrate lever
+(4px → 5.09 ms, 8px → 10.59 ms at 5M).
+
+A compute-shader density splat (`atomicAdd` into an image, then a fullscreen tonemap) is a
+*later* optimisation, not a day-one need — published gains are 3.5–136× over `GL_POINTS`
+([Schütz et al.](https://arxiv.org/pdf/2204.01287)) and biggest in clumpy distributions, which
+composites produce by design. Revisit if point size must grow.
+
+The bond renderer needs rework regardless: the current Python loop over alive composites is
+fatal at scale. With an edge list it becomes a single `GL_LINES` draw over the edge buffer,
+with no host involvement.
+
+---
+
+## 5. Phasing
+
+Each phase leaves the project runnable. **This spec is the umbrella design; Phases 1–4 are each
+large enough to warrant their own implementation plan**, written when that phase starts rather
+than up front.
+
+**Phase 0 — free wins, hours, no architecture change.**
+- `MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA` — measured **10.5× on draw at 1M** (8.16 → 0.78 ms).
+  One env var, zero code impact. Do this regardless of everything else.
+- fp16 positions on the render transfer path — 5× on D2H at 5M, and stays under the 32 MB cliff.
+- Delete the per-frame numpy work in `renderer.py` (colors, norms, clips move to the shader).
+- Fix the `cell_capacity=64` vs occupancy-372 correctness bug.
+
+**Phase 1 — Warp prototype, validate before committing.**
+Port only the neighbor search + short-range force path to Warp, **with spatial sorting from the
+start**, keeping everything else in JAX via zero-copy `wp.from_jax`. Validate the measured
+179 steps/s at 1M against the real chemistry. This is the go/no-go gate for the rewrite.
+
+**Phase 2 — edge-list composites.**
+Replace `CompositeState` with the edge list + connected-components labelling. Rewrite the
+chemistry kernels against it. Largest single piece of work (~2,200 lines) and the one that
+removes the memory wall.
+
+**Phase 3 — P³M long-range forces.**
+Add the mesh path with the radial-basis decomposition. A/B against the direct kernel at current
+N to quantify the mean-field error before enabling by default.
+
+**Phase 4 — native Windows + zero-copy rendering.**
+Move the interactive app to native Windows Python, wire `RegisteredGLBuffer`, delete the host
+round-trip. Single `GL_LINES` draw for bonds.
+
+**Effort estimate:** ~4,300 lines rewritten (`chemistry.py` 2,189, `step.py` 624, `state.py` 320,
+`interactions.py` 214, `spatial.py` 209 — deleted outright, `graph.py` 137);
+~3,800 lines preserved (`renderer.py`, `main.py`, `render/*`); ~2,300 lines of `analysis/`
+largely unaffected.
+
+---
+
+## 6. Success criteria and validation
+
+| criterion | target |
+|---|---|
+| 1M particles, 10× density, full chemistry | ≥ 60 fps |
+| 2M particles, 10× density, full chemistry | ≥ 30 fps |
+| 5M particles, reduced mode | ≥ 30 fps |
+| VRAM at 2M | < 2 GB (leaves headroom on 8 GB) |
+| cell-list losslessness | zero silently-dropped neighbors at target density |
+
+**Physics-equivalence gates** (each must pass before the corresponding phase is enabled by
+default):
+
+- Warp force kernel vs JAX `compute_all_forces`: per-particle force agreement to fp32 tolerance
+  on an identical warmed state.
+- Edge-list chemistry vs current: identical fusion/fission event sequences from a fixed seed
+  over ≥1000 steps.
+- P³M vs direct: composite size distribution, mean bond length, and the Tier-5 openendedness
+  metrics statistically indistinguishable over a 3000-step run at current N.
+
+The existing `halflife/analysis/` diagnostic pipeline is the instrument for the third gate —
+run `--scenario current_experiment` before and after and diff the reports.
+
+---
+
+## 7. Reference points
+
+| system | scale | hardware | notes |
+|---|---|---|---|
+| Sage Jenson physarum | 5–10M agents, real-time | GTX 1070 | field-mediated, no neighbor search |
+| bleuje interactive-physarum | 5.77M @ 60 fps | RTX 2060 | 12 B/agent bit-packed; open source |
+| bleuje, larger grid | 13.1M | RTX 4060 | 1920×1088 |
+| Hoetzlein SPH | 2.1M @ 12 fps | GTX Titan (2013) | counting-sort cell list |
+| HOOMD-blue LJ | ~3M @ 100 neighbors | 3 GB GPU | hand-tuned CUDA; the honest ceiling |
+| par-particle-life | caps neighbors above 200k | — | *deliberately approximate* above ~50k |
+| **this design (target)** | **1–2M full chemistry** | **RTX 3080 Laptop 8 GB** | P³M + edge list + Warp |
+
+Jenson's numbers are not a like-for-like target: his agents never interact with each other
+directly, so there is no neighbor search at all — per agent it is 3 texture reads and one
+deposit. This project's per-particle work is intrinsically ~20–50× heavier. The realistic
+ambition is HOOMD-class scale with richer chemistry, not physarum-class scale.
+
+---
+
+## 8. Open questions
+
+1. **Connected components cadence.** Full relabel every step, or incremental relabel of only
+   the components touched by fission/scission? Resolve with a measurement in Phase 2.
+2. **Radial basis size B.** How many fixed kernels are needed to reproduce the per-pair
+   `peak_fraction`/`cutoff_fraction` shapes to acceptable fidelity? Fit offline against the
+   current kernel; likely B=3, to be confirmed.
+3. **`max_fusions_per_step` at 10× density.** Fusion candidate density scales with particle
+   density; the current budget of 64 was tuned at ~4.7 fusions/step. Needs re-measurement.
+4. **Whether 5M "reduced mode" drops chemistry entirely or only the expensive extras**
+   (angles, ring closure, liquid-drop). Defer until Phase 3 numbers exist.
