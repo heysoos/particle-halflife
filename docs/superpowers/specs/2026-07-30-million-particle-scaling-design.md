@@ -93,6 +93,37 @@ It evaluates all 576 slots per particle regardless of occupancy, to find ~45 rea
 - **256 sequential `fori_loop` iterations per step** (BFS tree, subtree sums, descendant mask,
   reachable mask) — a fixed launch-latency floor.
 
+### 1.4b Real frame profile at N=20,000 (the sizes actually being run)
+
+**Measured 2026-07-30** on a developed state (1000 steps, 1,737 alive composites), real
+`Renderer`, real GL context, idle GPU. Simulation fully awaited before timing the renderer so
+async overlap cannot smear sim time into the render number:
+
+| phase | ms | share |
+|---|---|---|
+| simulation — 8 steps, fully awaited | **82.0** | **89%** |
+| `renderer.update()` (bonds mode) | 14.3 | 6% |
+| `renderer.render()` | 4.7 | 5% |
+| **total frame** | **91.9** | → **10.9 fps** |
+
+Cross-checked against the live app at the same size, which reports 8.0–9.2 fps.
+
+**The simulation is 89% of the frame. The renderer is not the bottleneck at this scale.**
+
+The apparent contradiction between "~98 steps/s" and "~9 fps" is entirely
+`steps_per_frame = 8` ([main.py:160](../../../halflife/main.py#L160)): each rendered frame
+advances the sim 8 steps at ~10.2 ms each. Lowering it trades simulation progress for frame
+rate directly, and is bound to the `-` key already.
+
+This does **not** contradict §1.5: the render path costs 75 ms at N=1e6 and becomes dominant
+there. Both are true at their own scale — render work grows with N far faster than the
+per-frame sim work does. Fix the sim for today; fix the render path for the scale target.
+
+**Anomaly worth a separate look:** `renderer.update()` in *merged* mode measures **47.6 ms**,
+3.3× *slower* than bonds mode's 14.3 ms, despite merged mode skipping the bond-vertex loop
+entirely. The merged branch ([renderer.py:1427](../../../halflife/renderer.py#L1427)) is doing
+something unexpectedly expensive. Not on the critical path, but it is backwards.
+
 ### 1.5 The renderer
 
 `renderer.py:1197` does `jax.device_get` of **19 arrays in full every frame**, including the
