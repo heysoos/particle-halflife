@@ -12,6 +12,7 @@ import sys
 import os
 import traceback
 import functools
+import dataclasses
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -29,10 +30,46 @@ from halflife.state import (
     initialize_physics_params,
 )
 from halflife.step import simulation_step
-from halflife.chemistry import apply_composite_decay
+from halflife.chemistry import (
+    apply_composite_decay,
+    attempt_fusion,
+    attempt_ring_closure,
+)
 
 # JIT-compiled step (compiled once per config, cached)
 _step_jit = jax.jit(simulation_step, static_argnums=(2,))
+
+# ── Jitted chemistry kernels ─────────────────────────────────────────────────
+# NEVER call these kernels eagerly from a test. They contain fori_loop sweeps
+# of fission_label_iters=64 plus BFS / subtree-sum passes, i.e. thousands of
+# primitives; in eager mode JAX dispatches each one individually from Python.
+# Measured on GPU: a SINGLE eager apply_composite_decay call took 29 s, and a
+# 20-iteration loop (x2 configs) took 206 s — 44% of this whole file's runtime.
+# Jitted, the same work is one compile plus microseconds per call.
+#
+# jax.jit caches per static-arg value internally, so one wrapper serves every
+# config; sharing config objects (see CFG_* below) is what keeps that cache
+# small, since each distinct SimConfig costs its own ~5-14 s compile.
+_decay_jit = jax.jit(apply_composite_decay, static_argnums=(1,))
+_fusion_jit = jax.jit(attempt_fusion, static_argnums=(3,))
+# config is positional index 3 in both signatures. degree / species_valences
+# stay traced (they are passed by keyword at the call sites, which is fine —
+# only the static arg has to be positional).
+_ring_jit = jax.jit(attempt_ring_closure, static_argnums=(3,))
+
+
+# ── Shared configs ───────────────────────────────────────────────────────────
+# Every distinct SimConfig is a separate XLA compile (it is static_argnums), so
+# tests that want the same physics MUST share one object rather than each
+# building an equal-but-separate one. These four fission tests previously built
+# four identical configs; they now cost one compile between them.
+CFG_FISSION = SimConfig(
+    num_species=3, num_particles=10, max_composites=4,
+    boundary_mode="reflect", world_width=20.0, world_height=20.0,
+    half_life_min=0.001, half_life_max=0.001,
+)
+# Same physics with the endothermic-fission barrier lifted.
+CFG_FISSION_OPEN = dataclasses.replace(CFG_FISSION, forbid_endothermic_fission=False)
 
 _config = SimConfig()
 _params = initialize_interaction_params(_config, seed=42)
@@ -322,10 +359,12 @@ def test_fission_produces_two_products():
     sizes_seen = set()
     for s in range(800):
         state = step_fn(state, params, config, physics)
-        alive = jnp.asarray(state.composites.alive)
-        mc = jnp.asarray(state.composites.member_count)
-        for size in mc[alive].tolist():
-            sizes_seen.add(int(size))
+        # Pull to host in bulk and mask with numpy. `mc[alive]` on a DEVICE
+        # array is a data-dependent-shape gather — XLA must sync and materialize
+        # it before .tolist() can run, once per step for 800 steps.
+        alive = np.asarray(state.composites.alive)
+        mc = np.asarray(state.composites.member_count)
+        sizes_seen.update(int(x) for x in mc[alive])
 
     # We must observe size-2 composites at minimum (from fission of size-3+).
     # Size-3+ composites should also occur (from fusion or fission of size-5+).
@@ -360,9 +399,11 @@ def test_fission_creates_intermediate_size_products():
     size_3_instances = 0
     for s in range(500):
         state = step_fn(state, params, config, physics)
-        alive = jnp.asarray(state.composites.alive)
-        mc = jnp.asarray(state.composites.member_count)
-        size_3_instances += int(jnp.sum((alive) & (mc == 3)))
+        # numpy on the host: the jnp version builds a small device graph and
+        # syncs on it every step (see the note in the size-2 test above).
+        alive = np.asarray(state.composites.alive)
+        mc = np.asarray(state.composites.member_count)
+        size_3_instances += int(np.sum(alive & (mc == 3)))
 
     assert size_3_instances >= 50, (
         f"too few size-3 composite-instances observed: {size_3_instances} "
@@ -401,15 +442,21 @@ def test_observability_distinct_composite_types():
     for s in range(1000):
         state = step_fn(state, params, config, physics)
         if s % 50 == 0:
-            alive = jnp.asarray(state.composites.alive)
-            members = jnp.asarray(state.composites.members)
-            mc = jnp.asarray(state.composites.member_count)
-            species = jnp.asarray(state.particles.species)
+            # np.asarray, NOT jnp.asarray: these must come back to the HOST once,
+            # in bulk. Left as device arrays, every int(mc[c_idx]) and
+            # int(species[m]) below is its own GPU->host round trip — hundreds of
+            # composites x several members x 20 samples is tens of thousands of
+            # syncs, and it made this the slowest test in the file (43s) even
+            # after the kernels themselves were fast.
+            alive = np.asarray(state.composites.alive)
+            members = np.asarray(state.composites.members)
+            mc = np.asarray(state.composites.member_count)
+            species = np.asarray(state.particles.species)
             current = set()
-            for c_idx in jnp.where(alive)[0].tolist():
+            for c_idx in np.where(alive)[0]:
                 n = int(mc[c_idx])
-                mids = members[c_idx, :n].tolist()
-                spc = sorted(int(species[m]) for m in mids if m >= 0)
+                mids = members[c_idx, :n]
+                spc = sorted(int(x) for x in species[mids[mids >= 0]])
                 key = tuple(spc)
                 current.add(key)
                 types_ever_seen.add(key)
@@ -853,7 +900,7 @@ def test_per_particle_fusion_gate_blocks_saturated_contact_member():
     from halflife.spatial import build_cell_list, find_all_neighbors
     cell_list = build_cell_list(world.particles.position, config)
     neighbors = find_all_neighbors(world.particles.position, cell_list, config)
-    new_state, _ = attempt_fusion(world, neighbors, params, config, physics)
+    new_state, _ = _fusion_jit(world, neighbors, params, config, physics)
 
     # Particle 3 should NOT have been absorbed: its only in-range partner (the
     # saturated member 0) has no free bond.
@@ -882,7 +929,7 @@ def test_fusion_appends_edge_free_plus_free():
     from halflife.spatial import build_cell_list, find_all_neighbors
     cell_list = build_cell_list(world.particles.position, config)
     neighbors = find_all_neighbors(world.particles.position, cell_list, config)
-    new_state, _ = attempt_fusion(world, neighbors, params, config, physics)
+    new_state, _ = _fusion_jit(world, neighbors, params, config, physics)
 
     # One composite was created; it should hold exactly one edge (0, 1).
     alive = np.asarray(new_state.composites.alive)
@@ -948,7 +995,7 @@ def test_composite_composite_fuses_on_nearest_member_not_rep():
     from halflife.spatial import build_cell_list, find_all_neighbors
     cell_list = build_cell_list(world.particles.position, config)
     neighbors = find_all_neighbors(world.particles.position, cell_list, config)
-    new_state, _ = attempt_fusion(world, neighbors, params, config, physics)
+    new_state, _ = _fusion_jit(world, neighbors, params, config, physics)
 
     cid = np.asarray(new_state.particles.composite_id)
     alive_after = np.asarray(new_state.composites.alive)
@@ -1028,7 +1075,7 @@ def test_ring_closure_adds_edge_between_same_composite_members():
     cell_list = build_cell_list(world.particles.position, config)
     neighbors = find_all_neighbors(world.particles.position, cell_list, config)
 
-    new_state, _ = attempt_ring_closure(
+    new_state, _ = _ring_jit(
         world, neighbors, params, config, physics,
         degree=degree, species_valences=sv,
     )
@@ -1090,9 +1137,7 @@ def test_fission_never_mints_new_bonds():
     SLOT order is deliberately scrambled relative to the bond topology so the
     old slot-order path rebuild would mint non-edges.
     """
-    config = SimConfig(num_species=3, num_particles=10, max_composites=4,
-                       boundary_mode="reflect", world_width=20.0, world_height=20.0,
-                       half_life_min=0.001, half_life_max=0.001)
+    config = CFG_FISSION
     pos = np.array([[5.0, 5.0], [5.5, 5.0], [6.0, 5.0], [6.5, 5.0]]
                    + [[50.0 + i, 50.0] for i in range(6)], dtype=np.float32)
     # Species 1 has valence 3 (see ring-closure test note), so fission
@@ -1114,7 +1159,7 @@ def test_fission_never_mints_new_bonds():
     # single call lets us inspect the FIRST generation of products (more
     # calls would cascade-fission them all the way to free particles and
     # leave nothing to check).
-    state = apply_composite_decay(world, config, physics)
+    state = _decay_jit(world, config, physics)
 
     edges_after = np.asarray(state.composites.edges)
     counts_after = np.asarray(state.composites.edge_count)
@@ -1130,9 +1175,7 @@ def test_fission_never_mints_new_bonds():
 def test_fission_products_keep_internal_edges_and_stay_consistent():
     """After a 4-chain fissions, every alive product's edges reference only
     its own members, and edge_count >= n - 1 (connected fragments)."""
-    config = SimConfig(num_species=3, num_particles=10, max_composites=4,
-                       boundary_mode="reflect", world_width=20.0, world_height=20.0,
-                       half_life_min=0.001, half_life_max=0.001)
+    config = CFG_FISSION
     pos = np.array([[5.0, 5.0], [5.5, 5.0], [6.0, 5.0], [6.5, 5.0]]
                    + [[50.0 + i, 50.0] for i in range(6)], dtype=np.float32)
     species = np.zeros(10, dtype=np.int32)
@@ -1140,7 +1183,7 @@ def test_fission_products_keep_internal_edges_and_stay_consistent():
         config, pos, species, [(0, 1), (1, 2), (2, 3)], half_life=1e-4)
     physics = initialize_physics_params(config)
 
-    state = apply_composite_decay(world, config, physics)
+    state = _decay_jit(world, config, physics)
 
     alive_after = np.asarray(state.composites.alive)
     members_after = np.asarray(state.composites.members)
@@ -1164,9 +1207,7 @@ def test_fission_products_keep_internal_edges_and_stay_consistent():
 def test_endothermic_fission_suppressed_by_default():
     """With parent BE far above any possible product-BE sum, every cut has
     Q < 0 → forbid_endothermic_fission (default True) keeps it alive."""
-    config = SimConfig(num_species=3, num_particles=10, max_composites=4,
-                       boundary_mode="reflect", world_width=20.0, world_height=20.0,
-                       half_life_min=0.001, half_life_max=0.001)
+    config = CFG_FISSION
     pos = np.array([[5.0, 5.0], [5.5, 5.0], [6.0, 5.0], [6.5, 5.0]]
                    + [[50.0 + i, 50.0] for i in range(6)], dtype=np.float32)
     species = np.zeros(10, dtype=np.int32)
@@ -1179,26 +1220,21 @@ def test_endothermic_fission_suppressed_by_default():
 
     state = world
     for _ in range(20):
-        state = apply_composite_decay(state, config, physics)
+        state = _decay_jit(state, config, physics)
     assert bool(state.composites.alive[0]), "endothermic fission should be barred"
     assert int(state.composites.member_count[0]) == 4
     # Same setup with the barrier off → it does fission (kick-less).
-    config_open = SimConfig(num_species=3, num_particles=10, max_composites=4,
-                            boundary_mode="reflect", world_width=20.0, world_height=20.0,
-                            half_life_min=0.001, half_life_max=0.001,
-                            forbid_endothermic_fission=False)
+    config_open = CFG_FISSION_OPEN
     state = world
     for _ in range(20):
-        state = apply_composite_decay(state, config_open, physics)
+        state = _decay_jit(state, config_open, physics)
     assert int(state.composites.member_count[0]) < 4 or not bool(state.composites.alive[0])
 
 
 def test_exothermic_fission_kicks_products_apart():
     """Parent BE 0 → Q = BE0 + BE1 >= 0; if any positive-Q cut fires, member
     velocities change (COM-axis kick)."""
-    config = SimConfig(num_species=3, num_particles=10, max_composites=4,
-                       boundary_mode="reflect", world_width=20.0, world_height=20.0,
-                       half_life_min=0.001, half_life_max=0.001)
+    config = CFG_FISSION
     pos = np.array([[5.0, 5.0], [5.5, 5.0], [6.0, 5.0], [6.5, 5.0]]
                    + [[50.0 + i, 50.0] for i in range(6)], dtype=np.float32)
     species = np.arange(10, dtype=np.int32) % 3   # mixed species → nonzero frag BEs
@@ -1211,7 +1247,7 @@ def test_exothermic_fission_kicks_products_apart():
 
     state = world
     for _ in range(20):
-        state = apply_composite_decay(state, config, physics)
+        state = _decay_jit(state, config, physics)
     fired = int(state.composites.member_count[0]) < 4 or not bool(state.composites.alive[0])
     assert fired, "composite with hl=1e-4 should have fissioned within 20 rolls"
     speeds = np.linalg.norm(np.asarray(state.particles.velocity[:4]), axis=1)
