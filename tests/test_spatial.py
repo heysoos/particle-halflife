@@ -73,22 +73,26 @@ def test_neighbor_distance_bound():
     H = _config.world_height
     eps = 1e-3
 
-    violations = 0
-    max_dist_seen = 0.0
+    # Vectorized on the HOST. The obvious nested-loop version reads
+    # int(neighbors[i, k]) straight off a DEVICE array — that is one GPU->host
+    # round trip per entry, and at 2000 x 256 entries it took 294 s. One bulk
+    # np.asarray plus numpy masking is the same computation in well under a
+    # second.
+    nb = np.asarray(neighbors)                      # (N, max_neighbors)
+    # cumprod over the row reproduces the original `break` exactly: an entry
+    # counts only if every entry before it in the row was also valid, i.e. the
+    # contiguous prefix ahead of the first -1 padding slot.
+    valid = np.cumprod(nb >= 0, axis=1).astype(bool)
+    ii, kk = np.nonzero(valid)
+    jj = nb[ii, kk]
 
-    for i in range(N):
-        for k in range(_config.max_neighbors):
-            j = int(neighbors[i, k])
-            if j < 0:
-                break
-            # Minimum-image distance
-            d = positions[i] - positions[j]
-            d[0] -= W * np.round(d[0] / W)
-            d[1] -= H * np.round(d[1] / H)
-            dist = np.sqrt(d[0]**2 + d[1]**2)
-            max_dist_seen = max(max_dist_seen, dist)
-            if dist > r_max + eps:
-                violations += 1
+    d = positions[ii] - positions[jj]               # min-image, both axes
+    d[:, 0] -= W * np.round(d[:, 0] / W)
+    d[:, 1] -= H * np.round(d[:, 1] / H)
+    dists = np.hypot(d[:, 0], d[:, 1])
+
+    max_dist_seen = float(dists.max()) if dists.size else 0.0
+    violations = int(np.count_nonzero(dists > r_max + eps))
 
     print(f"\nMax neighbor distance seen: {max_dist_seen:.4f} (limit={r_max})")
     print(f"Distance-bound violations: {violations}")
@@ -103,14 +107,17 @@ def test_no_dead_neighbors():
     state, cell_list, neighbors = _get_spatial_state()
     N = _config.num_particles
 
-    violations = 0
-    for i in range(N):
-        for k in range(_config.max_neighbors):
-            j = int(neighbors[i, k])
-            if j < 0:
-                continue
-            if j >= N:
-                violations += 1
+    # Same host-side vectorization as test_neighbor_distance_bound, and the
+    # reason this file used to take 23 MINUTES: the nested loop performed
+    # int(neighbors[i, k]) on a DEVICE array 2000 x 256 = 512,000 times, each
+    # one its own GPU->host sync.
+    #
+    # The original skipped j < 0 (padding) and flagged j >= N. Since N > 0,
+    # j >= N already implies j >= 0, so the single comparison is equivalent —
+    # and unlike the distance test this one used `continue`, not `break`, so
+    # every entry is examined rather than just the prefix.
+    nb = np.asarray(neighbors)
+    violations = int(np.count_nonzero(nb >= N))
 
     print(f"\nOut-of-range neighbor violations: {violations}")
     assert violations == 0, f"{violations} neighbor entries have out-of-range index"
