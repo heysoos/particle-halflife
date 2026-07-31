@@ -368,12 +368,45 @@ similar problem — cells with an explicit bond graph, angle constraints, fusion
 emergent structures — at large scale. 103k LOC total, 19.6k LOC of CUDA. It is the closest
 existing analogue to this project and the most useful reference found.
 
-**Caveat first: ALIEN publishes no benchmarks.** The README's entire performance claim is one
-unqualified sentence ("optimized for large-scale real-time simulations with millions of
-particles") — no GPU, no fps, no cell count, and nothing in 15 releases of notes or the HN
-thread. Derived from source, `sizeof(Object)` is exactly 512 B and the all-in cost is ~1000 B
-per living cell at 25% heap efficiency, so "millions" is *memory-plausible* but unverified.
-Treat it as an architecture reference, not a performance target.
+### 4.6.0 Caveat: ALIEN's demonstrated scale is ~158k particles, not millions
+
+The README's entire performance claim is one unqualified sentence ("optimized for large-scale
+real-time simulations with millions of particles") — no GPU, no fps, no cell count, and nothing
+in 15 releases of notes, the issues, or the HN thread. Digging harder produced the following,
+and it matters:
+
+- **The author's own flagship shipped preset is 157,764 particles** on a 5000×1500 world
+  (`Evolution Presets/Hanging Garden`, retrieved from the live `api.alien-project.org` catalogue
+  the in-app browser uses). The second and only other current preset is 40,261. **The demonstrated
+  scale is ~1.6 × 10⁵ — roughly 6× below "millions."**
+- **Published TPS numbers exist but carry no cell count.** The author A/B-benchmarks on an
+  RTX 4090 headless at **~200–250 TPS** (PRs #707/#708/#709), on a sim described only as
+  "the SPH-heavy test simulation." Not convertible to throughput, not comparable across projects.
+- **VRAM is ~2,228 B per live cell** (derived by compiling the actual structs: 512 B `Object`
+  + 368 B `NeuralNet` + alignment, heap **double-buffered**, plus 404 B of per-slot arrays), so
+  1M cells ≈ 2.07 GiB *before* the 3× array growth slack. Plus ~166 MB of fixed precomputed RNG
+  tables and 12 B per world grid unit (86 MB for a 5000×1500 world, even empty).
+- **Population growth, not world size, is what kills it.** A third-party report describes
+  30 fps degrading to 4 seconds/frame overnight as offspring count evolved from ~5 into the
+  tens of thousands — a 120× slowdown from population alone.
+- The README's stated "compute capability 6.0+" is **stale**: `develop` throws below CC 7.5,
+  which explains the GTX 10xx failure reports.
+- v5-alpha is explicitly not yet performance-tuned (author, discussion #810, 2026-07).
+
+**The reframe this forces.** Comparing interaction counts rather than particle counts:
+ALIEN at 158k particles with ≤10 neighbors each ≈ 1.6M interactions/step; this project at
+20k particles with ~45 neighbors ≈ 0.9M interactions/step. **The two are within ~2× of each
+other on raw pairwise work.** ALIEN runs it at ~200–250 steps/s on a 4090 against this
+project's 85 steps/s on a 3080 — call it 3–5× faster per interaction once hardware is
+discounted, not the 100× the headline implies.
+
+So ALIEN's apparent scale advantage is mostly **a much lower neighbor count** (interaction
+range 1.6 on a 1.0 grid, ≤10 candidates per cell) rather than a fundamentally better engine.
+That is genuinely encouraging for the targets in §3 — but it means **ALIEN is an architecture
+reference, not an existence proof that millions run at interactive rates.** No such proof was
+found. Treat §4.6's techniques as well-motivated engineering, and keep the independent
+evidence in §7 (bleuje's 5.77M at 60 fps on an RTX 2060; Hoetzlein's 2.1M at 12 fps) as the
+actual scale precedent.
 
 ### 4.6.1 The historical validation
 
@@ -584,6 +617,7 @@ run `--scenario current_experiment` before and after and diff the reports.
 | Hoetzlein SPH | 2.1M @ 12 fps | GTX Titan (2013) | counting-sort cell list |
 | HOOMD-blue LJ | ~3M @ 100 neighbors | 3 GB GPU | hand-tuned CUDA; the honest ceiling |
 | par-particle-life | caps neighbors above 200k | — | *deliberately approximate* above ~50k |
+| ALIEN, author's shipped preset | **157,764 particles** | unstated | ~200–250 TPS headless on a 4090, cell count unpublished |
 | **this design (target)** | **1–2M full chemistry** | **RTX 3080 Laptop 8 GB** | P³M + edge list + Warp |
 
 Jenson's numbers are not a like-for-like target: his agents never interact with each other
