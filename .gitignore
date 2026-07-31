@@ -22,6 +22,10 @@ Thumbs.db
 # Generated test artifacts
 tests/reports/
 
+# Captured output (S key / R key)
+screenshots/
+recordings/
+
 # Distribution / packaging
 build/
 dist/

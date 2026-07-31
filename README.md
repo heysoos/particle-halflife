@@ -34,9 +34,45 @@ See `requirements.txt` for exact versions.
 | `Space` | Pause / resume |
 | `+` / `-` | More / fewer simulation steps per frame |
 | `B` | Cycle composite view: **bonds → merged → none → bonds** |
-| `R` | Reset to initial state (re-uses current interaction params) |
+| `M` | Cycle bond mode: **edges → star_spring → off → edges** |
+| `N` | Reset to initial state (re-uses current interaction params) |
+| `R` | Start / stop video recording → `recordings/halflife_<timestamp>.mp4` |
+| `H` | Hide / show the HUD overlay |
 | `S` | Save screenshot |
 | `Q` / `Esc` | Quit |
+
+#### Recording (`R`)
+
+Frames are read back from the framebuffer and piped to `ffmpeg` (must be on
+`PATH`), producing H.264 MP4s under `recordings/`. Filenames are timestamped and
+never overwritten. While recording, a red **REC** badge in the top-right shows
+elapsed time and file size — the frame is captured *before* that badge is drawn,
+so the indicator never appears in the video. The HUD, on the other hand, **is**
+recorded when visible; press `H` first for a clean scene-only capture.
+
+**Output settings** live in the render-settings panel (the ⚙ nub on the Trails
+button), and are read when a recording *starts* — so changing them mid-take
+applies to the next one:
+
+| Control | Effect |
+|---|---|
+| `rec fps` slider | Output framerate, 15–90 (default 30) |
+| `Realtime` toggle | **OFF** — one rendered frame = one video frame. **ON** — frames are repeated or skipped against the wall clock so playback matches the speed you actually saw |
+
+The REC badge shows which pacing the current take is using (`30fps` vs `30fps live`).
+
+Two things to know:
+
+- **Recording costs framerate.** The framebuffer readback is a synchronous
+  `glReadPixels`; measured at 1280×720 it adds ~15 ms/frame (~29%).
+- **With Realtime off the output is fixed-framerate**, so a session captured at
+  14 fps live plays back ~2× fast at 30. The exact factor is printed when
+  recording stops, along with the `rec fps` value that would give real-time
+  playback. Turning Realtime on removes the issue (measured 1.00× real time) and
+  barely costs file size — duplicate frames encode to almost nothing.
+
+Expect ~210 MB per minute of video at the default `crf 18`; the particle field
+compresses poorly, so raise `recording_crf` to shrink it.
 
 **Mouse (on-screen buttons, left edge of window):**
 

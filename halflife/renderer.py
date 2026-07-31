@@ -8,7 +8,13 @@ and sized by mass. Composites can be shown in two modes (toggle with B):
 
 Clickable HUD overlay (rendered as a pygame surface → OpenGL texture):
   Buttons along the left edge; stats panel (toggle) on the right; event
-  sprites (expanding rings) at fusion/fission/spawn/decay sites.
+  sprites (expanding rings) at fusion/fission/spawn/decay sites. Hide the
+  whole overlay with H (see toggle_hud) — useful for clean recordings.
+
+Video recording (R, see halflife/render/recorder.py): the default framebuffer
+is read back after the HUD blit and piped to ffmpeg. The REC badge is drawn in
+a separate pass AFTER that read, so it is visible on screen but never in the
+recorded file.
 
 Data flow per frame:
   1. np.asarray() — transfer JAX GPU arrays to CPU numpy
@@ -34,6 +40,7 @@ from halflife.profiler import ProfileMetrics
 from halflife.render.widgets import Slider
 from halflife.render.camera import Camera
 from halflife.render.hud import HUDPainter
+from halflife.render.recorder import VideoRecorder, RecorderUnavailable
 
 
 # ── CPU-side state snapshot ───────────────────────────────────────────────────
@@ -457,6 +464,22 @@ class Renderer:
         )
         self._hud_texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
 
+        # ── REC badge overlay (its own surface/texture, same shader) ──────────
+        # The recording indicator must NOT appear in the recorded video, so it
+        # cannot live on the main HUD surface (which is captured). It gets a
+        # second full-window RGBA surface blitted through the very same
+        # hud_prog + _hud_quad_vao, in a pass that runs after the framebuffer
+        # read. Full-window rather than a small positioned quad so no new
+        # shader or NDC arithmetic is needed — it costs one extra 1280x720
+        # RGBA texture (~3.7 MB VRAM), repainted only ~1 Hz while recording.
+        self._badge_surface = pygame.Surface(
+            (config.window_width, config.window_height), pygame.SRCALPHA
+        )
+        self._badge_texture = self.ctx.texture(
+            (config.window_width, config.window_height), 4
+        )
+        self._badge_texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+
         # ── HDR scene framebuffer + tonemap composite ─────────────────────────
         # The scene (particles + bonds + events) is rendered into an RGBA16F
         # framebuffer so we have headroom above 1.0. The tonemap pass samples
@@ -549,10 +572,15 @@ class Renderer:
         # match the slider defaults defined in Task 4. UI sliders write into
         # this dict; the renderer reads from it each frame.
         self._render_settings = {
-            'trails_on':           True,
+            'trails_on':           False,
             'trail_decay':         0.75,
             'particle_size_mult':  0.60,
             'particle_alpha_mult': 0.20,
+            # Video output settings. Not read by render() — consumed by
+            # toggle_recording() when a take starts, since ffmpeg's -r is fixed
+            # at spawn and can't follow a slider mid-recording.
+            'recording_fps':       float(config.recording_fps),
+            'recording_realtime':  bool(config.recording_realtime),
         }
 
         # ── Camera (pan + zoom) ──────────────────────────────────────────────
@@ -667,6 +695,13 @@ class Renderer:
             ("trail_decay",         "trail decay",   0.95, "{:.3f}", (0.0, 0.999)),
             ("particle_size_mult",  "particle size", 1.0,  "{:.2f}", (0.25, 2.0)),
             ("particle_alpha_mult", "particle alpha", 1.0, "{:.2f}", (0.1,  1.0)),
+            # Video output framerate. Lives here rather than in a panel of its
+            # own because the left button strip is full — a 10th button pushes
+            # slider_start_y down 30px and the physics panel is already at its
+            # minimum row pitch to fit a 720px window. Read at recording START;
+            # see VideoRecorder.fps.
+            ("recording_fps",       "rec fps",       float(config.recording_fps),
+                                                           "{:.0f}", (15.0, 90.0)),
         ]
         self._render_sliders = []
         r_row_y = slider_start_y
@@ -677,6 +712,11 @@ class Renderer:
                        linear_range=lin, target_dict=self._render_settings)
             )
             r_row_y += slider_row_h
+        # Realtime toggle sits directly under the rec-fps slider it modifies —
+        # when on, that slider stops being a speed control and becomes just the
+        # output rate. Full panel width so it reads as a row, not a slider.
+        self._rec_realtime_rect = pygame.Rect(panel_x + 4, r_row_y + 2, slider_track_w, 22)
+        r_row_y += 30
         self._render_slider_content_h = r_row_y - slider_start_y
         self._render_params_reset_rect = pygame.Rect(panel_x + 4, slider_start_y - 26, 100, 20)
 
@@ -701,8 +741,28 @@ class Renderer:
         self._clock = pygame.time.Clock()
 
         self._show_stats  = False
-        self._show_events = True
+        self._show_events = False
         self._paused      = False   # mirror of main loop paused state
+        # HUD visibility (H key). When False the whole overlay — buttons,
+        # panels, inspector, hints — is skipped, so a recording captures the
+        # bare scene. Button/slider hit-testing is gated on this too (see
+        # handle_click) so invisible widgets can't be clicked by accident.
+        self._show_hud    = True
+
+        # ── Video recording ──────────────────────────────────────────────────
+        # Constructed inactive; start()/stop() happen on the R key. Frames are
+        # read from the default framebuffer AFTER the HUD blit but BEFORE the
+        # REC badge pass, so the badge can never end up in the file.
+        self.recorder = VideoRecorder(
+            config.window_width, config.window_height,
+            fps=config.recording_fps,
+            out_dir=config.recording_dir,
+            crf=config.recording_crf,
+        )
+        # Badge repaint throttle: the badge text only shows whole seconds and
+        # whole megabytes, so it needs repainting ~1 Hz, not 60-120 Hz. Holds
+        # the last rendered text so a change is cheap to detect.
+        self._badge_text = None
 
         # ── Particle selection (click-to-inspect) ─────────────────────────────
         # _selected_idx is the particle index of the current selection, or -1
@@ -877,10 +937,11 @@ class Renderer:
             if spec is None:
                 row_y += group_gap
                 continue
-            field, label, default, fmt, lin = spec
+            field, label, default, fmt, lin = spec[:5]
+            gamma = spec[5] if len(spec) > 5 else 1.0
             track = pygame.Rect(panel_x + 4, row_y + 18, slider_track_w, 8)
             self._sliders.append(
-                Slider(label, field, default, track, fmt, linear_range=lin)
+                Slider(label, field, default, track, fmt, linear_range=lin, gamma=gamma)
             )
             row_y += slider_row_h
         # Total content height (last row's bottom relative to slider_start_y).
@@ -916,6 +977,72 @@ class Renderer:
         self._render_settings['trails_on'] = not self._render_settings['trails_on']
         self._hud_dirty = True
 
+    def toggle_hud(self) -> bool:
+        """Show/hide the whole HUD overlay. Returns the new visibility.
+
+        Dirties the HUD so that re-showing it repaints from current state rather
+        than blitting a texture that went stale while hidden.
+        """
+        self._show_hud = not self._show_hud
+        self._hud_dirty = True
+        return self._show_hud
+
+    def toggle_rec_realtime(self) -> bool:
+        """Flip realtime pacing for the NEXT recording. Returns the new state."""
+        rs = self._render_settings
+        rs['recording_realtime'] = not rs['recording_realtime']
+        self._hud_dirty = True
+        return rs['recording_realtime']
+
+    def toggle_recording(self) -> str | None:
+        """Start or stop video recording. Returns the output path on both edges.
+
+        Returns None if starting failed (the reason is printed). Recording never
+        being available must not be fatal, so RecorderUnavailable is swallowed
+        here rather than propagated into the event loop.
+        """
+        if self.recorder.is_recording:
+            rec  = self.recorder
+            path = rec.stop()
+            msg  = f"Recording stopped: {path} ({rec.frame_count} frames, {rec.elapsed:.1f}s video)"
+            if rec.dropped:
+                # Surface this: it means the encoder couldn't keep up and the
+                # video is missing frames, which is invisible in the file itself.
+                msg += f" — {rec.dropped} frames DROPPED (encoder fell behind)"
+            if rec.realtime:
+                # Realtime resamples on purpose, so its counters mean something
+                # different from a dropped frame and shouldn't read as failure.
+                if rec.skipped:
+                    msg += f" — {rec.skipped} frames skipped (live rate above {rec.fps} fps)"
+                if rec.clamped:
+                    msg += f" — {rec.clamped} duplicate frames withheld after a stall"
+            print(msg)
+            # In fixed mode the output is constant-framerate, so a slow live
+            # session becomes a sped-up video. That's invisible in the file, so
+            # say it out loud and name the two ways to fix it.
+            speed = rec.speed_factor
+            if not rec.realtime and speed >= 1.15:
+                live = rec.frame_count / rec.wall_elapsed
+                print(f"  plays {speed:.1f}x faster than real time "
+                      f"({live:.0f} fps live → {rec.fps} fps output). "
+                      f"Enable Realtime in the render panel, or set rec fps ≈ {max(15, round(live))}.")
+            self._badge_text = None
+            return path
+
+        # Apply the panel's settings to the NEXT take. ffmpeg fixes -r at spawn,
+        # so this is the only point at which they can take effect.
+        rs = self._render_settings
+        self.recorder.fps      = max(1, int(round(rs['recording_fps'])))
+        self.recorder.realtime = bool(rs['recording_realtime'])
+        try:
+            path = self.recorder.start()
+        except RecorderUnavailable as e:
+            print(f"Cannot record: {e}")
+            return None
+        mode = "realtime" if self.recorder.realtime else "fixed"
+        print(f"Recording started: {path} ({self.recorder.fps} fps, {mode})")
+        return path
+
     def set_paused(self, paused: bool):
         """Keep the renderer in sync with the main loop's pause state."""
         if self._paused != paused:
@@ -924,6 +1051,12 @@ class Renderer:
 
     def handle_click(self, pos) -> str | None:
         """Return action string if a button was clicked, else None."""
+        # With the HUD hidden the widgets are invisible but their rects are
+        # still live — a click meant to pan the view while framing a shot would
+        # silently hit whatever button used to be there (Reset, worst case).
+        # Camera pan/zoom and particle picking stay active; they need no widget.
+        if not self._show_hud:
+            return None
         if self._stats_btn_rect.collidepoint(pos):
             return "toggle_stats"
         # Inspector close button — only meaningful when a selection is active,
@@ -958,6 +1091,9 @@ class Renderer:
 
     def handle_mousedown_slider(self, pos) -> bool:
         """Start dragging a slider if pos hits a handle, or reset if a reset button hit."""
+        # Invisible sliders must not be draggable — see handle_click.
+        if not self._show_hud:
+            return False
         # Only one of the two panels can be open at a time (mutually exclusive).
         # Iterate whichever panel is active; both panels share the same X column
         # so we never need to consider both lists at once.
@@ -967,6 +1103,11 @@ class Renderer:
         elif self._show_render_params:
             sliders = self._render_sliders
             reset_rect = self._render_params_reset_rect
+            # Realtime toggle — a plain button row in the render panel, not a
+            # slider, so it's handled here before the slider hit-tests.
+            if self._rec_realtime_rect.collidepoint(pos):
+                self.toggle_rec_realtime()
+                return True
         else:
             return False
 
@@ -974,6 +1115,12 @@ class Renderer:
             for s in sliders:
                 s.reset()
                 s.commit(self._physics_updates)
+            # The panel-level reset restores everything the panel owns, and the
+            # realtime toggle is one of those things even though it has no slider.
+            if self._show_render_params:
+                self._render_settings['recording_realtime'] = bool(
+                    self.config.recording_realtime
+                )
             self._hud_dirty = True
             return True
         for slider in sliders:
@@ -1607,18 +1754,39 @@ class Renderer:
         # Stats panel updates every frame (sparklines, FPS), so force dirty
         # while it's shown. Inspector panel likewise — position/velocity move
         # every frame while a particle is selected.
-        if self._show_stats or self._selected_idx >= 0:
-            self._hud_dirty = True
+        # Skipped entirely while hidden (H key) — including the paint, so a
+        # hidden HUD costs nothing at all.
+        if self._show_hud:
+            if self._show_stats or self._selected_idx >= 0:
+                self._hud_dirty = True
 
-        if self._hud_dirty:
-            self.hud.paint(fps)
-            surf_data = pygame.image.tostring(self._hud_surface, 'RGBA', True)
-            self._hud_texture.write(surf_data)
-            self._hud_dirty = False
+            if self._hud_dirty:
+                self.hud.paint(fps)
+                surf_data = pygame.image.tostring(self._hud_surface, 'RGBA', True)
+                self._hud_texture.write(surf_data)
+                self._hud_dirty = False
 
-        self._hud_texture.use(location=0)
-        self.hud_prog['hud_tex'].value = 0
-        self._hud_quad_vao.render(moderngl.TRIANGLES, vertices=6)
+            self._hud_texture.use(location=0)
+            self.hud_prog['hud_tex'].value = 0
+            self._hud_quad_vao.render(moderngl.TRIANGLES, vertices=6)
+
+        # ── Video capture ────────────────────────────────────────────────────
+        # THE capture point: everything drawn above is in the video, everything
+        # below is not. Reading here (rather than before the HUD) means the HUD
+        # is recorded when visible — press H for a clean scene-only capture —
+        # while the REC badge drawn below can never reach the file.
+        #
+        # This is a synchronous glReadPixels of the whole default framebuffer
+        # (2.7 MB at 720p) and it stalls the GL pipeline, so it costs real
+        # framerate. Only paid while recording.
+        if self.recorder.is_recording:
+            self.recorder.submit(
+                self.ctx.screen.read(components=3, alignment=1)
+            )
+
+        # ── REC badge (post-capture, never recorded) ──────────────────────────
+        if self.recorder.is_recording:
+            self._blit_rec_badge()
 
         pygame.display.flip()
 
@@ -1626,6 +1794,30 @@ class Renderer:
         self._trail_idx = 1 - self._trail_idx
 
     # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _blit_rec_badge(self) -> None:
+        """Upload + draw the REC badge. Runs only while recording.
+
+        Repaint is throttled on the badge's *appearance*: the label shows whole
+        seconds and whole megabytes and the dot pulses at 1 Hz, so nothing
+        changes more than twice a second. Between changes this is just a cached
+        texture bind + one fullscreen quad.
+        """
+        rec = self.recorder
+        # Pulse off video-time, not wall-clock, so the blink rate matches the
+        # recording's own clock and stays deterministic across framerates.
+        pulse_on = (rec.elapsed % 1.0) < 0.5
+        key = (int(rec.elapsed), rec.size_bytes // (1024 * 1024), rec.dropped, pulse_on)
+        if key != self._badge_text:
+            self.hud.paint_rec_badge(pulse_on)
+            self._badge_texture.write(
+                pygame.image.tostring(self._badge_surface, 'RGBA', True)
+            )
+            self._badge_text = key
+
+        self._badge_texture.use(location=0)
+        self.hud_prog['hud_tex'].value = 0
+        self._hud_quad_vao.render(moderngl.TRIANGLES, vertices=6)
 
     def _wrap_min_image(self, delta: np.ndarray) -> None:
         """In-place periodic min-image: subtract integer multiples of world
@@ -1674,6 +1866,10 @@ class Renderer:
 
     def close(self):
         """Release all GPU resources."""
+        # Finalize any in-flight recording FIRST. stop() waits on ffmpeg so the
+        # MP4's moov atom is written; skipping it leaves an unplayable file.
+        # Before the GL teardown because a release error must not skip this.
+        self.recorder.stop()
         self.particle_vbo.release()
         self.particle_vao.release()
         self.bond_vbo.release()
@@ -1683,6 +1879,7 @@ class Renderer:
         self._hud_quad_vbo.release()
         self._hud_quad_vao.release()
         self._hud_texture.release()
+        self._badge_texture.release()
         self.hud_prog.release()
         self._event_vbo.release()
         self._event_vao.release()

@@ -22,7 +22,7 @@ class SimConfig:
     # 200 × 720/1280 = 112.5
     world_width: float = 200.0      # spatial extent in x
     world_height: float = 112.5     # spatial extent in y
-    dt: float = 0.06                # simulation timestep
+    dt: float = 0.04                # simulation timestep
 
     # Boundary mode: "periodic" (torus) or "reflect" (bouncing walls)
     boundary_mode: str = "periodic"
@@ -267,6 +267,31 @@ class SimConfig:
     point_size_min: float = 2.0       # minimum particle render size (pixels)
     point_size_max: float = 14.0      # maximum (scales with mass)
     background_color: tuple = (0.004, 0.004, 0.007, 1.0)  # dark blue-black, in LINEAR sRGB (post-tonemap displays ≈ 5% gray-blue)
+
+    # ── Video recording (R key; halflife/render/recorder.py) ─────────────────
+    # These never enter a traced function, so adding them leaves the emitted
+    # HLO unchanged and the on-disk XLA cache still hits despite SimConfig
+    # being static_argnums.
+    recording_dir: str = "recordings"
+    # OUTPUT framerate. In the default (non-realtime) mode one rendered frame
+    # becomes exactly one video frame, so a session captured at 15 fps live
+    # plays back 2x fast at 30 — deterministic, no resampling. Live-tunable
+    # from the render-settings panel over [15, 90]; the value is read when a
+    # recording STARTS (ffmpeg is launched with -r), so mid-recording slider
+    # moves apply to the next take. Note libx264 veryfast only encodes 720p at
+    # ~95 fps, so submitting faster than that drops frames regardless.
+    recording_fps: int = 30
+    # Realtime mode: duplicate/skip frames against the wall clock so the video
+    # plays at the speed you actually saw, whatever the live framerate did.
+    # Costs file size (a 10 fps live session at 30 fps output writes each frame
+    # 3x), though duplicate frames compress to almost nothing.
+    recording_realtime: bool = False
+    # x264 quality; lower = better/bigger. Measured at 1280x720 crf 18 on a
+    # dense 5k-particle field: ~210 MB per minute of VIDEO (~35 MB per minute of
+    # real time at ~10 fps live). The particle field is high-entropy, so this is
+    # far heavier than typical screen capture — raise crf to ~23 to roughly
+    # halve it. The REC badge shows the file size as it grows.
+    recording_crf: int = 18
 
     # ── Derived (computed from above) ────────────────────────────────────────
     # Not actual dataclass fields — computed as properties for convenience

@@ -153,6 +153,11 @@ halflife-particle/
 │   ├── energy.py       ← energy tracking and soft conservation
 │   ├── step.py         ← simulation_step() — single @jax.jit orchestrator
 │   ├── renderer.py     ← ModernGL + pygame visualization
+│   ├── render/
+│   │   ├── camera.py   ← pan/zoom
+│   │   ├── hud.py      ← HUDPainter: buttons, panels, inspector, REC badge
+│   │   ├── widgets.py  ← Slider
+│   │   └── recorder.py ← VideoRecorder: framebuffer bytes → MP4 via ffmpeg pipe
 │   └── main.py         ← Entry point, event loop, async overlap
 └── tests/
     ├── test_hash.py
@@ -463,7 +468,10 @@ potential is **not** part of `energy.py` conservation tracking (v1 scope).
 | Space | Pause / resume |
 | `+` / `-` | More / fewer simulation steps per frame |
 | `B` | Toggle composite visualization (bonds ↔ merged) |
-| `R` | Reset to initial state |
+| `M` | Cycle bond mode (edges → star_spring → off) |
+| `N` | Reset to initial state ("new world" — moved off `R` when recording claimed it) |
+| `R` | Start / stop video recording (see "Video Recording" below) |
+| `H` | Hide / show the HUD overlay |
 | `S` | Save screenshot |
 | `Q` / Esc | Quit |
 
@@ -476,6 +484,85 @@ potential is **not** part of `energy.py` conservation tracking (v1 scope).
 | Stats | Toggle live stats panel |
 | Events | Toggle event sprites |
 | Reset | Re-initialize world |
+
+## Video Recording (`R` key)
+
+`halflife/render/recorder.py` — `VideoRecorder` pipes raw RGB frames to an
+`ffmpeg` subprocess (`-f rawvideo -pix_fmt rgb24 … -vf vflip -c:v libx264
+-pix_fmt yuv420p`), producing `recordings/halflife_<YYYYmmdd_HHMMSS>.mp4`.
+Timestamp collisions get a `_1`, `_2` suffix, so recordings are never
+overwritten. It knows nothing about GL/pygame/JAX — it takes bytes — so it is
+unit-testable without a display.
+
+**The capture point is the whole design.** In `Renderer.render()`:
+
+```
+tonemap scene → ctx.screen
+if _show_hud:  HUD blit              ← H key gates this; IS recorded
+★ ctx.screen.read() → recorder.submit()   ← everything above is in the video
+if recording:  _blit_rec_badge()     ← drawn AFTER the read; never recorded
+pygame.display.flip()
+```
+
+The REC badge therefore shows on screen but cannot reach the file. It lives on a
+*second* full-window RGBA surface/texture (`_badge_surface`/`_badge_texture`)
+blitted through the same `hud_prog` + `_hud_quad_vao` — no new shaders, ~3.7 MB
+VRAM — repainted only when its text or 1 Hz dot-pulse changes.
+
+With the HUD hidden, `handle_click`/`handle_mousedown_slider` return early so
+invisible widgets can't be clicked; camera pan/zoom and particle picking stay live.
+
+**Threading:** a daemon writer thread does the blocking `stdin.write`, fed by a
+`queue.Queue(maxsize=16)`. `submit()` is `put_nowait` — a slow encoder drops
+frames (counted, reported on stop) rather than stalling the render loop.
+Measured at 1280×720: ffmpeg needs ~55 ms before its first read (hence the queue
+depth) and encodes at ~10.5 ms/frame, a ~95 fps ceiling.
+
+**Two pacing modes.** Both emit a CONSTANT-framerate file (ffmpeg's `-r` is fixed
+at spawn and rawvideo carries no timestamps); they differ in what the writer
+thread does with each submitted frame:
+
+- **fixed** (default) — one rendered frame → one video frame. Deterministic; a
+  session slower than `fps` plays back sped up.
+- **realtime** — the writer repeats or skips frames against the wall clock so
+  video time tracks real time: `target = int(dt·fps + 1e-6) + 1`, write until
+  `frame_count` reaches it. (The epsilon matters: `0.9*30` is `26.999...`, and a
+  bare `int()` silently loses a frame whenever a timestamp lands on a slot
+  boundary.) A single frame's duplicate burst is capped at `2·fps` so a JIT-retrace
+  stall can't emit thousands; the withheld count is reported, never silent.
+  Measured **1.00× real time** vs **2.1× fixed** at the same live rate — and the
+  realtime file was *smaller*, since duplicate frames encode as near-empty P-frames.
+
+**UI** (render-settings panel, ⚙ nub on Trails): `rec fps` slider [15, 90] plus a
+`Realtime` toggle row (`_rec_realtime_rect`, hit-tested in
+`handle_mousedown_slider`, reset by the panel-level reset). Both live in
+`_render_settings` and are pushed onto the recorder by `toggle_recording()` at
+start — the only point they can take effect. They went in this panel rather than
+behind a new left-strip button because the strip is full: a 10th button shifts
+`slider_start_y` down 30px and the physics panel is already at its `_MIN_ROW_H`
+floor (it in fact overflows ~12px at 720 in edges mode — pre-existing).
+
+**Measured costs** (1280×720, 5k particles, this machine):
+
+| | |
+|---|---|
+| readback cost | +15 ms/frame, ~29% FPS loss (synchronous `glReadPixels`, 2.7 MB/frame) |
+| file size | ~210 MB per minute of *video* at `crf 18`; ~35 MB per minute of real time |
+| playback speed | fixed ⇒ live-rate dependent (2–8× fast observed); realtime ⇒ 1.00× |
+
+`recording_fps` (default 30) / `recording_realtime` / `recording_crf` /
+`recording_dir` are `SimConfig` fields seeding the UI. They never enter a traced
+function, so the emitted HLO — and the on-disk XLA cache — is unaffected despite
+`SimConfig` being `static_argnums`. In fixed mode `toggle_recording()` prints the
+measured speed factor and the `rec fps` that would give real-time playback.
+
+`Renderer.close()` calls `recorder.stop()` first, and `main.py`'s loop is wrapped
+in `try/finally` — without the wait-on-ffmpeg the MP4 has no moov atom and won't
+play.
+
+Tests: `tests/test_recorder.py` (CPU-only) plus `tests/test_recorder_gl.py`
+(needs a GL context — WSLg provides one; verifies the badge is absent from and
+the HUD present in real recorded frames, and that the video isn't upside-down).
 
 ## Configuration
 
@@ -662,6 +749,33 @@ JAX_PLATFORMS=cpu .venv/bin/pytest tests/test_analysis_events.py tests/test_anal
 - **GPU contention with live sim**: integration tests in `test_chemistry.py` default to GPU. If
   the user has the live sim running, force CPU with `JAX_PLATFORMS=cpu pytest ...` — otherwise
   pytest can hang for an hour fighting for SM time.
+- **Slow tests: it is almost never the physics (2026-07-30)**. `test_chemistry.py` ran
+  **7:48**; it now runs **1:49** (4.3x) with all 34 tests unchanged and passing. Nothing about
+  the simulation got faster — three host-side mistakes were removed. Check these first:
+  1. **Calling a chemistry kernel without `jax.jit`.** Eager mode dispatches every primitive
+     individually from Python, and these kernels hold `fori_loop` sweeps of
+     `fission_label_iters=64` plus BFS/subtree passes — thousands of primitives. Measured: a
+     *single* eager `apply_composite_decay` took **29 s**; a 40-call loop took **206 s**, 44% of
+     the whole file. Use the module-level `_decay_jit` / `_fusion_jit` / `_ring_jit` wrappers at
+     the top of `test_chemistry.py`. `jax.jit` caches per static-arg value, so one wrapper
+     serves every config.
+  2. **`jnp.asarray(...)` then per-element `int(...)`.** `jnp.asarray` keeps the data on the
+     GPU, so every `int(mc[i])` is its own device round trip — tens of thousands of them in a
+     sampling loop (~40 s). Use **`np.asarray`** to pull once in bulk, then index with numpy.
+  3. **Boolean-mask gathers on device arrays**, e.g. `mc[alive].tolist()` inside a per-step
+     loop. That is a data-dependent-shape gather: XLA must sync and materialize it every step
+     (~24 s over 800 steps). Mask on the host after one bulk `np.asarray`.
+- **Distinct `SimConfig`s cost compiles.** `SimConfig` is `static_argnums`, so each distinct
+  value is its own XLA compile (~13.8 s cold / 3.1 s cached on GPU; ~5.0 s / 2.1 s on CPU).
+  Equal-but-separately-constructed configs still hash equal and share a compile, but four
+  fission tests each building the same config is a smell — share one object (`CFG_FISSION`).
+  The persistent cache skips XLA's *backend* compile but NOT JAX's Python->jaxpr tracing, which
+  reruns per process; that residue is the 2-3 s "cached" figure and is paid per config per
+  xdist worker.
+- **Backend: neither wins outright.** CPU compiles ~2.7x faster; GPU executes ~7x faster at
+  these sizes. `test_hash`/`test_spatial` are compile-bound (CPU wins); `test_chemistry` is
+  execution-bound (GPU wins — a serial CPU run exceeded 10 min vs 7:48 on GPU). `conftest.py`
+  therefore forces nothing; pass `JAX_PLATFORMS=cpu` per-file when it helps.
 - **Fast test runs (2026-06-12)**: test wall-time is dominated by per-process XLA compiles and
   Python-dispatched step loops at tiny N — the GPU sits mostly idle either way. Two fixes, both
   measured on the chemistry suite:

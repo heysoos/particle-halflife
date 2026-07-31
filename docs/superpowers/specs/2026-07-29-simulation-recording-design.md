@@ -1,7 +1,9 @@
 # Simulation Recording + HUD Hiding
 
 **Date:** 2026-07-29
-**Status:** Design approved, pending implementation plan
+**Status:** Implemented. Cost/size figures below are measured, not estimated —
+the initial file-size estimate was wrong by ~14× and the playback speed-up by ~3×;
+both are corrected in place and noted where they changed the design.
 
 ## Motivation
 
@@ -23,6 +25,49 @@ clean, shareable MP4 of the running simulation can be produced from inside the a
   present in the recorded video.
 - Zero cost when not recording. No new Python dependencies.
 
+## Addendum (2026-07-30): live fps control + realtime pacing
+
+Shipped after the measurements below showed the fixed-framerate speed-up was
+much worse in practice than assumed at design time (3–8×, not ~2×). Three changes:
+
+- **`recording_fps` default 60 → 30**, and live-tunable from a `rec fps` slider
+  ([15, 90]) in the render-settings panel.
+- **A `Realtime` toggle** beside it. When on, the writer thread repeats or skips
+  frames against the wall clock so video time tracks real time — the standard
+  screen-recorder approach, and the only one available given ffmpeg fixes `-r` at
+  spawn and rawvideo carries no per-frame timestamps. This supersedes the
+  "variable framerate — out of scope" non-goal below; it turned out to need no
+  VFR plumbing at all.
+- Both are read at `start()` only, since `-r` cannot change mid-recording. The
+  REC badge shows the pacing actually in force (`30fps` vs `30fps live`).
+
+Placement: the render-settings panel rather than a new left-strip button, because
+the button strip is full — a 10th button shifts `slider_start_y` down 30px and the
+physics panel already overflows ~12px at 720 in edges mode (pre-existing, from the
+`_MIN_ROW_H = 28` floor).
+
+Measured at 1280×720 / 5k particles, same live rate, burned-in loop:
+
+| | fixed | realtime |
+|---|---|---|
+| playback | 2.14× fast | **1.00× real time** |
+| file size | 4.8 MB | 4.5 MB |
+
+The realtime file is *smaller* despite holding 258 frames against 90 — duplicate
+frames encode as near-empty P-frames, so the frame multiplier does not translate
+into a size multiplier.
+
+Two details worth keeping:
+
+- The slot arithmetic is `target = int(dt·fps + 1e-6) + 1`. The `+1` stops the
+  first frame (dt=0) from claiming zero slots and starting the video late; the
+  epsilon guards the truncation, since `0.9*30` evaluates to `26.999999999999996`
+  and a bare `int()` silently loses a frame whenever a timestamp lands on a slot
+  boundary.
+- A single frame's duplicate burst is capped at `2·fps`, so a multi-second stall
+  (a JIT retrace on a bond-mode switch) can't emit thousands of duplicates. The
+  withheld count is reported at stop rather than dropped silently.
+
 ## Non-goals
 
 - Audio. There is none.
@@ -31,6 +76,9 @@ clean, shareable MP4 of the running simulation can be produced from inside the a
   offscreen supersampled rendering is a separate project.
 - Pausing / resuming a single recording, in-app trimming, or GIF export.
 - Asynchronous (PBO) framebuffer readback. See "Known costs".
+- ~~Variable-framerate output.~~ Superseded — see the addendum above. Real-time
+  playback is now supported, achieved by wall-clock frame resampling into a
+  constant-framerate stream rather than by per-frame timestamps.
 
 ## Architecture
 
@@ -238,17 +286,34 @@ generated binary output.
 
 **Fixed output framerate.** Every rendered frame becomes exactly one video frame at a
 constant declared `recording_fps` (default 60). Video duration is therefore
-`frames / 60`, independent of wall-clock. If the app ran at 30 FPS while recording, the
-video plays back at roughly 2× the live speed. This is deterministic and needs no
+`frames / 60`, independent of wall-clock. This is deterministic and needs no
 variable-framerate plumbing; the alternative (per-frame PTS) is a later change if the
 speed-up proves annoying.
+
+Measurement showed the speed-up is larger than assumed at design time: the default
+config runs at ~10–19 FPS while recording, so a 60 FPS output plays **3–6× fast**, not
+the ~2× sketched above. Since this is invisible in the finished file, `stop()` prints the
+measured factor and the `recording_fps` value that would give real-time playback:
+
+```
+Recording stopped: recordings/halflife_20260729_194958.mp4 (300 frames, 5.0s video)
+  plays 6.0x faster than real time (10 fps live → 60 fps output).
+  For real-time playback set SimConfig.recording_fps≈10.
+```
+
+`VideoRecorder` therefore also tracks wall-clock (`wall_elapsed`, frozen at `stop()`)
+and exposes `speed_factor`.
 
 **Recording continues while paused**, capturing identical frames. A pause therefore
 holds on screen in the video, which is the useful behaviour for narrating a structure.
 
 **No auto-stop and no size cap.** The badge shows elapsed time and file size so growth
-is visible, but a forgotten recording will keep consuming disk at ~15 MB/min. Adding a
-cap would mean choosing a limit for the user; the indicator is the mitigation.
+is visible, but a forgotten recording keeps consuming disk — measured at **~210 MB per
+minute of video** (~35 MB per minute of real time) at 1280×720 crf 18 on a dense 5k-particle
+field. That is far heavier than typical screen capture because the particle field is
+high-entropy and compresses poorly; the initial ~15 MB/min estimate was wrong by ~14×.
+Raising `recording_crf` to ~23 roughly halves it. Adding a hard cap would mean choosing
+a limit for the user; the indicator is the mitigation.
 
 **Toggling `R` while recording finalizes the current file.** The next `R` starts a fresh
 one under a new name. There is no append.
@@ -256,11 +321,24 @@ one under a new name. There is no append.
 ## Known costs
 
 `ctx.screen.read()` is a synchronous `glReadPixels`: it stalls the GL pipeline until the
-2.7 MB (1280×720×3) readback completes, every frame. **Expect a real framerate drop while
-recording — estimated 10–30%.** Combined with the fixed-60fps output above, this makes a
-recording play back faster than it looked live.
+2.7 MB (1280×720×3) readback completes, every frame.
 
-Both are accepted for v1. The fix is a ring of pixel-buffer objects for asynchronous
+Measured on the real config (1280×720, 5000 particles, `angle_mode="vsepr"`):
+
+| | recording off | recording on |
+|---|---|---|
+| frame time | 52.8 ms | 68.1 ms |
+| FPS | 18.9 | 14.7 |
+
+**+15.3 ms/frame, a 29% FPS loss** — the upper end of the 10–30% estimate. Combined with
+the fixed-framerate output above, this makes a recording play back faster than it looked
+live (and recording itself worsens the factor by lowering live FPS).
+
+Encoder headroom is not the bottleneck: ffmpeg sustains ~10.5 ms/frame (~95 FPS) at this
+resolution, comfortably above the ~15 FPS submit rate, and 300-frame runs dropped zero
+frames.
+
+Both costs are accepted for v1. The fix is a ring of pixel-buffer objects for asynchronous
 readback, which `moderngl` does not expose directly and which would need a 1–2 frame
 latency budget in the capture path. Out of scope.
 
@@ -299,19 +377,47 @@ ffmpeg is absent.
 6. **Missing ffmpeg** — patch `shutil.which` to return `None`; assert
    `RecorderUnavailable` is raised and `is_recording` is `False`.
 
-### Manual verification — the GL path
+### `tests/test_recorder_gl.py` — automated integration
 
-`ctx.screen.read()` needs a real window and cannot run headless in this environment, so
-the capture path itself is verified by hand:
+WSLg turns out to expose a real OpenGL context (`D3D12 / Intel UHD, Mesa 23.2`), so the
+capture path is machine-verified after all rather than left to a checklist. Skipped when
+no context is available.
 
-1. Launch the app, press `R`, let it run ~5 seconds, press `R` again.
-2. Confirm `recordings/halflife_<ts>.mp4` exists and plays.
-3. Confirm the badge was visible while recording and appears **nowhere** in the video.
-4. Confirm the video is right-side up and the HUD is present in it.
-5. Press `H`, record again; confirm that video has no HUD, but the badge was still
-   visible live.
-6. With the HUD hidden, click where the Reset button sits; confirm nothing resets and
-   that drag-pan still works.
-7. Press `N`; confirm the world resets.
-8. Press `R`, then `Q` while still recording; confirm the file is finalized and plays.
-9. Note the FPS delta with recording on vs. off, to check the estimate above.
+The trick that makes these deterministic: `update()` is never called, so
+`_n_particles_to_draw` stays 0 and the scene is a uniform background colour. Any
+non-background pixel in a recorded frame therefore came from an overlay, and the test can
+say which one.
+
+1. **Badge excluded** — HUD hidden, record 12 frames; the decoded frame must be uniform
+   (per-channel spread ≤ 8), and the rect the badge actually occupied (taken from
+   `_badge_surface.get_bounding_rect()`, not hard-coded) must contain nothing bright.
+2. **HUD included, badge still excluded** — HUD shown; the frame must be non-uniform, but
+   the badge's rect must hold ≤ 10 red-dominant pixels. (Counting matters: the badge's
+   *brightest* pixel is its near-white text, so a max-red-pixel test misses the leak.)
+3. **H changes the capture** — recorded std with the HUD shown must exceed the hidden case.
+4. **Orientation in the real pipeline** — the HUD's key hints are painted at the bottom of
+   the window, so the bottom-centre strip must carry more variance than the top-centre one.
+5. **Frame accounting** — `frame_count + dropped` equals frames rendered, and `ffprobe`
+   agrees with `frame_count`.
+6. **Not recording** — rendering leaves no file and never paints the badge.
+7. **`close()` finalizes** — quitting mid-recording still yields a decodable file.
+
+Every recording helper asserts the badge was painted *before* stopping, so no test here
+can pass vacuously via a badge that never drew.
+
+**Mutation-checked:** moving `_blit_rec_badge()` to before the capture makes tests 1, 2
+and 4 fail. Verified, then reverted.
+
+### Manual verification — remaining
+
+A short list the automated tests don't cover, since they never open a visible window
+under a human's eye:
+
+1. Confirm the REC badge is legible and well-placed over a *busy* scene (the automated
+   tests only ever draw it over flat background).
+2. With the HUD hidden, click where the Reset button sits; confirm nothing resets and that
+   drag-pan still works.
+3. Press `N`; confirm the world resets (the key moved off `R`).
+4. Press `R`, then `Q` while still recording; confirm the file is finalized and plays.
+5. Watch a recording back and judge whether the fixed-framerate speed-up is acceptable, or
+   whether `recording_fps` wants lowering to the value `stop()` suggests.

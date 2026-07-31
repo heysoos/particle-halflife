@@ -154,6 +154,32 @@ class HUDPainter:
         for slider in sliders:
             slider.draw(surface, font)
 
+    def _draw_rec_realtime_toggle(self, surface: pygame.Surface, font) -> None:
+        """Draw the Realtime on/off row at the bottom of the render panel.
+
+        Green when on (video will match wall-clock speed), neutral when off.
+        The sub-label spells out what the setting actually does, because "fixed
+        vs realtime" is meaningless without knowing the live framerate.
+        """
+        r    = self.r
+        rect = r._rec_realtime_rect
+        on   = bool(r._render_settings['recording_realtime'])
+
+        bg     = (30, 70, 45, 215) if on else (35, 42, 60, 205)
+        border = (90, 180, 120, 200) if on else (90, 110, 150, 170)
+        pygame.draw.rect(surface, bg, rect, border_radius=4)
+        pygame.draw.rect(surface, border, rect, 1, border_radius=4)
+
+        label = f"Realtime: {'ON' if on else 'OFF'}"
+        col   = (170, 240, 195) if on else (185, 200, 225)
+        txt   = font.render(label, True, col)
+        surface.blit(txt, (rect.left + 8, rect.centery - txt.get_height() // 2))
+
+        hint = "match real speed" if on else "1 frame = 1 frame"
+        h_txt = font.render(hint, True, (120, 140, 165))
+        surface.blit(h_txt, (rect.right - h_txt.get_width() - 8,
+                             rect.centery - h_txt.get_height() // 2))
+
     def _draw_sparkline(self, surface, data, x, y, w, h, color):
         if len(data) < 2:
             return
@@ -581,13 +607,16 @@ class HUDPainter:
         if r._show_render_params:
             self._draw_slider_panel(surface, font, r._render_sliders,
                                     r._render_slider_content_h,
-                                    r._render_params_reset_rect, "Reset Trails")
+                                    r._render_params_reset_rect, "Reset Render")
+            # Belongs to the same panel but isn't a slider, so it's drawn after.
+            self._draw_rec_realtime_toggle(surface, font)
 
         # Inspector panel (live stats for the selected particle)
         self._paint_inspector(surface)
 
         # Bottom key hint
-        hint = "[Space] pause  [+/-] speed  [B] viz  [M] bond mode  [R] reset  [Q] quit"
+        hint = ("[Space] pause  [+/-] speed  [B] viz  [M] bond mode  "
+                "[N] reset  [R] rec  [H] hide HUD  [Q] quit")
         hint_surf = font.render(hint, True, (120, 140, 160))
         surface.blit(hint_surf,
                      (r.config.window_width // 2 - hint_surf.get_width() // 2,
@@ -604,3 +633,49 @@ class HUDPainter:
         surface.blit(mode_surf,
                      (r.config.window_width // 2 - mode_surf.get_width() // 2,
                       r.config.window_height - hint_surf.get_height() - mode_surf.get_height() - 6))
+
+    # ── REC badge ─────────────────────────────────────────────────────────────
+    # Painted onto a SEPARATE surface (r._badge_surface), not the HUD surface
+    # above, because the HUD is inside the recorded frame and the badge must not
+    # be. See the capture point in Renderer.render().
+
+    def paint_rec_badge(self, pulse_on: bool) -> None:
+        """Draw the recording indicator onto r._badge_surface.
+
+        Called only when the badge's appearance changes (~2 Hz — whole-second
+        clock plus the 1 Hz dot pulse), not every frame.
+        """
+        r       = self.r
+        surface = r._badge_surface
+        font    = r._font
+        rec     = r.recorder
+
+        surface.fill((0, 0, 0, 0))  # clear to transparent
+
+        secs  = int(rec.elapsed)
+        label = f"REC  {secs // 60:02d}:{secs % 60:02d}"
+        label += f"  ·  {rec.size_bytes // (1024 * 1024)} MB"
+        # Show the pacing the take is actually using — it's fixed at start, so
+        # this is the only place to confirm which mode you got.
+        label += f"  ·  {rec.fps}fps{' live' if rec.realtime else ''}"
+        # Dropped frames mean the encoder fell behind and the video is missing
+        # frames — invisible in the file, so say so while it's still happening.
+        if rec.dropped:
+            label += f"  ·  {rec.dropped} dropped"
+        text = font.render(label, True, (235, 235, 240))
+
+        PAD, DOT_R, GAP = 8, 5, 10
+        w = PAD + DOT_R * 2 + GAP + text.get_width() + PAD
+        h = max(text.get_height(), DOT_R * 2) + PAD
+        x = r.config.window_width - w - 12
+        y = 12
+
+        panel = pygame.Surface((w, h), pygame.SRCALPHA)
+        panel.fill((18, 10, 12, 205))
+        pygame.draw.rect(panel, (150, 40, 45, 230), panel.get_rect(), width=1)
+        # Dim rather than vanish on the off-beat: a dot that disappears reads as
+        # a glitch, one that dims reads as a deliberate pulse.
+        dot = (235, 60, 60) if pulse_on else (120, 40, 40)
+        pygame.draw.circle(panel, dot, (PAD + DOT_R, h // 2), DOT_R)
+        panel.blit(text, (PAD + DOT_R * 2 + GAP, (h - text.get_height()) // 2))
+        surface.blit(panel, (x, y))
