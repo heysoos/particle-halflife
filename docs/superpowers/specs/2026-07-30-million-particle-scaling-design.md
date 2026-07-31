@@ -41,21 +41,39 @@ Two facts set the agenda:
    `Can't reduce memory use below 1.09GiB ... only reduced to 12.25GiB, down from 17.51GiB`
    before failing. 3.6 GB of that is *static* allocation.
 
-### 1.2 The padding tax
+### 1.2 The padding tax — and the caps that actually bind
 
-Measured array utilisation after 200 steps at default settings:
+**Corrected 2026-07-30.** An earlier version of this section claimed composites average 8.3
+members against a 256 cap, implying the cap could be cut ~30×. That measurement was taken on
+an under-developed state. Measured at **steady state (1000 steps, clean GPU)**:
 
-| array | shape | mean actual | utilisation |
-|---|---|---|---|
-| neighbor list | (N, 256) | 68 neighbors | **26.7%** |
-| composite `members` | (C, 256) | 8.3 members | **3.2%** |
-| composite pool | (C,) | — | 15% |
+| | N=20,000 | N=5,000 | cap | verdict |
+|---|---|---|---|---|
+| cell occupancy | mean 57.1, p99 388, **max 453** | mean 14.3, max 141 | `cell_capacity=64` | **23.1% / 5.4% of cells OVERFLOW** |
+| neighbors/particle | mean 178.7, p99 256, max 256 | mean 105.7, max 256 | `max_neighbors=256` | **4.7% / 0.2% saturate** |
+| composite size | mean 5.7, p99 152, max 256 | mean 13.9, p99 184, max 255 | `max_composite_size=256` | binding at the tail |
+| edges/composite | mean 5.6, p99 191, max 333 | mean 15.5, p99 228, max 307 | `e_max=512` | not binding |
 
-73% of the force loop evaluates masked-out padding lanes. A composite occupies
-**5,149 bytes — 161× a particle — of which 99.4% is padding** (`edges` at (C,512,2) = 4 KB
-plus `members` at (C,256) = 1 KB, both worst-case-sized).
+**Both interaction caps bind at N=20,000, and shrinking them would corrupt the physics.**
+The composite-size distribution is extremely heavy-tailed — mean 5.7 but p99 152 and max
+pinned at the 256 cap — so the padding is not free headroom to reclaim; it is buffer for a
+real tail. The mean/cap ratio is a misleading statistic here.
 
-At N=1e6 this padding *is* the OOM: neighbor list 1 GB, `members` 512 MB, `edges` 2 GB.
+This changes the conclusion: the padding cost is real for *memory* at N=1e6 (neighbor list
+1 GB, `members` 512 MB, `edges` 2 GB — a composite is 5,149 B, 161× a particle), but it
+**cannot be fixed by lowering the caps**. It requires the representation change in §4.1,
+where cost tracks the real tail rather than a worst-case bound.
+
+### 1.2b Correctness: the sim is lossy today, at two levels
+
+Independent of scaling, at the sizes actually being run:
+- **23.1% of grid cells overflow `cell_capacity=64` at N=20,000** (max occupancy 453, 7× the
+  cap); 5.4% at N=5,000. Particles past slot 64 are invisible to forces, fusion and ring closure.
+- **4.7% of particles saturate `max_neighbors=256` at N=20,000** (mean 178.7), so their force
+  sums are truncated too.
+
+Both must be fixed regardless of which scaling path is chosen, and neither is a performance
+issue — they are silent physics corruption.
 
 ### 1.3 The transient tax
 
@@ -547,15 +565,29 @@ than up front.
 - Delete the per-frame numpy work in `renderer.py` (colors, norms, clips move to the shader).
 - Fix the `cell_capacity=64` vs occupancy-372 correctness bug.
 
-**Phase 0b — ALIEN-derived wins that need no rewrite (§4.6).** These apply to the current JAX
-codebase and are worth doing before Phase 1, since they also de-risk it:
+**Phase 0b — wins that need no rewrite.** Applicable to the current JAX codebase:
 - **Phase-index amortisation** of angle forces, liquid-drop half-life and scission (§4.6.2).
-  The angle path alone is 2.6 ms — ~43% of the step at N=5,000. Running it every 3rd step is
-  a plausible ~1.3–1.5× on the whole step for a static-arg change. Validate that composite
-  geometry is unaffected via the analysis pipeline before keeping it.
+  Measured: the VSEPR path costs **2.3 ms of a 10.2 ms step at N=20,000 (23%)** — 7.9 ms with
+  `angle_mode="off"` vs 10.2 ms with `vsepr`. Running it every 3rd step is worth roughly
+  1.18×, not the 1.3–1.5× claimed earlier. Real but modest; validate composite geometry via
+  the analysis pipeline before keeping it.
 - **Frustum culling + compaction before the render readback** (§4.6.6). A `where` + `cumsum`
   in JAX, no interop needed, and the single largest cut to the 75 ms host path at 1M.
 - **Constant vertex count** with off-screen surplus, removing the host-side count sync.
+- **Kill the Python loop over alive composites** in `renderer.py:1288`. At N=20,000 there are
+  **~1,700–1,970 alive composites**, so that loop runs ~1,900 Python iterations *per frame*.
+  This is a strong candidate for the app feeling slower than the 10.2 ms step time implies.
+
+**Do NOT lower `max_composite_size`, `e_max`, or `max_neighbors`** — §1.2 measures all of the
+interaction caps as binding at steady state. An earlier draft of this spec recommended cutting
+`max_composite_size` to 16 on the basis of a mean of 8.3; that measurement was premature and
+the recommendation was wrong.
+
+**Measurement discipline note.** `make_run_n_steps`' `n` is a `lax.scan` length, so **every
+distinct chunk size triggers a fresh ~15–20 s XLA compile**. Timing a chunk size that has not
+been compiled measures compile time amortised over the chunk. This produced fake "1,215 ms/step"
+figures that disagreed with the true ~10 ms by 100×. Always compile the exact chunk length once,
+untimed, before timing anything — and check `nvidia-smi` for competing GPU work first.
 
 **Phase 1 — Warp prototype, validate before committing.**
 Port only the neighbor search + short-range force path to Warp, **with spatial sorting from the
