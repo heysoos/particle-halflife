@@ -316,11 +316,25 @@ With composites as an edge list, every current `(C, e_max)` grid traversal becom
 | angle list | 3.07M-element sort/step | counting sort over E, O(E) |
 | liquid-drop half-life | O(C·E) + O(C·M) | O(N + E) segmented reductions |
 
-**Connected components is the one genuinely new piece.** Composite labels must be recomputed
-from the edge list. Plan: label propagation with pointer jumping (Afforest-style), targeting
-1–2 ms at 4M edges. Fusion is a cheap union; only fission and scission force a relabel.
-If per-step full CC proves too slow, fall back to incremental relabelling of only the
-components touched by this step's fission/scission batch.
+**Connected components: mostly, don't.** This was an open question; ALIEN answers it (§7.1).
+Their core physics — bond forces, angle forces, fusion, scission — is *purely local* (a cell
+plus its ≤6 bonded neighbors) and needs no global connectivity at all. Global labels are
+computed only where genuinely required, and then:
+
+- by **approximate label propagation** (`atomicMin` + pointer chasing), with a hardcoded 30-hop
+  cap, launched exactly 3 times (≤90 hops) and explicitly **not run to convergence** — the
+  source comment is literally `// Heuristics to cover connected cells`;
+- **only every 3rd timestep**, and only when the feature needing it is enabled.
+
+Adopt the same shape: identify which consumers actually need a global label (liquid-drop
+half-life, radius of gyration, per-composite aggregates) and run an approximate, capped,
+every-Kth-step relabel for them, rather than an exact per-step pass.
+
+**Per-composite aggregates live at the root, with no composite array.** ALIEN `atomicAdd`s
+COM, velocity, angular momentum and angular mass onto the *member with the lowest index*.
+Periodic-boundary COM is handled by a 2-bit mask recording whether the cluster touches the
+left/upper third of the world, then shifting members past the two-thirds line. That is a
+cheaper and simpler answer than a segmented reduction over sorted labels — adopt it.
 
 **The expensive graph surgery does not scale with N and is not a problem.** BFS spanning trees,
 subtree sums for fission cut-scoring, and reachability for scission already run on a *compacted
@@ -347,6 +361,146 @@ with no host involvement.
 
 ---
 
+## 4.6 Lessons from ALIEN (chrxh/alien)
+
+[ALIEN](https://github.com/chrxh/alien) is a CUDA artificial-life simulator solving a very
+similar problem — cells with an explicit bond graph, angle constraints, fusion, decay,
+emergent structures — at large scale. 103k LOC total, 19.6k LOC of CUDA. It is the closest
+existing analogue to this project and the most useful reference found.
+
+**Caveat first: ALIEN publishes no benchmarks.** The README's entire performance claim is one
+unqualified sentence ("optimized for large-scale real-time simulations with millions of
+particles") — no GPU, no fps, no cell count, and nothing in 15 releases of notes or the HN
+thread. Derived from source, `sizeof(Object)` is exactly 512 B and the all-in cost is ~1000 B
+per living cell at 25% heap efficiency, so "millions" is *memory-plausible* but unverified.
+Treat it as an architecture reference, not a performance target.
+
+### 4.6.1 The historical validation
+
+ALIEN v2.0 had explicit rigid-body **cell-cluster objects**. v3.0 **deleted them** in favour of
+per-cell soft-body springs. `MapSectionCollector.cuh` survives as entirely commented-out dead
+code still referencing `Cluster*`, `List<Cluster*>`, `DynamicMemory*`.
+
+They had this project's `CompositeState`, at scale, and removed it. That is independent
+confirmation of §4.1's edge-list decision.
+
+### 4.6.2 Phase-index amortisation — the highest-leverage idea, and it applies today
+
+ALIEN runs a **22-kernel baseline step, and a 49-kernel step every 3rd timestep**. Angle
+forces, inner friction, connected components and *all* chemistry are gated on
+`timestep % 3 == 0` (`TIMESTEPS_PER_CELL_FUNCTION = 3`). This ships in production.
+
+Direct candidates here, in cost order:
+- **VSEPR angle forces** — currently 2.6 ms/step, ~43% of the step at N=5,000, driven by a
+  3.07M-element radix sort for the angle list.
+- **Liquid-drop half-life** recomputation (`(C,E)` bond sum + `(C,M)` radius of gyration).
+- **Bond scission** (`(C,E)` grid plus a `(C,E)` RNG draw).
+
+This fits the existing `static_argnums` model exactly: add a phase index as a static argument
+and XLA caches K variants — the same mechanism ALIEN gets from caching `cudaGraphExec_t` keyed
+on a config struct containing `timestepMod3`. **This is applicable to the current JAX codebase
+before any rewrite**, and is the one item that could pay off immediately.
+
+### 4.6.3 A compact hot mirror for the neighbor scan
+
+ALIEN keeps a 40-byte `LightObject` mirror of only the fields the neighbor scan touches
+(`pos`, `vel`, `density`, `type`, `self`, chain pointer, `numConnections`, `flags`), guarded by
+`static_assert(sizeof(LightObject) == 40)` and the comment *"growing it directly costs memory
+bandwidth in the hot SPH kernels"*. Against a 512-byte `Object`, that is a **12.8× bandwidth
+reduction on the O(N·k) inner loop**.
+
+This project is already SoA, so the mechanism differs, but the principle holds and is testable:
+the force kernel must read a minimal `(position, species)` working set, never gather from every
+state array. Assert the packed width in a test so it cannot silently grow.
+
+### 4.6.4 Angle constraints via `angleFromPrevious` on sorted edges
+
+ALIEN stores each cell's connections in **circular angular order**, each carrying
+`angleFromPrevious` — the rest-angle gap to the previous connection, summing to 360°. Angle
+forces then apply only to *consecutive* pairs: **O(degree) instead of O(C(degree,2))**.
+
+This deletes `build_angle_list` and its `(N, C(max_valence,2), 3)` triple array outright — the
+triples become implicit as `(i-1, i)`. It is a structural simplification, not a micro-optimisation.
+
+Two further details worth taking: the penalty is **linear in |Δθ|, not quadratic** (a
+constant-magnitude restoring torque, far more stable at high stiffness), and the force is
+tangential-only via 90° rotations with **no `atan2` in the hot path**.
+
+Keep the VSEPR *physics* (emergent rest angle from chord-Coulomb repulsion suits hash chemistry
+better than ALIEN's stored, genome-settable angles) but adopt their *data structure*.
+
+### 4.6.5 Deferred structural operations — already validated
+
+Nothing in ALIEN mutates topology during physics. Fusion, bond deletion and cell death all
+enqueue into a bounded per-step queue sized `1000 + numObjects/2` that **silently drops on
+overflow**, drained afterwards by five substep kernels. Bond deletion is lock-free (atomic
+bitmask mark, then each object compacts its own ≤6 connections); addition uses a
+**pointer-ordered non-blocking double lock** that drops and retries next step on contention.
+
+This is `max_fissions_per_step` / `max_scissions_per_step` deferral, independently arrived at
+and validated at much larger scale. Keep it. One refinement to adopt: ALIEN compacts work into
+**one dense queue per cell type**, so each kernel processes only its own list rather than all N
+with a divergent branch — directly applicable to per-reaction-channel masking here.
+
+### 4.6.6 Rendering — cull before you transfer
+
+**ALIEN's default build round-trips through the host**; CUDA-GL interop is opt-in via
+`--interop`, and even then there are 9 blocking `cudaDeviceSynchronize()` calls per frame.
+Interop is not what makes it fast.
+
+What makes it fast is **GPU-side frustum culling plus atomic compaction before extraction**, so
+the VBO only ever contains on-screen entities. At 5M particles with ~20k visible that is a
+~250× cut in transfer — and it is implementable in JAX today as a `where` + `cumsum` compaction,
+independent of any interop plumbing. Pair it with drawing a **constant** vertex count and
+pushing the surplus off-screen (`gl_Position = vec4(-2,-2,-2,1)`) so the host never needs the
+count and no sync is required.
+
+Their LOD trick is also worth taking: below zoom 5, **bonded cells stop being drawn as sprites
+entirely** — bond lines and fills become the low-LOD representation, while free particles stay
+and are drawn *larger*. Kills moiré and saves fragment shading exactly when on-screen particle
+count peaks.
+
+### 4.6.7 What does NOT transfer
+
+- **Their force kernel is easier than this one.** Species-agnostic SPH pressure/viscosity,
+  interaction range 1.6 on a 1.0 grid, a 5×5 = 25-cell scan with ≤10 candidates each. There is
+  **no species-pair force matrix anywhere in ALIEN** (the only colour matrix is
+  `attackerFoodChainColorMatrix`, used for predation). This project's radius-8, ~45-neighbor,
+  species-indexed kernel will not inherit their throughput by copying their structures.
+- **Their bond chemistry is simpler.** Bond breaking is "distance > 3.6 → dissolve *all* of that
+  cell's bonds", plus a probabilistic force threshold. No hash-derived bond energies, no
+  Arrhenius, no liquid-drop fissility, no max-binding-energy cut. **This project is ahead here;
+  there is nothing to import.**
+- **The 1×1 grid with a hard 10-per-cell cap silently drops neighbors.** Acceptable only because
+  they enforce `minObjectDistance = 0.3` and clamp forces hard. Copying it into a sim that
+  genuinely wants ~45 neighbors would corrupt the physics — and note §1.6, where this project
+  already has exactly that bug.
+- **They abandoned determinism.** The RNG is a 160 MB precomputed table read through one global
+  atomic ring index, so which thread gets which number depends on scheduling. Combined with
+  `atomicAdd` float accumulation and best-effort lock/queue drops, ALIEN is not reproducible.
+  **Do not follow this** — the threaded `rng_key` is a research asset for an open-ended-evolution
+  project, not a nicety.
+- **The semi-space copying GC is the wrong tool.** It costs 4× VRAM for the live set and exists
+  only because their edges are raw pointers into a heap of variable-size objects. Index-addressed
+  fixed-size arrays need at most a prefix-sum permutation.
+
+### 4.6.8 Miscellaneous techniques worth noting
+
+- **fp32 everywhere in physics; fp64 only for global reductions** (`externalEnergy`, statistics).
+  A clean rule to adopt verbatim.
+- Launch geometry is **constant and independent of N** (16384 blocks, grid-stride loops), which
+  is what makes the `cudaGraphExec_t` cache viable. ~49 kernel launches per step ≈ 250–320 µs of
+  pure launch overhead — a reminder that kernel count, not just kernel cost, is a budget.
+- The neighbor kernel is **one block per particle, one thread per grid cell** (block size set to
+  exactly the scan rectangle, 25 threads), reduced with cooperative-groups warp reductions.
+  Contrast with [Bramas et al.](https://arxiv.org/pdf/2406.16091) (§4.3), who found
+  thread-per-particle fastest on NVIDIA at this neighbor count — ALIEN's choice suits their much
+  smaller per-particle neighbor count. **Benchmark both; do not assume.**
+- They also use a deliberate one-step-lag on density (*"Optimization: using the density from
+  last time step"*) — the same trick already used here for `rep_pe`.
+
+---
+
 ## 5. Phasing
 
 Each phase leaves the project runnable. **This spec is the umbrella design; Phases 1–4 are each
@@ -359,6 +513,16 @@ than up front.
 - fp16 positions on the render transfer path — 5× on D2H at 5M, and stays under the 32 MB cliff.
 - Delete the per-frame numpy work in `renderer.py` (colors, norms, clips move to the shader).
 - Fix the `cell_capacity=64` vs occupancy-372 correctness bug.
+
+**Phase 0b — ALIEN-derived wins that need no rewrite (§4.6).** These apply to the current JAX
+codebase and are worth doing before Phase 1, since they also de-risk it:
+- **Phase-index amortisation** of angle forces, liquid-drop half-life and scission (§4.6.2).
+  The angle path alone is 2.6 ms — ~43% of the step at N=5,000. Running it every 3rd step is
+  a plausible ~1.3–1.5× on the whole step for a static-arg change. Validate that composite
+  geometry is unaffected via the analysis pipeline before keeping it.
+- **Frustum culling + compaction before the render readback** (§4.6.6). A `where` + `cumsum`
+  in JAX, no interop needed, and the single largest cut to the 75 ms host path at 1M.
+- **Constant vertex count** with off-screen surplus, removing the host-side count sync.
 
 **Phase 1 — Warp prototype, validate before committing.**
 Port only the neighbor search + short-range force path to Warp, **with spatial sorting from the
@@ -431,8 +595,10 @@ ambition is HOOMD-class scale with richer chemistry, not physarum-class scale.
 
 ## 8. Open questions
 
-1. **Connected components cadence.** Full relabel every step, or incremental relabel of only
-   the components touched by fission/scission? Resolve with a measurement in Phase 2.
+1. ~~**Connected components cadence.**~~ **Resolved by §4.6.1/§4.6.4** — ALIEN's answer is an
+   approximate, hop-capped, every-3rd-step label propagation, with per-composite aggregates
+   accumulated at the lowest-index member rather than in a composite array. Remaining sub-question:
+   which consumers here genuinely need a global label, and can any of them be made local?
 2. **Radial basis size B.** How many fixed kernels are needed to reproduce the per-pair
    `peak_fraction`/`cutoff_fraction` shapes to acceptable fidelity? Fit offline against the
    current kernel; likely B=3, to be confirmed.
