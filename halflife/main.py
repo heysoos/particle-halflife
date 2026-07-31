@@ -83,6 +83,35 @@ def parse_args():
     p.add_argument('--width',     type=float, default=None,   help='World width')
     p.add_argument('--height',    type=float, default=None,   help='World height')
     p.add_argument('--no-chemistry', action='store_true',     help='Disable fusion and decay (physics only)')
+
+    # ── Capacity / budget overrides ──────────────────────────────────────────
+    # These exist because raising --particles alone does NOT preserve the
+    # chemistry: the composite pool and the per-step reaction budgets are fixed
+    # constants tuned for ~20k. Measured at 100k with defaults, the bonded
+    # fraction collapses from 47% to 7%. See --auto-scale below, which sets all
+    # of them from --particles in one go.
+    p.add_argument('--max-composites',     type=int, default=None,
+                   help='Composite pool size (default 3000, tuned for ~20k particles)')
+    p.add_argument('--max-fusions-per-step',        type=int, default=None,
+                   help='Fusion budget per step (default 64)')
+    p.add_argument('--max-fissions-per-step',       type=int, default=None,
+                   help='Fission budget per step (default 64)')
+    p.add_argument('--max-ring-closures-per-step',  type=int, default=None,
+                   help='Ring-closure budget per step (default 16)')
+    p.add_argument('--max-scissions-per-step',      type=int, default=None,
+                   help='Bond-scission budget per step (default 32)')
+    p.add_argument('--cell-capacity',      type=int, default=None,
+                   help='Particles per spatial cell (default 64; overflow is silently dropped)')
+    p.add_argument('--max-neighbors',      type=int, default=None,
+                   help='Neighbours considered per particle (default 256)')
+
+    # ── The convenience button ───────────────────────────────────────────────
+    p.add_argument('--auto-scale', action='store_true',
+                   help='Scale world area, composite pool and all per-step reaction '
+                        'budgets from --particles so the chemistry matches a 20k run. '
+                        'Explicit flags above still win. Verified: 100k reproduces '
+                        "20k's 47%% bonded fraction and mean composite size.")
+
     p.add_argument(
         "--enable-profiling",
         action="store_true",
@@ -110,6 +139,48 @@ def build_config(args) -> SimConfig:
     # molecular angles instead of floppy chains. Headless/test configs keep the
     # zero-cost "off" default. Gated on bond_mode == "edges" in simulation_step.
     kwargs['angle_mode'] = 'vsepr'
+
+    # ── --auto-scale ─────────────────────────────────────────────────────────
+    # Raising --particles alone silently changes the chemistry, because three
+    # separate things are tuned for the 20k reference and none of them scale:
+    #   1. world area   -> density; at 100k in the default world the mean cell
+    #                      holds 286 particles against cell_capacity=64
+    #   2. max_composites (3000) -> saturates at ~2950 by 100k, so free+free
+    #                      fusions can no longer claim a slot
+    #   3. the per-step reaction budgets -> binding is capped at a constant
+    #                      while unbinding scales with composite count, so the
+    #                      equilibrium bonded fraction falls as N rises
+    # Measured: 100k with defaults gives 7.3% bonded vs 20k's 47%. Scaling all
+    # three by N/20000 gives 47.9% with mean composite size 6.01 vs 5.74 --
+    # i.e. the same chemistry, just more of it.
+    if args.auto_scale:
+        ref_n = 20_000
+        ref_density = ref_n / (SimConfig.world_width * SimConfig.world_height)
+        n = kwargs.get('num_particles', SimConfig.num_particles)
+        s = n / ref_n
+
+        # Hold density at the 20k reference, preserving the configured aspect.
+        aspect = SimConfig.world_width / SimConfig.world_height
+        height = (n / ref_density / aspect) ** 0.5
+        kwargs.setdefault('world_width',  round(aspect * height, 1))
+        kwargs.setdefault('world_height', round(height, 1))
+
+        _scaled = lambda base: max(base, int(round(base * s)))
+        kwargs.setdefault('max_composites',            _scaled(SimConfig.max_composites))
+        kwargs.setdefault('max_fusions_per_step',      _scaled(SimConfig.max_fusions_per_step))
+        kwargs.setdefault('max_fissions_per_step',     _scaled(SimConfig.max_fissions_per_step))
+        kwargs.setdefault('max_ring_closures_per_step', _scaled(SimConfig.max_ring_closures_per_step))
+        kwargs.setdefault('max_scissions_per_step',    _scaled(SimConfig.max_scissions_per_step))
+
+    # Explicit flags win over --auto-scale (applied after, overwriting).
+    if args.max_composites            is not None: kwargs['max_composites']             = args.max_composites
+    if args.max_fusions_per_step      is not None: kwargs['max_fusions_per_step']       = args.max_fusions_per_step
+    if args.max_fissions_per_step     is not None: kwargs['max_fissions_per_step']      = args.max_fissions_per_step
+    if args.max_ring_closures_per_step is not None: kwargs['max_ring_closures_per_step'] = args.max_ring_closures_per_step
+    if args.max_scissions_per_step    is not None: kwargs['max_scissions_per_step']     = args.max_scissions_per_step
+    if args.cell_capacity             is not None: kwargs['cell_capacity']              = args.cell_capacity
+    if args.max_neighbors             is not None: kwargs['max_neighbors']              = args.max_neighbors
+
     return SimConfig(**kwargs)
 
 

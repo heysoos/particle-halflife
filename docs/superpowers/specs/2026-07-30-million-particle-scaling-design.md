@@ -124,6 +124,86 @@ per-frame sim work does. Fix the sim for today; fix the render path for the scal
 entirely. The merged branch ([renderer.py:1427](../../../halflife/renderer.py#L1427)) is doing
 something unexpectedly expensive. Not on the critical path, but it is backwards.
 
+### 1.4c Where the 10.3 ms step actually goes (per-feature A/B, N=20,000)
+
+Isolated per-phase timing was tried first and **discarded**: the phases summed to 5.1× the
+real step, because each isolated call pays its own kernel-launch overhead and loses XLA's
+cross-phase fusion. Its *ranking* is still informative (below), but its absolute numbers are not.
+
+The honest attribution is to toggle a feature off and re-measure the whole compiled step.
+Baseline 10.34 ms/step on a state developed 1000 steps:
+
+| feature disabled | ms/step | cost of the feature | composites |
+|---|---|---|---|
+| — (baseline) | 10.34 | — | 1,608 |
+| **`bond_mode="off"`** (all bond forces + angle + scission) | 6.64 | **3.70 ms — 36%** | 2,086 |
+| `angle_mode="off"` (VSEPR) | 8.97 | **1.36 ms — 13%** | 1,479 |
+| `enable_bond_scission=False` | 9.81 | 0.53 ms — 5% | 1,953 |
+| `allow_ring_closure=False` | 10.54 | −0.20 ms (noise) | 1,422 |
+| `stability_mode="legacy"` | 10.90 | −0.56 ms | 2,962 |
+| `use_valence=False` | 10.40 | −0.06 ms | 277 |
+
+**Read these with care.** Each toggle changes the physics, so the developed state differs —
+composite counts span 277 to 2,962 — and step cost depends on composite count. Only two rows
+are clean comparisons: `angle_mode` (1,479 vs 1,608 composites) and `bond_mode` (2,086 vs
+1,608 — *more* composites yet 36% faster, so 3.70 ms is if anything an **underestimate**).
+The negative rows are state divergence, not a speedup: `stability_mode="legacy"` produced 84%
+more composites, which is why it got slower.
+
+Isolated-phase ranking (relative only): `find_all_neighbors` 9.4 > `attempt_fusion` 8.7 >
+`attempt_ring_closure` 7.2 > `apply_composite_decay` 5.7 ≈ `compute_angle_forces` 5.7 >
+`apply_bond_scission` 3.3 > **`compute_all_forces` 2.4** > `build_cell_list` 1.4 ≈
+`compute_liquid_drop_half_life` 1.3 ≈ `compute_edge_bond_forces` 1.3 ≈ `compute_degree` 1.3.
+
+#### What this changes in the plan
+
+1. **Elevate the edge-list composite change (§4.1).** The bond subsystem is 36% of the step,
+   and it is precisely the code that iterates `(C, e_max)` padded grids holding a measured mean
+   of 5.6 real edges. It was justified on memory; it is now justified on speed too, at
+   *current* scale. This is the highest-value single change.
+2. **De-prioritise the P³M force split (§4.2).** `compute_all_forces` is the *seventh* most
+   expensive phase and the pairwise kernel is not the bottleneck at current density. P³M only
+   pays off at the 10× density target, where neighbour counts rise ~10×. Keep it in the design,
+   move it after the composite work.
+3. **Neighbour-search rework (§4.3) stays top priority** — `find_all_neighbors` is the most
+   expensive isolated phase, consistent with its 24.6 KiB/particle transient.
+4. **Angle amortisation is worth ~9%, not the 23% claimed earlier.** VSEPR costs 1.36 ms of
+   10.34 ms; running it every 3rd step saves ~0.9 ms. Real, modest, cheap to do.
+
+**Tooling note:** `halflife/profiler.py` is bit-rotted against the current API — it assumes
+`simulation_step` returns a bare state (it returns a tuple when `emit_events=True`) and that
+`attempt_fusion` returns a state (it returns `(state, degree)`). Both raise `AttributeError`.
+It needs fixing before it is useful again.
+
+### 1.4d Raising `num_particles` alone silently changes the chemistry
+
+Measured at N=100,000 with otherwise-default settings: the bonded fraction collapses from
+**47% to 7.3%** and mean composite size from 5.7 to 2.5. Three independent caps cause this,
+and fixing only one or two does not help:
+
+| cap | default | why it binds at 100k |
+|---|---|---|
+| world area | 200×112.5 | density rises 5×; mean cell occupancy 286 vs `cell_capacity=64` |
+| `max_composites` | 3,000 | saturates at ~2,950, so free+free fusions cannot claim a slot |
+| `max_fusions/fissions/ring_closures/scissions_per_step` | 64 / 64 / 16 / 32 | binding is capped at a constant while unbinding scales with composite count, so the equilibrium bonded fraction falls as N rises |
+
+Isolating them shows why partial fixes fail — world-scaling alone gave 6.3% bonded, and
+world + pool gave 9.8%. Scaling **all three** by N/20000 reproduces the reference:
+
+| | ms/step | composites | bonded | mean size |
+|---|---|---|---|---|
+| 20k reference | 13.62 | 1,640 | **47.1%** | 5.74 |
+| 100k, all three scaled 5× | 66.71 | 7,979 | **47.9%** | 6.01 |
+
+Step cost scales 4.9× for 5× particles — essentially linear, which is the encouraging part.
+
+This is now the `--auto-scale` flag in `main.py`, alongside individual `--max-composites`,
+`--max-{fusions,fissions,ring-closures,scissions}-per-step`, `--cell-capacity` and
+`--max-neighbors` overrides. `--auto-scale` is a no-op at exactly 20k by construction.
+
+**Implication for the rewrite:** any redesign must make these budgets scale with N by
+construction rather than by a flag, or the same silent physics drift returns at 1M.
+
 ### 1.5 The renderer
 
 `renderer.py:1197` does `jax.device_get` of **19 arrays in full every frame**, including the
